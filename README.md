@@ -440,8 +440,6 @@ and are covered by the MIT `LICENSE` in that directory.
 
 ## Contributing
 
-Issues and pull requests are welcome for any of the first-party crates or for the bundled CDDL / RFC fixtures.
-For larger changes, open an issue first so we can agree on scope and any release-tag implications.
+Issues are intentionally disabled.
 
-The `cddl/rfc-std/` directory is a snapshot of upstream `cabo/cddlc` data;
-please update it via that upstream rather than hand-editing files in place.
+See [CONTRIBUTING](CONTRIBUTING.md) for details if you wish to contribute to this project.
