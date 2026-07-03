@@ -1,0 +1,6 @@
+; Step 5.11 negative fixture: two different named compression
+; algorithms are not mutually within each other.
+
+not-ok = (bstr .x-brotli payload) .within (bstr .x-zstd payload)
+
+payload = { 1 => int }

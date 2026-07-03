@@ -1,0 +1,43 @@
+{
+  "$schema": "https://charm.land/crush.json",
+  "mcp": {
+    "necragnomicon": {
+      "type": "http",
+      "url": "http://localhost:3000"
+    }
+  },
+  "permissions": {
+    "allowed_tools": [
+      "mcp_necragnomicon_get_statistics",
+      "mcp_necragnomicon_get_call_graph",
+      "mcp_necragnomicon_find_definition",
+      "mcp_necragnomicon_search_git_history",
+      "mcp_necragnomicon_index_codebase",
+      "mcp_necragnomicon_query_codebase",
+      "mcp_necragnomicon_find_references",
+      "mcp_necragnomicon_search_by_filters"
+    ]
+  },
+  "lsp": {
+    "typst": {
+      "command": "tinymist"
+    },
+    "python": {
+      "command": "ty",
+      "args": ["server"]
+    },
+    "rust": {
+      "command": "rust-analyzer"
+    },
+    "go": {
+      "command": "gopls"
+    },
+    "cue": {
+      "command": "cue",
+      "args": ["lsp"]
+    }
+  },
+  "options": {
+    "context_paths": ["AGENTS.md"]
+  }
+}

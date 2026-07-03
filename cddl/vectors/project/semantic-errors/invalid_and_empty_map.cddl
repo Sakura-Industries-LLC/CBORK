@@ -1,0 +1,6 @@
+; source: project .within validation fixture
+; behavior: empty map cannot satisfy the .and non-empty-map constraint
+
+bad = empty .within (non-empty<empty>)
+non-empty<M> = (M) .and ({ + any => any })
+empty = {}

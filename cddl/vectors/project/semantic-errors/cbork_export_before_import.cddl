@@ -1,0 +1,11 @@
+; Step 5.12 negative fixture: `;@ CBORK: Export` must not skip over
+; an `import` / `include` directive comment.  The directive here
+; sits before an `import` and would otherwise be applied to the
+; next rule across the import, which the lint rejects.
+
+;@ CBORK: Library
+;@ CBORK: Export
+
+;# import "./cbork_export_before_import_lib.cddl"
+
+after-import = uint

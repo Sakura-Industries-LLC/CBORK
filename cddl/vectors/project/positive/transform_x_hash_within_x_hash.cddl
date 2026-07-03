@@ -1,0 +1,7 @@
+; Step 5.11 regression fixture: a wider `.x-hash` controller is
+; within a narrower `.x-hash` controller.
+
+ok = (bstr .x-hash payload-narrow) .within (bstr .x-hash payload-wide)
+
+payload-narrow = { 1 => int }
+payload-wide = { 1 => int, ? 2 => tstr }

@@ -1,0 +1,5 @@
+; source: project import/include regression fixture
+; behavior: this step stays not-prunable because it is reached through include
+
+;# import rfc9052
+relative_level2 = COSE_Key

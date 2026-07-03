@@ -1,0 +1,44 @@
+/target
+/build
+/test
+Cargo.lock
+**/*.rs.bk
+*.pdb
+#plans
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Environment
+.env.local
+
+# Moon cache
+.moon/cache/
+.moon/docker-cache/
+.moon/container-cache/
+
+# uv (Python) cache
+.uv-cache/
+
+# JS package installs
+**/node_modules/
+
+
+# Tool builds
+tools/target/
+
+# Local caches
+.cache/
+extension/zed/grammars/
+__pycache__

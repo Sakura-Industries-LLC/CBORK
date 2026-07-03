@@ -1,0 +1,12 @@
+; Step 5.12 selected-import warning: the consumer explicitly imports
+; `public-rule` but never references it, so W004 and W005 are expected.
+; The consumer also references `private-helper` from the same library,
+; so W003 is expected for direct use of a non-exported library helper.
+;
+; No W006 should be emitted.  Exported names are public API surface,
+; not a requirement that every consumer use every export.
+
+;# import unused_export_lib.public-rule from "./support/unused_export_lib.cddl" as unused_export_lib
+
+ok = unused_export_lib.private-helper
+

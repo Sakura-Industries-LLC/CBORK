@@ -1,0 +1,4 @@
+; source: project import/include regression fixture
+; behavior: nested include stays not-prunable under the outer include chain
+
+absolute_level2 = tstr

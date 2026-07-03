@@ -1,0 +1,12 @@
+; BUG-009 reproducer: bareword map member keys (e.g. `tld:`) are
+; treated as unresolved type names during `.within` comparison.
+; A bareword member key is a concrete text label, not a type
+; reference.  `tld:` must compare successfully against `label =
+; int / tstr` because `tld` is a single concrete text key that
+; lies within `tstr`.
+
+label = int / tstr
+values = any
+header-map = { * label => values }
+
+specific = { tld: tstr, root: bstr } .within header-map

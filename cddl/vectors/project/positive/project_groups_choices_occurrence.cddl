@@ -1,0 +1,50 @@
+; source: project
+; Comprehensive group, choice, occurrence, and member key coverage
+
+; Simple group
+point = [x: int, y: int]
+
+; Choice alternatives using /
+rect-shape = [w: uint, h: uint]
+circle-shape = [r: uint]
+shape = rect-shape / circle-shape
+
+; Occurrence operators in group context
+sized-items //= ( 4*4 uint )
+bounded-items //= ( 1*10 tstr )
+optional-item //= ( ? int )
+required-item //= ( uint )
+zero-or-more //= ( * bstr )
+one-or-more //= ( + text )
+
+; Member keys with value key
+value-keyed = {
+  1 => tstr,
+  -1 => uint,
+  "name" => tstr,
+  bareword => int,
+}
+
+; Member keys with type selector (cut)
+type-keyed = {
+  tstr => uint,
+  int => tstr,
+}
+
+; Bareword member keys
+bare = {
+  name: tstr,
+  age: uint,
+}
+
+; Group-to-choice with //=
+choice-group //= ( option-a: int )
+choice-group //= ( option-b: tstr )
+
+; Nested groups
+outer = {
+  inner: {
+    deep: uint,
+  },
+  flat: [a: int, b: int],
+}

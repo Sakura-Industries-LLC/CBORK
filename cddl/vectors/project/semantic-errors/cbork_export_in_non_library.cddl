@@ -1,0 +1,5 @@
+; Step 5.12 negative fixture: `;@ CBORK: Export` is only valid in a
+; library file.  Using it in a non-library file produces an E022.
+
+;@ CBORK: Export
+not-a-library-rule = uint

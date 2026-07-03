@@ -1,0 +1,26 @@
+id: "crates/cbork"
+language: "rust"
+layer: "library"
+
+tasks:
+  build:
+    options:
+      runInCI: true
+    inputs:
+      - "/crates/cbork/**/*.rs"
+      - "/crates/cbork/**/Cargo.toml"
+      - "/crates/cbork-cddl-compiler/**/*.rs"
+      - "/crates/cbork-cddl-compiler/**/Cargo.toml"
+      - "/crates/cbork-cddl-parser/**/*.rs"
+      - "/crates/cbork-cddl-parser/**/Cargo.toml"
+      - "/crates/cbork-abnf-parser/**/*.rs"
+      - "/crates/cbork-abnf-parser/**/Cargo.toml"
+      - "/crates/cbork-edn/**/*.rs"
+      - "/crates/cbork-edn/**/Cargo.toml"
+      - "/crates/cbork-catalog/**/*.rs"
+      - "/crates/cbork-catalog/**/Cargo.toml"
+      - "/cddl/rfc-std/**/*.cddl"
+      - "/crates/cbork-utils/**/*.rs"
+      - "/crates/cbork-utils/**/Cargo.toml"
+      - "/Cargo.toml"
+      - "/Cargo.lock"

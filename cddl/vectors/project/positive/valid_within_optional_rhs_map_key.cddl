@@ -1,0 +1,6 @@
+; source: project .within validation fixture
+; behavior: optional RHS map entries do not force a failure
+
+ok = lhs .within rhs
+lhs = { 1 => int }
+rhs = { 1 => int, ? 2 => tstr }

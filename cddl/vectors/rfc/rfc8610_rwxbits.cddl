@@ -1,0 +1,3 @@
+; source: RFC 8610 Section 3.8.2 Figure 10
+rwxbits = uint .bits rwx
+rwx = &(r: 2, w: 1, x: 0)

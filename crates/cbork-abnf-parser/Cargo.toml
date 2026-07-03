@@ -1,0 +1,24 @@
+#cspell: words memchr
+
+[package]
+name = "cbork-abnf-parser"
+version = "0.0.3"
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+description = "ABNF parser for RFC-style grammars used by the CBORK workspace."
+readme = "README.md"
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude = ["moon.yml"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lints]
+workspace = true
+
+[dependencies]
+pest = { version = "2.8.6", features = ["std", "pretty-print", "memchr", "const_prec_climber"] }
+pest_derive = { version = "2.8.6", features = ["grammar-extras"] }
+thiserror = "2.0.18"

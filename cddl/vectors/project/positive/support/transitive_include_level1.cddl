@@ -1,0 +1,5 @@
+; source: project import/include regression fixture
+; behavior: this level stays not-prunable because it is reached via include
+
+;# include "./transitive_include_level2.cddl"
+transitive_include_level1 = transitive_include_level2

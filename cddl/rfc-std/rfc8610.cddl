@@ -1,0 +1,67 @@
+;! # RFC8610 defined types
+
+;@ CBORK: Library
+
+rfc8610 = buuid /
+          uuid-string-abnf
+
+;! [buuid](https://github.com/lucas-clemente/cbor-specs/blob/master/uuid.md)
+buuid = #6.37(buuid-all)
+
+buuid-all = buuidv4 /
+            buuidv7 /
+            buuidv8 /
+            buuid-nil /
+            buuid-max /
+            buuid-other
+
+;@ CBORK: Export
+buuidv4 = bstr .abnfb uuidv4-abnf
+;@ CBORK: Export
+buuidv7 = bstr .abnfb uuidv7-abnf
+;@ CBORK: Export
+buuidv8 = bstr .abnfb uuidv8-abnf
+;@ CBORK: Export
+buuid-nil = bstr .abnfb uuid-nil-abnf
+;@ CBORK: Export
+buuid-max = bstr .abnfb uuid-max-abnf
+;@ CBORK: Export
+buuid-other = bstr .size 16
+
+
+uuid-string-abnf = '
+UUID     = 4hexOctet "-"
+           2hexOctet "-"
+           2hexOctet "-"
+           2hexOctet "-"
+           6hexOctet
+hexOctet = HEXDIG HEXDIG
+DIGIT    = %x30-39
+HEXDIG   = DIGIT / "A" / "B" / "C" / "D" / "E" / "F"
+'
+
+uuidv4-abnf = "UUIDv4" .det '
+    UUIDv4   = random-a version-and-random-b
+               random-c-and-variant
+    random-a              = 6OCTET
+    version-and-random-b  = %x40-4F OCTET
+    random-c-and-bariant  = %x80-BF 7OCTET
+'
+
+uuidv7-abnf = "UUIDv7" .det '
+    UUIDv7   = unix-ts-ms version-and-rand-a
+               rand-b-and-variant
+    unix-ts-ms            = 6OCTET
+    version-and-rand-a    = %x70-7F OCTET
+    rand-b-and-variant    = %x80-BF 7OCTET
+'
+uuidv8-abnf = "UUIDv8" .det '
+  UUIDv8   = custom-a version-and-custom-b
+             custom-c-and-variant
+  custom-a              = 6OCTET
+  version-and-custom-b  = %x80-8F OCTET
+  custom-c-and-variant  = %x80-BF 7OCTET
+'
+
+uuid-nil-abnf = "UUID-NIL = %x00.00.00.00.00.00.00.00.00.00.00.00.00.00.00.00"
+uuid-max-abnf = "UUID-MAX = %xFF.FF.FF.FF.FF.FF.FF.FF.FF.FF.FF.FF.FF.FF.FF.FF"

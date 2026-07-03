@@ -1,0 +1,32 @@
+;@ CBORK: Library
+
+rfc9237 = AIF-Specific /
+          AIF-REST
+
+;@ CBORK: Export
+AIF-Generic<Toid, Tperm> = [* [Toid, Tperm]]
+
+;@ CBORK: Export
+AIF-Specific = AIF-Generic<tstr, uint>
+
+;@ CBORK: Export
+AIF-REST = AIF-Generic<local-path, REST-method-set>
+local-path = tstr   ; URI relative to enforcement point
+REST-method-set = uint .bits methods
+methods = &(
+  GET: 0
+  POST: 1
+  PUT: 2
+  DELETE: 3
+  FETCH: 4
+  PATCH: 5
+  iPATCH: 6
+  Dynamic-GET: 0 .plus Dynamic-Offset ; 32
+  Dynamic-POST: 1 .plus Dynamic-Offset ; 33
+  Dynamic-PUT: 2 .plus Dynamic-Offset ; 34
+  Dynamic-DELETE: 3 .plus Dynamic-Offset ; 35
+  Dynamic-FETCH: 4 .plus Dynamic-Offset ; 36
+  Dynamic-PATCH: 5 .plus Dynamic-Offset ; 37
+  Dynamic-iPATCH: 6 .plus Dynamic-Offset ; 38
+)
+Dynamic-Offset = 32

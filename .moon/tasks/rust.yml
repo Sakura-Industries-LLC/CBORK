@@ -1,0 +1,150 @@
+$schema: "../cache/schemas/tasks.json"
+inheritedBy:
+  language: rust
+
+fileGroups:
+  sources:
+    - "**/*.rs"
+    - "**/Cargo.toml"
+    - "Cargo.toml"
+    - "Cargo.lock"
+    - "clippy.toml"
+    - "rust-toolchain.toml"
+    - "rustfmt.toml"
+  tests:
+    - "benches/**/*"
+    - "examples/**/*"
+    - "tests/**/*"
+
+tasks:
+  license-check:
+    command: "cargo"
+    args:
+      - "deny"
+      - "--manifest-path"
+      - "$projectRoot/Cargo.toml"
+      - "check"
+      - "licenses"
+      - "bans"
+      - "-c"
+      - "deny.toml"
+    options:
+      runFromWorkspaceRoot: true
+      runInCI: true
+    inputs:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "/Cargo.toml"
+      - "/deny.toml"
+
+  license-advisories:
+    command: "bash"
+    args:
+      - "-c"
+      - 'cargo deny --manifest-path "$projectRoot/Cargo.toml" check advisories -c deny.toml || true'
+    options:
+      cache: false
+      runFromWorkspaceRoot: true
+      runInCI: true
+    inputs:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "/Cargo.toml"
+      - "/deny.toml"
+
+  format-check:
+    command: "rustup"
+    args:
+      - "run"
+      - "nightly"
+      - "cargo"
+      - "fmt"
+      - "--all"
+      - "--check"
+    options:
+      runInCI: true
+    inputs:
+      - "@globs(sources)"
+      - "@globs(tests)"
+
+  fix-fmt:
+    command: "rustup"
+    args:
+      - "run"
+      - "nightly"
+      - "cargo"
+      - "fmt"
+      - "--all"
+    options:
+      runInCI: false
+    inputs:
+      - "@globs(sources)"
+      - "@globs(tests)"
+
+  fix-clippy:
+    command: "cargo"
+    args:
+      - "clippy"
+      - "--fix"
+      - "--allow-dirty"
+      - "--allow-staged"
+      - "--all-targets"
+    options:
+      runInCI: false
+    inputs:
+      - "@globs(sources)"
+      - "@globs(tests)"
+
+  clippy:
+    command: "cargo"
+    args:
+      - "clippy"
+      - "--all-targets"
+      - "--"
+      - "-D"
+      - "warnings"
+    options:
+      runInCI: true
+    inputs:
+      - "@globs(sources)"
+      - "@globs(tests)"
+
+  build:
+    command: "cargo"
+    args:
+      - "build"
+      - "--release"
+    options:
+      runInCI: true
+    inputs:
+      - "@globs(sources)"
+
+  test:
+    command: "cargo"
+    args:
+      - "nextest"
+      - "run"
+    options:
+      runInCI: true
+    inputs:
+      - "@globs(sources)"
+      - "@globs(tests)"
+
+  ci:
+    deps:
+      - "format-check"
+      - "clippy"
+      - "license-check"
+      - "license-advisories"
+      - "build"
+      - "test"
+    options:
+      runDepsInParallel: false
+      runInCI: true
+
+  fix:
+    deps:
+      - "fix-fmt"
+    options:
+      runDepsInParallel: false
+      runInCI: false

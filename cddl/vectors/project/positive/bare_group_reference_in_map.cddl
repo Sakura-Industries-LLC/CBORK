@@ -1,0 +1,22 @@
+; Step 5.10 regression fixture: bare group reference inside a map.
+;
+; The map `headers` includes the named group `Generic-Headers` as a
+; bare group reference.  The CDDL spec treats this as normal group
+; inclusion: the concrete entries from `Generic-Headers` must be
+; merged into the map's effective entries.  The lint must succeed
+; because the effective map should not be left with a synthetic
+; `Generic-Headers` socket key.
+
+root = headers
+
+Generic-Headers = (
+  alg: int,
+  kid: bstr,
+)
+
+headers = {
+  Generic-Headers,
+  * uint => values,
+}
+
+values = bytes

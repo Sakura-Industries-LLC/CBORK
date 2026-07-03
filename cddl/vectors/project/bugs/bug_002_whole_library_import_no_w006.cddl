@@ -1,0 +1,18 @@
+; Bug repro: a consumer that imports a whole library (no `from`
+; clause) and references a non-exported private helper from
+; that library must NOT trigger a W006 "unused library export"
+; warning.  A library export is a public API surface, not an
+; obligation for every consumer of the library to reference
+; every exported name.  Before the fix, W006 falsely fired for
+; the unused `public-a` export.
+;
+; Expected after fix:
+; - W003 may fire (consumer uses non-exported `private-helper`).
+; - no W004 (the directive IS used).
+; - no W005 (no selected names).
+; - no W006 (whole-library import, unused export is not an
+;   obligation).
+
+;# import "./support/bug_002_whole_lib.cddl" as bug_002_lib
+
+ok = bug_002_lib.private-helper

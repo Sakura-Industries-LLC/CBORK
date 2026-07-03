@@ -1,0 +1,11 @@
+id = "cddl"
+name = "CDDL"
+version = "0.1.0"
+schema_version = 1
+authors = ["Steven Johnson <steven.johnson@sakuraindustries.net>"]
+description = "CDDL syntax support and editor integrations for CBORK"
+repository = "https://github.com/Sakura-Industries-LLC/cbork"
+
+[grammars.cddl]
+repository = "https://codeberg.org/SakuraIndustries/tree-sitter-cddl.git"
+rev = "main"

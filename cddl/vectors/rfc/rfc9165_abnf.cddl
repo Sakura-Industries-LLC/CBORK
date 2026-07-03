@@ -1,0 +1,7 @@
+rfc9165-abnf = Tag1004 / Tag0
+
+; source: RFC 9165 Figure 5 and Section 3
+Tag1004 = #6.1004(text .abnf full-date)
+Tag0 = #6.0(text .abnf date-time)
+
+;# import rfc9165

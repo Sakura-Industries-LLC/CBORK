@@ -1,0 +1,10 @@
+; Step 5.11 regression fixture: a wider `.x-enc` controller is
+; within a narrower `.x-enc` controller.
+;
+; Both sides use the same `.x-enc` transform; the lint must succeed
+; because the controllers subtype.
+
+ok = (bstr .x-enc payload-narrow) .within (bstr .x-enc payload-wide)
+
+payload-narrow = { 1 => int }
+payload-wide = { 1 => int, ? 2 => tstr }

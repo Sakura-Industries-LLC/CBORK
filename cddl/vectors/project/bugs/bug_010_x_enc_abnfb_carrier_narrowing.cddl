@@ -1,0 +1,34 @@
+; BUG-010 reproducer: `.x-enc.abnf` and `.x-enc.abnfb` must be
+; normalized to the same `ControlOp::XEnc` as the base `.x-enc`
+; operator during `.within` subtype checks.  Before the fix,
+; `.x-enc.abnfb` fell through to `Other(".x-enc.abnfb")` and was
+; rejected structurally against plain `bstr` instead of being
+; narrowed via the carrier wire type.
+
+; The carrier is `(bstr .size 48)`.  The `.within bstr`
+; comparison must succeed because `(bstr .size 48)` is a subtype
+; of `bstr`.  The annotation is metadata for later validation
+; tooling, not part of the subtype relation.
+
+encrypted-cek = ( bstr .size 48 ) .x-enc.abnfb ( "cek" .det cek-abnf )
+
+cek-abnf = 'cek = 32OCTET\nOCTET = %x00-FF\n'
+
+; Positive: carrier within plain `bstr`.
+positive = encrypted-cek .within bstr
+
+; Positive: carrier within choice.
+positive-choice = encrypted-cek .within ( bstr / nil )
+
+; Negative: a different carrier size constraint must still fail.
+negative-narrow = encrypted-cek .within ( bstr .size 0 )
+
+; Negative: `.x-enc` must not subtype as `.x-hash`.
+enc-vs-hash-lhs = [ ( bstr .size 48 ) .x-enc.abnfb ( "x" .det cek-abnf ) ]
+enc-vs-hash-rhs = [ ( bstr .size 48 ) .x-hash.abnfb ( "x" .det cek-abnf ) ]
+enc-vs-hash-root = enc-vs-hash-lhs .within enc-vs-hash-rhs
+
+; Negative: `.x-enc` must not subtype as `.x-brotli`.
+enc-vs-brotli-lhs = [ ( bstr .size 48 ) .x-enc.abnfb ( "x" .det cek-abnf ) ]
+enc-vs-brotli-rhs = [ ( bstr .size 48 ) .x-brotli.abnfb ( "x" .det cek-abnf ) ]
+enc-vs-brotli-root = enc-vs-brotli-lhs .within enc-vs-brotli-rhs

@@ -1,0 +1,6 @@
+; source: project import/include regression fixture
+; behavior: bare import from the standard library should stay prunable
+; note: the compiled tree keeps the imported material available for later pruning
+
+;# import rfc9052
+cose_key_ref = COSE_Key

@@ -1,0 +1,5 @@
+; source: project import/include regression fixture
+; behavior: only the explicitly named item should be retained by the compiler
+
+keep_me = tstr
+drop_me = uint

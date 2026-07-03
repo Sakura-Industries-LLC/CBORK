@@ -1,0 +1,5 @@
+; source: project import/include regression fixture
+; behavior: absolute import should resolve relative to the repository root path
+
+;# import "/cddl/vectors/project/positive/support/absolute_import_leaf.cddl"
+absolute_import_root = absolute_import_leaf

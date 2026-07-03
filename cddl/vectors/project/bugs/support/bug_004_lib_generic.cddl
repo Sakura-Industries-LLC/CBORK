@@ -1,0 +1,11 @@
+; BUG-004 support: a CBORK library whose private generic root
+; `all<keytype>` collides with another independent library's
+; private plain root `all`.  The consumer imports both libraries
+; (no `from` clause, no alias) but does not directly select or
+; reference either library's private `all` root.
+
+;@ CBORK: Library
+;@ CBORK: Export
+bar = all<bstr>
+
+all<keytype> = keytype

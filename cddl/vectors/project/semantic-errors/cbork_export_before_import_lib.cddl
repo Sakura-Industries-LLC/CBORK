@@ -1,0 +1,4 @@
+; Step 5.12 fixture support: stub library for the
+; `cbork_export_before_import` negative fixture.
+;@ CBORK: Library
+helper = uint

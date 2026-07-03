@@ -1,0 +1,27 @@
+; source: RFC 9165 Section 3 and Section 5
+; Control operators .plus, .det, .feature, .abnfb
+
+; .plus — additional type choices
+basic-type = int / tstr
+extended-type = basic-type .plus float16
+
+; .det — deterministically encoded CBOR contents
+wrapped-key = bstr .det COSE_Key
+
+COSE_Key = {
+  1: uint,   ; kty
+  ? 2: bstr, ; kid
+}
+
+; .feature — named feature toggle
+feature-flags = uint .feature "compression"
+
+; .abnfb — ABNF grammar applied to byte string
+ip-address-bytes = bstr .abnfb ip-address-abnf
+
+ip-address-abnf = '
+ip-address = IPv4address / IPv6address
+IPv4address = dec-octet "." dec-octet "." dec-octet "." dec-octet
+dec-octet = DIGIT / %x31-39 DIGIT / "1" 2DIGIT / "2" %x30-34 DIGIT / "25" %x30-35
+IPv6address = "::"
+'

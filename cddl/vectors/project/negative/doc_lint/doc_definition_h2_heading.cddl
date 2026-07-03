@@ -1,0 +1,17 @@
+; source: project doc-lint fixture
+;! # Definition using forbidden level-2 heading fixture
+;!
+;! This fixture documents an exported definition with a level-2 Markdown
+;! heading, which is reserved for sectioning inside file/module documentation.
+;! Definition documentation must start with a level-3 Markdown heading.
+;! Expected doc-lint diagnostic: definition docs must use a level-3 heading.
+
+;@ CBORK: Library
+;@ CBORK: Export
+;! ## location-references
+;! This uses a level-2 heading, which is forbidden for definition docs.
+location-references = [ +location-reference ]
+
+location-reference = {
+  url: tstr,
+}

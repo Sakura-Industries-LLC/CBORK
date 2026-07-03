@@ -1,0 +1,3 @@
+;# import arg.untagged-argon2id<t> from "./support/generic_import_leaf.cddl" as arg
+
+named_generic_alias_root<t> = arg.untagged-argon2id<t>

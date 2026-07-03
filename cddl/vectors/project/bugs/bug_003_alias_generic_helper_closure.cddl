@@ -1,0 +1,13 @@
+; Bug repro: a consumer that imports a library which itself
+; imports another library under an alias and instantiates an
+; aliased generic body must not lose the alias-qualified
+; private helper closure that the generic body references.
+; Before the fix the consumer emitted an E016 undefined
+; reference for the alias-qualified private helper.
+;
+; Expected after fix: no E016; the helper closure is retained,
+; alias-qualified, and visible to the resolver / finalizer.
+
+;# import "./support/bug_003_middle.cddl" as middle
+
+ok = middle.via-alias

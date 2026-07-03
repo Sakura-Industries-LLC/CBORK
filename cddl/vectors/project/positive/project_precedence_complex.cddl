@@ -1,0 +1,31 @@
+; source: project
+; Complex type compositions with control operators
+
+; Control operators used in type definitions
+status = uint .gt 0
+name-limited = tstr .size 64
+offset = int .ge -128
+
+; Complex nested alternatives with control operators
+complex-record = {
+  ? id: uint .gt 0,
+  ? label: tstr .size 8,
+  data: bstr / #6.24(bstr),
+}
+
+; Mixed array types with operators
+structured-array = [
+  header: uint .size 4,
+  ? payload: bstr .cbor { * int => tstr },
+  * items: int .ge -128,
+]
+
+; Group alternation with choice alternatives
+shape-a = [a: [+ text]]
+shape-b = [b: [? number]]
+shape-c = [c: { * tstr => any }]
+multi-shape = shape-a / shape-b / shape-c
+
+; Type socket with control operator
+$SocketName /= int .gt 0
+$SocketName /= tstr .size 3

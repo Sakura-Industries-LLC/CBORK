@@ -1,0 +1,7 @@
+; Step 5.11 negative fixture: `.x-hash` is not within
+; `.x-compressed` (compression family).  Distinct transform
+; families.
+
+not-ok = (bstr .x-hash payload) .within (bstr .x-compressed payload)
+
+payload = { 1 => int }

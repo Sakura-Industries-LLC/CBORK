@@ -1,0 +1,22 @@
+; source: project doc-lint fixture
+;! # Blank-line collapse fixture root
+;!
+;! Root definition used to wire the fixture rules together so the CDDL
+;! linter does not flag them as unreferenced.
+
+doc_fixture_blank_lines_root = [
+  doc_fixture_blank_lines_first,
+  doc_fixture_blank_lines_second,
+]
+
+;! # Blank-line collapse expected fixture
+;!
+;! This fixture is the *after* side of the `--doc --fix` round-trip
+;! for the blank-line collapse policy. Compare against
+;! `doc_fix_blank_lines_input.cddl` to confirm that multiple consecutive
+;! blank lines in the final fixed CDDL are reduced to a single blank
+;! line. The CDDL source rules themselves must remain unchanged.
+
+doc_fixture_blank_lines_first = 1
+
+doc_fixture_blank_lines_second = 2

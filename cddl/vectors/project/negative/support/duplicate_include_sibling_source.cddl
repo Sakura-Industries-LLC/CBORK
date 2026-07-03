@@ -1,0 +1,3 @@
+; source: project import/include regression fixture
+; behavior: shared by two duplicate-include fixtures
+shared_leaf = tstr

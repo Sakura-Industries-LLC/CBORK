@@ -1,0 +1,13 @@
+; BUG-004 support: a CBORK library whose private root name `all`
+; collides with another independent library's private root `all`.
+; The consumer imports both libraries (no `from` clause, no alias)
+; but does not directly select or reference either library's
+; private `all` root.  Before the fix, the two independent
+; libraries' private roots merged into one consumer namespace and
+; produced a false E013 plain-vs-generic collision on `all`.
+
+;@ CBORK: Library
+;@ CBORK: Export
+foo = all
+
+all = uint

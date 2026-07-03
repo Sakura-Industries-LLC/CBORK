@@ -1,0 +1,22 @@
+[package]
+name = "cbork-edn"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CBOR Extended Diagnostic Notation (EDN) parser and encoder for the CBORK workspace."
+readme = "README.md"
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude = ["moon.yml"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lints]
+workspace = true
+
+[dependencies]
+half = "2.7.1"
+minicbor = { version = "2", features = ["std", "half"] }
+thiserror = "2.0.18"

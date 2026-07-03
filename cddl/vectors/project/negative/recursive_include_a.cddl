@@ -1,0 +1,5 @@
+; source: project import/include negative regression fixture
+; behavior: include recursion must fail hard
+
+;# include "./recursive_include_b.cddl"
+recursive_include_a = recursive_include_b

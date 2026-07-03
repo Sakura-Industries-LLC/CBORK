@@ -1,0 +1,15 @@
+; source: project doc-lint fixture
+;! # Exported definition missing docs fixture
+;!
+;! This fixture exports a rule with `;@ CBORK: Export` but provides no
+;! definition-level documentation for it.
+;! Expected doc-lint diagnostic: exported definition missing documentation.
+
+;@ CBORK: Library
+;@ CBORK: Export
+location-references = [ +location-reference ]
+
+location-reference = {
+  url: tstr,
+  ? label: tstr,
+}

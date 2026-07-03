@@ -1,0 +1,11 @@
+; Step 5.7 regression fixture.
+;
+; The consumer imports only lib.wrapper.
+; The imported generic's .within RHS refers to std.Wrapper, where std is
+; an alias that exists in the generic definition's file, not in this consumer.
+; This should lint cleanly once generic .within expansion preserves
+; definition-site scope.
+
+root = lib.wrapper<uint>
+
+;# import lib.wrapper from "./support/generic_within_definition_site_lib.cddl" as lib

@@ -1,0 +1,8 @@
+; Support library for the negative Step 5.7 fixture.
+;
+; The `.within` RHS requires a tstr array but the consumer instantiates
+; the generic with `uint`, which the lint must reject.
+
+wrapper<T> = [T] .within std.Wrapper
+
+;# import "./generic_within_definition_site_negative_std.cddl" as std

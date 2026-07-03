@@ -1,0 +1,12 @@
+; source: project render fixture
+; behavior: cose-alg = 1, cose-iv = 5, cose-salt = -20 are
+;           named-constant references. In concrete mode the
+;           renderer folds them into the rules that reference them.
+
+cose-alg = 1
+cose-iv = 5
+cose-salt = -20
+
+alg = cose-alg
+salt = cose-salt
+iv = cose-iv

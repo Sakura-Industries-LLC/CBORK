@@ -1,0 +1,21 @@
+; source: project
+; Exercise comment retention — interleaved comments and expressions
+
+; file header comment
+; describing the schema purpose
+
+person = {              ; a person record
+  name: tstr,           ; full name
+  ? age: uint .lt 150,  ; optional age, must be reasonable
+  ? email: tstr,        ; contact email
+}
+
+; separator comment between records
+
+address = {             ; an address record
+  street: tstr,         ; street name and number
+  city: tstr,           ; city
+  ? zip: tstr .size 5,  ; postal code
+}
+
+; trailing comment at end of file

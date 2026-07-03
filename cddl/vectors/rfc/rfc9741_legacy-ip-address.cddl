@@ -1,0 +1,5 @@
+; source: RFC 9741 Section 3.1 Figure 1
+legacy-ip-address = text .join legacy-ip-address-elements
+legacy-ip-address-elements = [bytetext, ".", bytetext, ".", bytetext, ".", bytetext]
+bytetext = text .base10 byte
+byte = 0..255

@@ -1,0 +1,2 @@
+; source: RFC 9741 Table 3
+yang-json-sid = text .base10 (0..9223372036854775807)

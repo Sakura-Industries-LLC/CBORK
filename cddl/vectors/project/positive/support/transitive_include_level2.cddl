@@ -1,0 +1,5 @@
+; source: project import/include regression fixture
+; behavior: this level switches into imported material and becomes prunable
+
+;# import rfc9052
+transitive_include_level2 = COSE_Key

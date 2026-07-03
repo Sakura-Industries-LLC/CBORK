@@ -1,0 +1,5 @@
+; source: RFC 8610 Section 3.8.1 Figure 8 and Figure 9
+full-address = [[+ label], ip4, ip6]
+ip4 = bstr .size 4
+ip6 = bstr .size 16
+label = bstr .size (1..63)

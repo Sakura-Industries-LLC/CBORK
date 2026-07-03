@@ -1,0 +1,2 @@
+; source: RFC 9090 Section 6 and Section 7.2
+roid = #6.110(bstr)

@@ -1,0 +1,13 @@
+$schema: "./cache/schemas/workspace.json"
+defaultProject: "root"
+
+projects:
+  root: "."
+  crates/cbork: "crates/cbork"
+  crates/cbork-abnf-parser: "crates/cbork-abnf-parser"
+  crates/cbork-catalog: "crates/cbork-catalog"
+  crates/cbork-cddl-compiler: "crates/cbork-cddl-compiler"
+  crates/cbork-cddl-parser: "crates/cbork-cddl-parser"
+  crates/cbork-edn: "crates/cbork-edn"
+  crates/cbork-utils: "crates/cbork-utils"
+  extension/zed: "extension/zed"

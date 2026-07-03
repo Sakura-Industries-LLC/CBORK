@@ -1,0 +1,19 @@
+; source: BUG-004 reproducer
+; behavior: a consumer that imports two independent CBORK
+; libraries (one whose private root is a plain `all = uint`,
+; one whose private root is a generic `all<t> = t`) must not
+; trigger an E013 plain-vs-generic collision on `all`.  The
+; two private roots live in independent libraries; only the
+; exported `foo` / `bar` symbols are part of the consumer's
+; surface.
+;
+; The libraries are imported WITHOUT aliases, so both private
+; `all` definitions land in the consumer's effective namespace
+; under the bare name `all`.  Plain-vs-generic collision only
+; matters within the same effective namespace/origin; the
+; consumer does not directly reference either library's private
+; `all` root.
+
+;# import "./support/bug_004_lib_plain.cddl"
+;# import "./support/bug_004_lib_generic.cddl"
+consumer-root = [ foo, bar ]

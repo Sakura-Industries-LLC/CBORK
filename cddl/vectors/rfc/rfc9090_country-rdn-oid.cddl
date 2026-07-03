@@ -1,0 +1,4 @@
+; source: RFC 9090 Figure 8
+country-rdn = {country-oid => country-value}
+country-oid = bytes .oid [2, 5, 4, 6]
+country-value = text .size 2

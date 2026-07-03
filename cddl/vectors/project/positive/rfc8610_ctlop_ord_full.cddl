@@ -1,0 +1,10 @@
+; source: RFC 8610 Section 3.8.6
+; Control operators .lt, .le, .eq, .ne — numeric comparisons
+
+age = uint .lt 150
+temperature = number .le 100.0
+status-code = uint .eq 200
+error-code = uint .ne 0
+score = number .ge 0
+rating = int .gt 0
+name = tstr .default "unnamed"

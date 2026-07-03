@@ -1,0 +1,3 @@
+; Support standard-like module for generic .within parameter substitution tests.
+
+Wrapper = [uint, bstr]

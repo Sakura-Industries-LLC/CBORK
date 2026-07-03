@@ -1,0 +1,73 @@
+# cargo-deny configuration for the cbork workspace.
+#
+# This file is consumed by `cargo deny check` via the moon `license-check`
+# and `license-advisories` tasks, which are part of the per-crate `ci` task
+# and run in CI under the Docker-pinned `cargo-deny`.
+#
+# The canonical CI command is:
+#
+#     just fix-ci
+#
+# or, to run just the license portions:
+#
+#     moon run :ci     # includes license-check + license-advisories
+#     moon run :fix    # formatting only
+#
+# Workspace license policy (see plans/license-plan.md, Phase 1):
+#
+#   * `cbork`                   -> AGPL-3.0-only
+#   * `cbork-cddl-compiler`     -> MPL-2.0
+#   * `cbork-catalog`           -> MPL-2.0
+#   * `cbork-edn`               -> MPL-2.0
+#   * `cbork-cddl-parser`       -> MIT OR Apache-2.0
+#   * `cbork-abnf-parser`       -> MIT OR Apache-2.0
+#   * `cbork-utils`             -> MIT OR Apache-2.0
+#
+# Third-party dependencies must be in the `allow` list below.
+
+[advisories]
+# Inherit severity from the workspace settings where possible.
+unmaintained = "workspace"
+unsound = "workspace"
+unused-ignored-advisory = "warn"
+
+[bans]
+# Multiple versions of the same crate are tolerated but produce a warning
+# (so duplicate-version pressure surfaces during review without failing CI).
+multiple-versions = "warn"
+# Allow wildcards in dependency version requirements (e.g. `bpaf = "0.9"`).
+wildcards = "allow"
+
+# Accepted exception: the `phf` family (phf, phf_generator, phf_shared) is
+# currently pulled in twice:
+#
+#   * phf 0.14.x is used directly by `cbork-catalog`.
+#   * phf 0.13.x arrives transitively through `rumdl` (used by
+#     `cbork-cddl-compiler` for markdown linting).
+#
+# Until `rumdl` upgrades to phf 0.14.x this duplicate is expected and the
+# `multiple-versions = "warn"` setting above keeps the warning visible
+# during review rather than failing the build.
+
+[licenses]
+allow = [
+    # Permissive licenses used across the Rust ecosystem
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "MIT",
+    "BlueOak-1.0.0",
+    # Unicode data (used by ICU-based crates such as those pulled in by the
+    # CDDL compiler for case folding and normalization)
+    "Unicode-3.0",
+    # First-party: cbork-cddl-compiler, cbork-catalog, cbork-edn
+    "MPL-2.0",
+    # First-party: cbork (AGPL CLI)
+    "AGPL-3.0-only",
+]
+# Permit dependencies that do not declare a license. Every dependency in
+# the current tree does declare one, so this is a safety valve rather than
+# a current need.
+private = { ignore = true }
+# Permit an allow-list entry to go unused, so that removing the last
+# dependency that needs a license does not require editing this file.
+unused-allowed-license = "allow"

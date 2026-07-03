@@ -1,0 +1,23 @@
+; source: project render fixture
+; behavior: a group plug (`one-pq-signature`) defined purely through
+;           `//=` augmentations should be inlined into the map that
+;           uses it as a bare reference. The three plug bodies
+;           become a choice wrapped in the grpent parenthesised
+;           form.
+;
+; expected: the rendered output contains a single top-level rule
+;           for `alg-sig-map` whose body has all three plug entries
+;           (ml-dsa-44, ml-dsa-65, ml-dsa-87) inlined as a choice.
+;           The `one-pq-signature //= ...` augmentations themselves
+;           are not rendered as separate top-level rules.
+
+one-pq-signature //= (ml-dsa-44 => bstr)
+one-pq-signature //= (ml-dsa-65 => bstr)
+one-pq-signature //= (ml-dsa-87 => bstr)
+
+alg-sig-map = {
+  ed25519 => bstr,
+  one-pq-signature
+} .within { 2*2 int => bstr }
+
+bstr = bytes .size 64

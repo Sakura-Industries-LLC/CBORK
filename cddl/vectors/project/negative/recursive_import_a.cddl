@@ -1,0 +1,5 @@
+; source: project import/include negative regression fixture
+; behavior: import recursion must fail hard
+
+;# import "./recursive_import_b.cddl"
+recursive_import_a = recursive_import_b

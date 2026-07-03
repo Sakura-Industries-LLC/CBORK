@@ -1,0 +1,21 @@
+root = COSE-Sign<Null-Headers, nil, Null-COSE-Signature>
+
+COSE-Sign<headers, dntls-payload, dntls-signatures> = [
+  headers,
+  payload: dntls-payload,
+  signatures: [+ dntls-signatures],
+] .within Target-Sign
+
+Target-Sign = [
+  Null-Headers,
+  payload: nil,
+  signatures: [+ Null-COSE-Signature],
+]
+
+Null-Headers = {}
+Null-COSE-Signature = []
+
+; This include intentionally follows the concrete generic alias above.
+; It contains an unrelated generic definition; the alias must still be
+; expanded and must not be misclassified as an open generic template.
+;# include "./support/generic_within_trailing_generic_helper.cddl"

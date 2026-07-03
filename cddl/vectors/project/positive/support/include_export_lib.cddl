@@ -1,0 +1,10 @@
+; Step 5.12 include-style export contract support: a CBORK
+; library with two rules.  `public-rule` is exported; the
+; consumer must reference only the exported name.
+
+;@ CBORK: Library
+
+;@ CBORK: Export
+public-rule = uint
+
+private-helper = bstr .size 16

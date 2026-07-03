@@ -1,0 +1,5 @@
+; source: RFC 9165 Figure 2
+c = "foo" .cat '
+  bar
+  baz
+'

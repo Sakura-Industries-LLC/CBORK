@@ -1,0 +1,21 @@
+; source: project doc-lint fixture
+;! # Doc fixture: literal `cddl` fenced block
+;!
+;! This fixture demonstrates a documentation comment that contains a literal
+;! ```` ```cddl ```` fenced code block.  The doc-lint transform must not
+;! confuse this user-authored fence with generated splice markers, and must
+;! preserve the fence verbatim through the transform.
+;!
+;! Example value:
+;!
+;! ```cddl
+;! doc_fixture_fenced = {
+;!   "name": "fenced-cddl-doc",
+;!   "items": [1, 2, 3],
+;! }
+;! ```
+
+doc_fixture_fenced = {
+  "name": tstr,
+  "items": [ * uint ],
+}

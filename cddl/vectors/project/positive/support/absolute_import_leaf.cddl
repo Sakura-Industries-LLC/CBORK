@@ -1,0 +1,4 @@
+; source: project import/include regression fixture
+; behavior: this file is brought in through a prunable import edge
+
+absolute_import_leaf = bstr

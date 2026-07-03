@@ -1,0 +1,14 @@
+; Step 5.7/5.8 regression fixture.
+;
+; The consumer's plain `all = root` rule conflicts by base name with
+; an unreferenced weak imported generic helper `all<keytype>`.  The
+; generic helper is selected by the cherry-picked `from` clause but
+; never instantiated by this consumer.  After the reachability
+; pruner and definition-strength normalization run, the generic helper
+; is silently pruned (it is unreferenced weak material) and must NOT
+; collide with the strong local plain rule.  The lint must succeed.
+
+all = root
+root = 1
+
+;# import _all_import.all<keytype> from "./support/plain_vs_generic_collision_unreferenced_generic_lib.cddl" as _all_import

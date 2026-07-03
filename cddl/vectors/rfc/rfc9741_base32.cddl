@@ -1,0 +1,6 @@
+; source: RFC 9741 Table 1
+base32 = text .b32 signature
+
+signature = bytes .cbor COSE_Sign1
+
+;# import rfc9052

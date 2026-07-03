@@ -1,0 +1,15 @@
+; BUG-011 reproducer (include): directly including a file that is
+; not marked `;@ CBORK: Library` must surface a W007 warning at the
+; include directive.  See `support/non_library_time.cddl` for the
+; non-library target.
+;
+; BUG-011 follow-up: the consumer's reference to `dntls-epoch`
+; is non-exported in the included file, so the consumer must
+; also surface a W003 warning (cross-file direct-use of a
+; non-exported symbol).
+
+;# include "./support/non_library_time.cddl"
+
+start = epoch-only
+
+epoch-only = dntls-epoch

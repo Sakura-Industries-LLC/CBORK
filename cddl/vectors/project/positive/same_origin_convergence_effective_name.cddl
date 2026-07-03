@@ -1,0 +1,13 @@
+; Step 5.9 regression fixture: same-origin import convergence (effective name).
+;
+; The consumer imports the same library helper through two import
+; paths that converge on the SAME effective name AND the SAME source
+; origin.  The second arrival is the same effective definition
+; reached through a different import route and must NOT emit a
+; W001 redundant-definition warning.
+
+consumer_a = same_origin_helper
+
+;# import same_origin_helper from "./support/same_origin_convergence_effective_name_lib.cddl"
+
+;# import same_origin_helper from "./support/same_origin_convergence_effective_name_lib.cddl"

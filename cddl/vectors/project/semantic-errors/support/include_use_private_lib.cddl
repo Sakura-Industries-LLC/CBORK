@@ -1,0 +1,11 @@
+; Step 5.12 include-style export contract support: a CBORK
+; library with two rules.  `public-rule` is exported; the
+; consumer in `include_use_export_uses_private.cddl` references
+; `private-helper` which is not exported, triggering W003.
+
+;@ CBORK: Library
+
+;@ CBORK: Export
+public-rule = uint
+
+private-helper = bstr .size 16

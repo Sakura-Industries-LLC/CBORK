@@ -1,0 +1,19 @@
+; source: project doc-lint fixture
+; The trailing `;!` marker below would, without the marker-misuse rule,
+; try to bind documentation to `trailing_doc_root`. With the rule in
+; place, the marker is treated as an ordinary trailing comment and does
+; not steal the documentation comment from the rule it appears on.
+trailing_doc_root = [trailing_doc_directive]
+
+;! # Trailing `;!` marker misuse fixture
+;!
+;! The `;!` on the trailing comment below is treated as a regular comment,
+;! not as documentation. Special markers are recognized only after leading
+;! whitespace on a standalone comment line.
+;! Expected doc-lint diagnostic: special marker `;!` used as a trailing comment.
+;!
+;! This fixture uses the canonical `;! # Heading` form so it proves the
+;! marker-misuse rule catches even a marker whose body would otherwise
+;! bind a level-1 documentation heading to the trailing rule.
+
+trailing_doc_directive = 1  ;! # Would-be heading for `trailing_doc_directive`

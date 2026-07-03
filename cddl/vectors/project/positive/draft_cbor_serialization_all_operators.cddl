@@ -1,0 +1,28 @@
+; source: draft-ietf-cbor-serialization-06
+; Control operators .prefp, .prefpseq, .dtrm, .dtrmseq
+
+; .prefp — preferred serialization
+time-pref = time .prefp time-preferred
+
+time-preferred = #6.1(1.0)
+
+; .dtrm — deterministic serialization
+sig-strict = sig-structure .dtrm sig-deterministic
+
+sig-deterministic = [
+  context: tstr,
+  body: bstr,
+]
+
+; .prefpseq — preferred serialization for sequences
+seq-pref = [ + uint ] .prefpseq [ + uint .size 4 ]
+
+; .dtrmseq — deterministic serialization for sequences
+seq-det = [ + int ] .dtrmseq [ + int .size 8 ]
+
+; Standard postlude types used above
+time = #6.1(number)
+sig-structure = [
+  context: tstr,
+  body: bstr,
+]

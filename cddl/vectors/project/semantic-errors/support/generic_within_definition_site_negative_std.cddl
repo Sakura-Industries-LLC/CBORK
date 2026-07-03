@@ -1,0 +1,6 @@
+; Support standard-like module for the negative Step 5.7 fixture.
+;
+; Requires a tstr header — incompatible with the `uint` argument the
+; negative consumer instantiates.
+
+Wrapper = [tstr]

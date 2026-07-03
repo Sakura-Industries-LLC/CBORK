@@ -1,0 +1,9 @@
+; BUG-003 middle support: a library that imports another
+; library under an alias and instantiates an aliased generic
+; whose body references private helpers.  The middle
+; library re-exports the instantiated value as `via-alias`.
+
+;# import "./bug_003_lib_a.cddl" as a
+
+via-alias = a.Wrapper<inner-type>
+inner-type = uint

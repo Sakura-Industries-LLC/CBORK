@@ -1,0 +1,7 @@
+; Step 5.12 positive regression: a consumer that imports a
+; library and references at least one brought-in name must
+; NOT emit a W004 or W005 warning.
+
+;# import helper from "./support/used_lib.cddl"
+
+ok = helper

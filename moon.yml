@@ -1,0 +1,131 @@
+tasks:
+  fix:
+    deps:
+      - "root:markdown-fix"
+      - "root:test-rustfmt"
+    options:
+      runInCI: false
+
+  test-rustfmt:
+    command: "rustfmt"
+    args:
+      - "+nightly"
+      - "--version"
+
+  ci:
+    deps:
+      - "root:markdown-check"
+      - "root:spell-check"
+      - "root:cbork-rfc-std-lint"
+      - "root:cbork-rfc-vectors-lint"
+    options:
+      runInCI: true
+
+  cbork-rfc-std-lint:
+    deps:
+      - "crates/cbork:build"
+    command: "bash"
+    args:
+      - "-lc"
+      - "target/release/cbork lint --strict cddl/rfc-std"
+    options:
+      runFromWorkspaceRoot: true
+      runInCI: true
+      outputStyle: "stream"
+    inputs:
+      - "cddl/rfc-std/**/*.cddl"
+      - "crates/cbork/**/*.rs"
+      - "crates/cbork-cddl-compiler/**/*.rs"
+      - "crates/cbork-cddl-parser/**/*.rs"
+      - "crates/cbork-abnf-parser/**/*.rs"
+      - "crates/cbork-edn/**/*.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+  cbork-rfc-vectors-lint:
+    deps:
+      - "crates/cbork:build"
+    command: "bash"
+    args:
+      - "-lc"
+      - "target/release/cbork lint --strict cddl/vectors/rfc"
+    options:
+      runFromWorkspaceRoot: true
+      runInCI: true
+      outputStyle: "stream"
+    inputs:
+      - "cddl/vectors/rfc/**/*.cddl"
+      - "crates/cbork/**/*.rs"
+      - "crates/cbork-cddl-compiler/**/*.rs"
+      - "crates/cbork-cddl-parser/**/*.rs"
+      - "crates/cbork-abnf-parser/**/*.rs"
+      - "crates/cbork-edn/**/*.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+  markdown-check:
+    command: "rumdl"
+    args:
+      - "check"
+      - "."
+    options:
+      runInCI: true
+      outputStyle: "stream"
+    inputs:
+      - "**/*.md"
+      - "**/*.mdx"
+      - "**/*.markdown"
+      - "!**/node_modules/**"
+
+  spell-check:
+    command: "cspell"
+    args:
+      - "lint"
+      - "--config"
+      - "cspell.json"
+      - "--no-progress"
+      - "."
+    options:
+      runInCI: true
+      outputStyle: "stream"
+    inputs:
+      - "**/*.c"
+      - "**/*.cddl"
+      - "**/*.h"
+      - "**/*.js"
+      - "**/*.json"
+      - "**/*.md"
+      - "**/*.markdown"
+      - "**/*.mdx"
+      - "**/*.rs"
+      - "**/*.scm"
+      - "**/*.sh"
+      - "**/*.toml"
+      - "**/*.yaml"
+      - "**/*.yml"
+      - "!**/node_modules/**"
+      - "!extension/zed/grammars/cddl/**"
+      - "cspell.json"
+      - ".config/dictionaries/project.dic"
+
+  markdown-fix:
+    command: "rumdl"
+    args:
+      - "check"
+      - "--fix"
+      - "."
+    options:
+      runInCI: false
+    inputs:
+      - "**/*.md"
+      - "**/*.mdx"
+      - "**/*.markdown"
+      - "!**/node_modules/**"
+
+  container-cache-dir:
+    command: "mkdir"
+    args:
+      - "-p"
+      - ".moon/container-cache"
+    options:
+      runInCI: false

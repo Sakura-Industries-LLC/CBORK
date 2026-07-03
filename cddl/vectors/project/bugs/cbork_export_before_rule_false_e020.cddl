@@ -1,0 +1,12 @@
+; Bug repro: a valid CBORK Export directive immediately before a rule currently
+; emits E020 in strict CLI lint even though it should mark that rule exported.
+;
+; Expected after fix:
+; - strict lint succeeds
+; - public-rule is recorded as an exported library rule
+
+;@ CBORK: Library
+;@ CBORK: Export
+public-rule = private-helper
+
+private-helper = bstr .size 16

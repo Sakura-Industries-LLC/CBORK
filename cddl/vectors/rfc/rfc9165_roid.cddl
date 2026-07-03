@@ -1,0 +1,12 @@
+; source: RFC 9165 Figure 3
+roid = bytes .abnfb ("roid" .det cbor-tags-oid)
+cbor-tags-oid = '
+  oid = 1*arc
+  roid = *arc
+  arc = [nlsb] %x00-7f
+  nlsb = %x81-ff *%x80-ff
+' .det rfc5234-core
+rfc5234-core = '
+  DIGIT          =  %x30-39 ; 0-9
+  ; abbreviated here
+'

@@ -1,0 +1,17 @@
+; BUG-011 reproducer (import shape): a directly-imported file that is
+; not marked `;@ CBORK: Library` must surface a W007 warning at the
+; import directive origin.  The target file defines `dntls-epoch`
+; (a CBOR tag #6.1 unsigned integer) but does not declare itself
+; a CBORK library, so the consumer is bypassing Step 5.12's
+; library contract.
+;
+; BUG-011 follow-up: the consumer's reference to `dntls-epoch`
+; is non-exported in the imported file, so the consumer must
+; also surface a W003 warning (cross-file direct-use of a
+; non-exported symbol).
+
+;# import "./support/non_library_time.cddl"
+
+start = epoch-only
+
+epoch-only = dntls-epoch

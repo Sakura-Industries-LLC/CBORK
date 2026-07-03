@@ -1,0 +1,9 @@
+; Step 5.12 regression fixture: `;@ CBORK: Export` applied to
+; the next rule marks the rule as part of the library's public
+; surface.
+
+;@ CBORK: Library
+;@ CBORK: Export
+public-rule = uint
+
+private-helper = bstr .size 16

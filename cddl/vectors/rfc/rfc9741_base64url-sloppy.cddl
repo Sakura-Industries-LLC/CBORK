@@ -1,0 +1,6 @@
+; source: RFC 9741 Table 1
+base64url-sloppy = text .b64u-sloppy signature
+
+signature = bytes .cbor COSE_Sign1
+
+;# import rfc9052

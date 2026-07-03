@@ -1,0 +1,8 @@
+; Step 5.11 regression fixture: a named compression algorithm is
+; within the generic `.x-compressed` wrapper when the controllers
+; subtype.
+
+ok = (bstr .x-brotli payload) .within (bstr .x-compressed payload-wide)
+
+payload = { 1 => int }
+payload-wide = { 1 => int, ? 2 => tstr }

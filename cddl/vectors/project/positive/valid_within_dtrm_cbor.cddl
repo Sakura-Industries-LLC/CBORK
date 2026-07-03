@@ -1,0 +1,6 @@
+; source: project .within validation fixture
+; behavior: .dtrm is accepted as within the broader .cbor
+
+ok = (bstr .dtrm payload) .within (bstr .cbor payload-wide)
+payload = { 1 => int }
+payload-wide = { 1 => int, ? 2 => tstr }

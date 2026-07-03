@@ -1,0 +1,9 @@
+; source: RFC 8610 Section 3.8.4
+; Control operator .cborseq — CBOR sequence matching
+
+certificates = [ + cert ] .cborseq [ + cert ]
+
+cert = {
+  issuer: tstr,
+  serial: uint,
+}

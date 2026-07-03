@@ -1,0 +1,5 @@
+; source: project import/include regression fixture
+; behavior: include -> include -> import transitive chain
+
+;# include "./relative_chain_level2.cddl"
+relative_level1 = relative_level2

@@ -1,0 +1,12 @@
+; Support library for generic_within_parameter_substitution.cddl.
+;
+; The std alias is intentionally local to this file; consumers should
+; not have to import it.  The wrapper generic's body uses `header`
+; and `payload` as bare array-entry types; the expanded consumer
+; must see the concrete arguments (`Concrete-Headers`,
+; `Concrete-Payload`) in the diagnostic, never the unresolved
+; formal parameter names.
+
+wrapper<header, payload> = [header, payload] .within std.Wrapper
+
+;# import "./generic_within_parameter_substitution_std.cddl" as std

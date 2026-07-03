@@ -1,0 +1,4 @@
+; Step 5.12 unused-import support: a plain CDDL module with
+; one rule that the consumer never references.
+
+helper = uint

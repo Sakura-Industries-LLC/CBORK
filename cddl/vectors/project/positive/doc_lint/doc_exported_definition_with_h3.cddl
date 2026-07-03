@@ -1,0 +1,18 @@
+; source: project doc-lint fixture
+;! # Library exports documentation fixture
+;!
+;! Used to verify exported rule documentation in cbork.
+;! Definition-level documentation must start with a level-3 Markdown heading.
+
+;@ CBORK: Library
+;@ CBORK: Export
+;! ### location-references
+;! Public list of location references, exposed by this library.
+location-references = [ +location-reference ]
+
+; Internal helper rule used by `location-references`.
+; This rule is intentionally undocumented because it is not exported.
+location-reference = {
+  url: tstr,
+  ? label: tstr,
+}

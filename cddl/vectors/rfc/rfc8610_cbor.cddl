@@ -1,0 +1,8 @@
+rfc8610_cbor = encoded-cbor-type1 / encoded-cborseq-type2
+
+; source: RFC 8610 Section 3.8.4
+encoded-cbor-type1 = bytes .cbor type1
+encoded-cborseq-type2 = bytes .cborseq type2
+
+type1 = bstr
+type2 = tstr

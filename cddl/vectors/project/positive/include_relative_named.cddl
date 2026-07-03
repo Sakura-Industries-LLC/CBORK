@@ -1,0 +1,5 @@
+; source: project import/include regression fixture
+; behavior: named relative include protects the named item from pruning
+
+;# include keep_me from "./support/selective_source.cddl"
+relative_named_root = keep_me

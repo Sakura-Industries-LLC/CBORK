@@ -1,0 +1,19 @@
+; source: project render fixture
+;@ CBORK: Library
+;
+; behavior: when the file declares itself a library, named
+;           constants are preserved in the concrete view.
+
+library = cose.Headers
+
+cose-alg = 1
+cose-iv = 5
+cose-salt = -20
+A256GCM = 3
+
+; A header map that uses the constants above.
+protected = {
+  cose-alg  => A256GCM,
+  cose-salt => bstr,
+  cose-iv   => bstr,
+}

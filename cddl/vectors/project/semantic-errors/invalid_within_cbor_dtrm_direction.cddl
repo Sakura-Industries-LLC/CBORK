@@ -1,0 +1,5 @@
+; source: project .within validation fixture
+; behavior: .cbor is broader than .dtrm and therefore not within .dtrm
+
+bad = (bstr .cbor payload) .within (bstr .dtrm payload)
+payload = { 1 => int }

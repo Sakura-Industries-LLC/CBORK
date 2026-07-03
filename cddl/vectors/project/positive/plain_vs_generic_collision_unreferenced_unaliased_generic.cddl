@@ -1,0 +1,3 @@
+all = root
+root = 1
+;# import all<keytype> from "./support/plain_vs_generic_collision_unreferenced_unaliased_generic_lib.cddl"

@@ -1,0 +1,13 @@
+; BUG-002 support: a CBORK library with an exported symbol
+; (`public-a`) and a non-exported private helper (`private-helper`).
+; The consumer in `bug_002_whole_library_import_no_w006.cddl`
+; references `private-helper` (triggering the legitimate W003
+; cross-file direct-use-export violation) and leaves the
+; `public-a` export unreferenced.  Before the fix, the unused
+; `public-a` export triggered a false W006.
+
+;@ CBORK: Library
+;@ CBORK: Export
+public-a = uint
+
+private-helper = bstr .size 16

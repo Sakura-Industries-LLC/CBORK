@@ -1,0 +1,2 @@
+; source: draft-ietf-cbor-serialization-06 Section 8
+leaf = #6.24(bytes .dtrm any)

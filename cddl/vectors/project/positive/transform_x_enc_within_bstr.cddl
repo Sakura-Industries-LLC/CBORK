@@ -1,0 +1,10 @@
+; Step 5.11 regression fixture: encryption wrapper compatible with
+; the bare carrier `bstr`.
+;
+; The LHS narrows the carrier with `.x-enc`; the RHS is the bare
+; carrier type.  Because the encryption wrapper is a narrowing
+; operator, the narrowed LHS is within the bare carrier.
+
+ok = (bstr .x-enc payload) .within bstr
+
+payload = { 1 => int }

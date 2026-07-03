@@ -1,0 +1,16 @@
+; source: project doc-lint fixture
+;! # Doc fix input fixture
+;!
+;! This fixture is the *before* side of the `--doc --fix` round-trip.
+;! It contains Markdown style issues that `rumdl` is expected to fix,
+;! such as multiple consecutive blank lines inside a doc block.
+;!
+;! The CDDL source on lines below the doc block must be preserved
+;! byte-for-byte by the reverse transform.
+
+
+;! ### counter
+;! Description of the counter rule.
+
+
+doc_fixture_fix_counter = uint .lt 100

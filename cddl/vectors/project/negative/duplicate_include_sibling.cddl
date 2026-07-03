@@ -1,0 +1,11 @@
+; source: project import/include negative regression fixture
+; behavior: two sibling `include` directives for the same file inject
+; the same definitions directly into this file's scope, producing a
+; duplicate-definition conflict.  Unlike `import`, `include` is strong
+; and the resolver must still reject the repeated inclusion up front.
+
+;# include "./support/duplicate_include_sibling_source.cddl"
+
+;# include "./support/duplicate_include_sibling_source.cddl"
+
+duplicate_include_root = shared_leaf

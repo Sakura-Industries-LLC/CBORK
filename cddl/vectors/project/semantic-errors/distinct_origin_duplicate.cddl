@@ -1,0 +1,12 @@
+; Step 5.9 regression fixture: distinct-origin duplicate.
+;
+; Two different source files each define the rule `same_origin_distinct_dup`.
+; Both definitions have the same content (`= 1`) but originate from
+; different files.  This is a real W001 redundant-definition scenario
+; and must still be reported.
+
+consumer_x = same_origin_distinct_dup
+
+;# import same_origin_distinct_dup from "./support/distinct_origin_dup_a.cddl"
+
+;# import same_origin_distinct_dup from "./support/distinct_origin_dup_b.cddl"

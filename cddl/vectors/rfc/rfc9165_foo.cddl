@@ -1,0 +1,7 @@
+; source: RFC 9165 Section 4 and Figure 6
+foo = {
+  kind: bar / baz .feature (["foo-extensions", "bazify"])
+}
+
+bar = bstr
+baz = tstr

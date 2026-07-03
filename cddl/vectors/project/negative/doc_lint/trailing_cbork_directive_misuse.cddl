@@ -1,0 +1,20 @@
+; source: project doc-lint fixture
+; The trailing `;@` marker below would, without the marker-misuse rule,
+; mark this file as a CBORK library. With the rule in place, the marker
+; is treated as an ordinary trailing comment and the file stays a normal
+; schema.
+trailing_cbork_root = [trailing_cbork_directive]
+
+;! # Trailing `;@` directive misuse fixture
+;!
+;! The `;@` on the trailing comment below is treated as a regular comment,
+;! not as a CBORK directive. A misplaced `;@ CBORK: Library` here will
+;! silently fail to mark this file as a library.
+;! Expected doc-lint diagnostic: special marker `;@` used as a trailing comment.
+;!
+;! This fixture uses the canonical `;@ CBORK: Library` form so it proves
+;! the marker-misuse rule is stronger than "the directive parser does not
+;! recognize the body": even when the body would otherwise set
+;! `is_library = true`, a trailing `;@` must remain an ordinary comment.
+
+trailing_cbork_directive = 1  ;@ CBORK: Library

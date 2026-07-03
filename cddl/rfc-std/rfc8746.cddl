@@ -1,0 +1,59 @@
+;! # Concise Binary Object Representation (CBOR) Tags for Typed Arrays
+;!
+;! ## Types from Table 6
+
+rfc8746 = ta-uint8 /
+          ta-uint16be /
+          ta-uint32be /
+          ta-uint64be /
+          ta-uint8-clamped /
+          ta-uint16le /
+          ta-uint32le /
+          ta-uint64le /
+          ta-sint8 /
+          ta-sint16be /
+          ta-sint32be /
+          ta-sint64be /
+          ta-sint16le /
+          ta-sint32le /
+          ta-sint64le /
+          ta-float16be /
+          ta-float32be /
+          ta-float64be /
+          ta-float128be /
+          ta-float16le /
+          ta-float32le /
+          ta-float64le /
+          ta-float128le /
+          homogeneous<[uint, uint]> /
+          multi-dim<[uint, uint], [* bstr]> /
+          multi-dim-column-major<[uint, uint], [* bstr]>
+
+
+ta-uint8 = #6.64(bstr)
+ta-uint16be = #6.65(bstr)
+ta-uint32be = #6.66(bstr)
+ta-uint64be = #6.67(bstr)
+ta-uint8-clamped = #6.68(bstr)
+ta-uint16le = #6.69(bstr)
+ta-uint32le = #6.70(bstr)
+ta-uint64le = #6.71(bstr)
+ta-sint8 = #6.72(bstr)
+ta-sint16be = #6.73(bstr)
+ta-sint32be = #6.74(bstr)
+ta-sint64be = #6.75(bstr)
+; reserved: #6.76(bstr)
+ta-sint16le = #6.77(bstr)
+ta-sint32le = #6.78(bstr)
+ta-sint64le = #6.79(bstr)
+ta-float16be = #6.80(bstr)
+ta-float32be = #6.81(bstr)
+ta-float64be = #6.82(bstr)
+ta-float128be = #6.83(bstr)
+ta-float16le = #6.84(bstr)
+ta-float32le = #6.85(bstr)
+ta-float64le = #6.86(bstr)
+ta-float128le = #6.87(bstr)
+homogeneous<array> = #6.41(array)
+multi-dim<dim, array> = #6.40([dim, array])
+multi-dim-column-major<dim, array> = #6.1040([dim, array])

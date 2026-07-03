@@ -1,0 +1,5 @@
+; source: project import/include regression fixture
+; behavior: absolute include should resolve relative to the repository root path
+
+;# include "/cddl/vectors/project/positive/support/absolute_chain_level1.cddl"
+absolute_root = absolute_level1

@@ -1,0 +1,6 @@
+; Step 5.12 negative fixture: an unknown `;@ CBORK: Thing`
+; directive must produce an E021 diagnostic because it looks like
+; an active CBORK directive but is not recognized.
+
+;@ CBORK: Thing
+ok = 1

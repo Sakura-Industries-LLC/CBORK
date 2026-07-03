@@ -1,0 +1,21 @@
+[package]
+name = "cbork-utils"
+version = "0.0.3"
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+description = "Shared CBOR utility helpers used across the CBORK workspace."
+readme = "README.md"
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude = ["moon.yml"]
+
+[lints]
+workspace = true
+
+[dependencies]
+minicbor = { version = "2", features = ["std"] }
+
+[dev-dependencies]
+proptest = { version = "1.6.0", features = ["attr-macro"] }

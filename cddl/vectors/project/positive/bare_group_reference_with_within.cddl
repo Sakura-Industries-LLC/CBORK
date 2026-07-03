@@ -1,0 +1,23 @@
+; Step 5.10 regression fixture: bare group reference inside a map
+; with a `.within` check.
+;
+; The map `cose-protected-headers` includes the named group
+; `cose-headers` as a bare group reference.  The `.within` RHS
+; must match the effective map that has the entries of
+; `cose-headers` merged into it.
+
+ok = cose-protected-headers .within {
+  alg: int,
+  kid: bstr,
+  * uint => bytes,
+}
+
+cose-headers = (
+  alg: int,
+  kid: bstr,
+)
+
+cose-protected-headers = {
+  cose-headers,
+  * uint => bytes,
+}

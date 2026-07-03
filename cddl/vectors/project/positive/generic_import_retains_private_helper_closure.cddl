@@ -1,0 +1,15 @@
+; Step 5.7 regression fixture.
+;
+; The consumer imports only `lib.Envelope<payload>` from the support
+; library.  The imported generic body references two private helpers
+; (`lib-private-header` and `lib-private-values`) that are defined in
+; the same source module as the generic template but not selected by
+; the consumer's `from` clause.  The consumer must never see E016 for
+; those private helper names — the selected generic's private helper
+; closure must remain reachable when the generic is expanded.
+
+root = lib.Envelope<Concrete-Payload>
+
+Concrete-Payload = bstr
+
+;# import lib.Envelope<payload> from "./support/generic_import_retains_private_helper_closure_lib.cddl" as lib

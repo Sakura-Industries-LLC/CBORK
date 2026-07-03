@@ -1,0 +1,6 @@
+; source: project doc-lint fixture
+;! This module-level documentation block is missing a level-1 Markdown heading.
+;! File/module documentation must start with a `#` heading.
+;! Expected doc-lint diagnostic: file docs missing level-1 heading.
+
+doc_fixture_no_h1 = 1

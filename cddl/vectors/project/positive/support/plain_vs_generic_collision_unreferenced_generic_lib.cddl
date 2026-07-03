@@ -1,0 +1,10 @@
+; Support library for plain_vs_generic_collision_unreferenced_generic.cddl.
+;
+; Defines a generic helper `all<keytype>` whose body references the
+; library's private `keyset<keytype>` rule.  When the consumer
+; cherry-picks this generic via `from all<keytype>` but never
+; instantiates it, the helper must be pruned silently and must not
+; collide with the consumer's strong local plain `all` rule.
+
+all<keytype> = keyset<keytype> / [keytype]
+keyset<keytype> = { * any => any }

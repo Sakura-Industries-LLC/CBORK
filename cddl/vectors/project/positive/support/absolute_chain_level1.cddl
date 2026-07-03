@@ -1,0 +1,5 @@
+; source: project import/include regression fixture
+; behavior: absolute include chain continues through relative child resolution
+
+;# include "./absolute_chain_level2.cddl"
+absolute_level1 = absolute_level2

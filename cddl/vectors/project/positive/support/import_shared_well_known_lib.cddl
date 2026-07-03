@@ -1,0 +1,14 @@
+; source: project import/include regression fixture
+; behavior: a library module that imports the well-known cose module; the
+; outer file imports the library as `defs` and ALSO imports the same
+; well-known cose module directly.  Imports are weak, scope-bound
+; references, so the same well-known in two different scopes is not a
+; cycle: the inner import becomes `defs.cose.COSE_Key` and the outer
+; import becomes `cose.COSE_Key`.  Neither `library` nor
+; `defs_cose_key_ref` is referenced from the importer, so the
+; well-known-in-different-scope case is exercised by the *directives*
+; themselves rather than by reachable rules.
+
+;# import rfc9052 as cose
+
+defs_cose_key_ref = cose.COSE_Key

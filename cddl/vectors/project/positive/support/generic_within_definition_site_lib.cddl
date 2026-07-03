@@ -1,0 +1,8 @@
+; Support library for generic_within_definition_site_scope.cddl.
+;
+; The std alias is intentionally local to this file.
+; Consumers of wrapper<T> should not need to import std themselves.
+
+wrapper<T> = [T] .within std.Wrapper
+
+;# import "./generic_within_definition_site_std.cddl" as std

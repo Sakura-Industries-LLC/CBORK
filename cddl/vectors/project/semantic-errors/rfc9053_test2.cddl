@@ -1,0 +1,28 @@
+
+COSE_KDF_Context = [
+    AlgorithmID : int / tstr,
+    PartyUInfo : [ PartyInfo ],
+    PartyVInfo : [ PartyInfo ],
+    SuppPubInfo : [
+        keyDataLength : uint,
+        protected : empty_or_serialized_map,
+        ? other : bstr
+    ],
+    ? SuppPrivInfo : bstr
+]
+
+PartyInfo = (
+    identity : bstr / nil,
+    nonce : bstr / int / nil,
+    other : bstr / nil
+)
+
+PartyInfo = (
+    identity : bstr / nil,
+    nonce : bstr / int / nil,
+    other : bstr / nil
+)
+
+identity-val = bstr
+
+;# import rfc9052

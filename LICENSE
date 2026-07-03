@@ -1,0 +1,8 @@
+This repo consists of various libraries and programs under various licenses.
+If a directory contains a LICENSE file, that LICENSE applies to all code underneath that directory ONLY.
+
+IF a LICENSE is NOT Specified, then:
+
+    This Source Code Form is subject to the terms of the Mozilla Public
+    License, v. 2.0. If a copy of the MPL was not distributed with this
+    file, You can obtain one at https://mozilla.org/MPL/2.0/.

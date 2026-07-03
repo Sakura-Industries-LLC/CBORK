@@ -1,0 +1,5 @@
+; source: project import/include regression fixture
+; behavior: bare relative include should keep the subtree non-prunable
+
+;# include "./support/relative_chain_level1.cddl"
+relative_root = relative_level1

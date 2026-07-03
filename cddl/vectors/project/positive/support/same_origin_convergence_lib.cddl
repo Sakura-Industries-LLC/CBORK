@@ -1,0 +1,7 @@
+; Support library for same_origin_convergence.cddl.
+;
+; The library defines a single helper.  Both import paths in the
+; consumer resolve to this exact file, so the consumer sees the same
+; rule from the same source origin twice.
+
+helper = uint

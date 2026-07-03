@@ -1,0 +1,37 @@
+; BUG-007 reproducer: a `.within` failure where the conflict
+; is on a nested map/group entry deep inside the LHS.  The
+; diagnostic must mark the failing nested field as CONFLICT in the
+; rendered DIFF so the user can see exactly which line is wrong,
+; not just the top-level wrapper call.
+
+; A generic wrapper analogous to COSE_Sign<headers, payload, signatures>.
+generic-cose-sign<headers, payload, sig> = [
+    headers,
+    payload: payload,
+    signatures: [+ sig]
+] .within generic-cose-sign-rhs
+
+; The RHS requires a specific map shape for headers.  The failing
+; case: the LHS provides a map with the wrong shape, so the first
+; entry of the LHS array is rejected.
+generic-cose-sign-rhs = [
+    required-headers-map,
+    payload: bstr / nil,
+    signatures: [+ required-signature]
+]
+
+required-headers-map = {
+    tld => tstr,
+    root => namehash
+}
+
+namehash = bstr .size 32
+
+required-signature = bstr
+
+; LHS instantiation: use a `headers` map whose entries do not match.
+failing-sign = generic-cose-sign<
+    { wrong-key: tstr, missing-root: any },  ; first entry wrong shape
+    bstr,
+    bstr
+>

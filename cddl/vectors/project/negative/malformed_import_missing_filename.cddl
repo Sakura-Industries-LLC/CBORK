@@ -1,0 +1,5 @@
+; source: project import/include negative regression fixture
+; behavior: directive parser should reject a missing filename
+
+;# import
+broken = tstr

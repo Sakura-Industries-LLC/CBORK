@@ -1,0 +1,9 @@
+; Bare references to generic templates are undefined.
+; `Generic` is not a concrete rule; only `Generic<T>` is defined.
+;@ CBORK: Library
+
+root = Generic / Specific
+
+Generic<T> = [T]
+
+Specific = Generic<uint>

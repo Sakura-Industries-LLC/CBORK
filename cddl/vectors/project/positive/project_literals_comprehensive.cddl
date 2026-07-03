@@ -1,0 +1,44 @@
+; source: project
+; Comprehensive literal value coverage — all number, text, and byte forms
+
+; Integer forms
+signed-int-pos = 42
+signed-int-neg = -17
+hex-int = 0xFF
+bin-int = 0b1010
+zero-int = 0
+
+; Float forms
+float-intlike = 3.14
+float-exp = 1.5e+10
+float-neg-exp = 2.0e-3
+float-dec = 3.14
+hex-float = 0x1.fffp+12
+hex-float-neg = -0x1.0p-3
+
+; Text forms
+empty-text = ""
+simple-text = "hello"
+escaped-text = "line1\nline2"
+unicode-text = "\u00e9"
+
+; Byte string forms
+hex-bytes = h'deadbeef'
+single-hex-byte = h'ff'
+b64-bytes = b64'Zm9v'
+b64-padded = b64'Zm9vYg'
+byte-text = 'AB'
+byte-text-escaped = 'A\nB'
+empty-byte-text = ''
+
+; Tag forms
+tag0 = #6.0(tstr)
+tag1 = #6.1(number)
+tag-large = #6.55799(any)
+plain-tag-int = #6
+plain-tag = #
+
+; Range operator forms
+range-ellipsis = 0...255
+range-double-dot = 0..4095
+range-neg = -10..10

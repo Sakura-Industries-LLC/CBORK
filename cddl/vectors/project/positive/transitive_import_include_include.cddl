@@ -1,0 +1,5 @@
+; source: project import/include regression fixture
+; behavior: import -> include -> include; pruning should remain prunable throughout the chain
+
+;# import "./support/transitive_import_level1.cddl"
+transitive_import_root = transitive_import_level1

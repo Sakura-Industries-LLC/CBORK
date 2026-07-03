@@ -1,0 +1,14 @@
+; Step 5.9 regression fixture: same-origin well-known convergence.
+;
+; The consumer imports the well-known module `rfc8610` twice: once
+; selecting only `buuidv4`, then again selecting both `buuidv4` and
+; `buuidv7`.  Both paths resolve to the same canonical rule
+; `uuidv4-abnf` inside the well-known catalog, so the second arrival
+; is the same effective definition reached through a different
+; import route and must NOT emit a W001 redundant-definition warning.
+
+consumer_a = uuidv4-abnf
+
+;# import buuidv4 from rfc8610
+
+;# import buuidv4, buuidv7 from rfc8610

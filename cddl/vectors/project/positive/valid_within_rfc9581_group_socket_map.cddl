@@ -1,0 +1,23 @@
+; source: project .within validation fixture
+; behavior: the RFC9581 shape remains accepted end-to-end:
+;           required LHS group-socket entries using `key: value` match
+;           RHS `uint => any`. This fixture prevents regression of
+;           Step 7.5.
+
+detailed = ({
+  $$BASE
+  * $$ELECTIVE
+  * $$CRITICAL
+}) .within framework
+
+framework = {
+  uint => any,
+  * (nint/text) => any,
+  * uint => any
+}
+
+$$BASE //= (1: 0)
+$$BASE //= (4: 0)
+$$BASE //= (5: 0)
+$$ELECTIVE //= (-3: 0)
+$$CRITICAL //= (13 => 0)

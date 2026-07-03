@@ -1,0 +1,8 @@
+; source: project render fixture
+; behavior: a struct with ctlops, choices, tags, and a parenthesized
+;           group plug should render without losing any structure.
+
+my_type = bstr .size 32 / int .lt 100
+tagged = #6.123(tstr)
+plug = (foo => int)
+plug //= (bar => int)

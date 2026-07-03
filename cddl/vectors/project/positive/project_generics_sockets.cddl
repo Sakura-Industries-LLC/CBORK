@@ -1,0 +1,36 @@
+; source: project
+; Comprehensive generic type and socket/plug coverage
+
+; Simple generic type parameter
+pair<a, b> = [first: a, second: b]
+int-pair = pair<int, int>
+mixed-pair = pair<tstr, uint>
+
+; Generic type with single parameter
+maybe<t> = t / null
+maybe-int = maybe<int>
+
+; Group socket
+Protocol = {
+  type: tstr,
+  $$ProtocolExtensions,
+}
+
+; Type socket
+Attributes = {
+  $AttributeName => any,
+}
+AttributeName = tstr
+
+; Socket with plug using //=
+$$ProtocolExtensions //= ( tcp: { port: uint } )
+$$ProtocolExtensions //= ( udp: { port: uint } )
+
+; Nested generics
+triple<a, b, c> = [a, b, c]
+wrapped<t> = [inner: t]
+nested = wrapped<triple<int, tstr, bool>>
+
+; Generic group with control operator
+sized-array<n, t> = [ * t ] .size n
+sized-5-ints = sized-array<5, int>

@@ -1,0 +1,23 @@
+; Support library for generic_import_retains_private_helper_closure.cddl.
+;
+; Models the RFC 9393 shape: a generic template whose body
+; references private same-module helpers that the consumer's import
+; directive does NOT select.
+
+Envelope<payload> = [
+    protected:    bstr .cbor lib-private-header,
+    unprotected:  lib-private-values,
+    payload:      bstr .cbor payload,
+    signature:    bstr,
+]
+
+lib-private-header = {
+    1 => int,
+    * cose-label => cose-values,
+}
+
+lib-private-values = any
+
+cose-values = any
+
+cose-label = int / tstr

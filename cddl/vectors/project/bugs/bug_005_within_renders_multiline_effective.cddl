@@ -1,0 +1,28 @@
+; BUG-005 reproducer: `.within` failure where the LHS or RHS is the
+; body of a generic instantiation with a complex nested structure.
+; The diagnostic must render both sides multiline, indented, and with
+; symbolic dependencies expanded (not bare typename references).
+
+COSE_recipient<headers, body> = [
+    protected: headers,
+    unprotected: body,
+    ? recipients: [+COSE_recipient<headers, body>]
+]
+
+Headers = {
+    1: 57,
+    4: bstr .size 32,
+    ? -21: bstr,
+    ? -22: bstr .size 32,
+    ? -24: bstr .size 32
+}
+
+Body = {-4: bstr .size 1120}
+
+dntls-recipients = COSE_recipient<
+    Headers,
+    Body
+> .within [
+    protected: Headers,
+    unprotected: {-4: bstr .size 1120, -5: bstr, -6: bstr .size 64}
+]

@@ -1,0 +1,6 @@
+; source: project .within validation fixture
+; behavior: a concrete non-empty map satisfies the .and non-empty-map constraint
+
+ok = payload .within (non-empty<payload>)
+non-empty<M> = (M) .and ({ + any => any })
+payload = { 1 => int }

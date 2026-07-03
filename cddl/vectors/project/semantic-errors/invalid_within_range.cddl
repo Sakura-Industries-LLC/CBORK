@@ -1,0 +1,5 @@
+; source: project .within validation fixture
+; behavior: 0..255 is not a subtype of 0..100
+
+root = my_range .within 0..100
+my_range = 0..255

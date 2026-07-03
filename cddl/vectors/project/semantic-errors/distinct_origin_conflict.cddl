@@ -1,0 +1,12 @@
+; Step 5.9 regression fixture: distinct-origin conflict.
+;
+; Two different source files each define the rule
+; `same_origin_distinct_conflict` with different contents (`= 1` vs
+; `= 2`).  Different signatures from different source origins must
+; still raise an E014 conflict diagnostic.
+
+consumer_x = same_origin_distinct_conflict
+
+;# import same_origin_distinct_conflict from "./support/distinct_origin_conflict_a.cddl"
+
+;# import same_origin_distinct_conflict from "./support/distinct_origin_conflict_b.cddl"

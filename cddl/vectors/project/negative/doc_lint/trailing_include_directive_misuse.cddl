@@ -1,0 +1,21 @@
+; source: project doc-lint fixture
+; The trailing `;#` marker below would, without the marker-misuse rule,
+; attempt to include `./nonexistent.cddl` and fail compilation. With the
+; rule in place, the marker is treated as an ordinary trailing comment
+; and the include is never attempted.
+trailing_include_root = [trailing_include_directive]
+
+;! # Trailing `;#` directive misuse fixture
+;!
+;! The `;#` on the trailing comment below is treated as a regular comment,
+;! not as an include/import directive. The included file would not be
+;! included by the compiler even if it existed on disk.
+;! Expected doc-lint diagnostic: special marker `;#` used as a trailing comment.
+;!
+;! This fixture uses the canonical `;# include` form so it proves the
+;! marker-misuse rule is stronger than "the directive parser does not
+;! recognize the body": even when the body would otherwise trigger an
+;! include resolution error, a trailing `;#` must remain an ordinary
+;! comment and never attempt to resolve any file.
+
+trailing_include_directive = 1  ;# include "./nonexistent.cddl"

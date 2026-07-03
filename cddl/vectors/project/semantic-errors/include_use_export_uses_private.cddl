@@ -1,0 +1,8 @@
+; Step 5.12 include-style export contract: a consumer that
+; includes a library and references a non-exported private
+; helper must emit a W003 warning.  Include directives are
+; subject to the same export contract as `import`.
+
+;# include "./support/include_use_private_lib.cddl" as include_use_private_lib
+
+ok = include_use_private_lib.private-helper

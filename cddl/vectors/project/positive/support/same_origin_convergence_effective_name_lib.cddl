@@ -1,0 +1,3 @@
+; Support library for same_origin_convergence_effective_name.cddl.
+
+same_origin_helper = uint

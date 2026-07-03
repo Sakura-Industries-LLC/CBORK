@@ -1,0 +1,15 @@
+; Step 5.12 cross-file library: `;@ CBORK: Export` marks
+; `public-rule` as the library's public surface.  `private-helper`
+; stays internal.
+
+;@ CBORK: Library
+
+;@ CBORK: Export
+public-rule = uint
+
+private-helper = bstr .size 16
+
+wrapper = {
+  public-rule,
+  * tstr => any,
+}

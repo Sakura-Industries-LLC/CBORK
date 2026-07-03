@@ -1,0 +1,5 @@
+; source: project import/include regression fixture
+; behavior: explicitly named import from the standard library should protect the named item
+
+;# import COSE_Key from rfc9052
+named_cose_key = COSE_Key

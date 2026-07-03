@@ -1,0 +1,6 @@
+; source: project import/include regression fixture
+; behavior: outer module transitively includes a nested aliased module; all
+; self-references in the leaf must be reachable through the full alias chain
+
+;# include "./support/nested_alias_mid.cddl" as mid
+nested_alias_root = mid.mid_rule

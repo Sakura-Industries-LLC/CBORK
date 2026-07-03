@@ -1,0 +1,4 @@
+; Step 5.12 positive regression support: a plain CDDL module
+; whose `helper` rule is referenced by the consumer.
+
+helper = uint

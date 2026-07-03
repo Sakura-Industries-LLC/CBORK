@@ -1,0 +1,49 @@
+
+;@ CBORK: Library
+
+;@ CBORK: Export
+ip-address-or-prefix = ipv6-address-or-prefix /
+                       ipv4-address-or-prefix
+
+;@ CBORK: Export
+ipv6-address-or-prefix = #6.54(ipv6-address /
+                               ipv6-address-with-prefix /
+                               ipv6-prefix)
+
+;@ CBORK: Export
+ipv4-address-or-prefix = #6.52(ipv4-address /
+                               ipv4-address-with-prefix /
+                               ipv4-prefix)
+
+;@ CBORK: Export
+ipv6-address = bytes .size 16
+
+;@ CBORK: Export
+ipv4-address = bytes .size 4
+
+;@ CBORK: Export
+ipv6-address-with-prefix = [ipv6-address,
+                            ipv6-prefix-length / null,
+                            ?ip-zone-identifier]
+;@ CBORK: Export
+ipv4-address-with-prefix = [ipv4-address,
+                            ipv4-prefix-length / null,
+                            ?ip-zone-identifier]
+
+;@ CBORK: Export
+ipv6-prefix-length = 0..128
+;@ CBORK: Export
+ipv4-prefix-length = 0..32
+
+;@ CBORK: Export
+ipv6-prefix = [ipv6-prefix-length, ipv6-prefix-bytes]
+;@ CBORK: Export
+ipv4-prefix = [ipv4-prefix-length, ipv4-prefix-bytes]
+
+;@ CBORK: Export
+ipv6-prefix-bytes = bytes .size (uint .le 16)
+;@ CBORK: Export
+ipv4-prefix-bytes = bytes .size (uint .le 4)
+
+;@ CBORK: Export
+ip-zone-identifier = uint / text

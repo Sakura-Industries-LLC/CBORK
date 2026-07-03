@@ -1,0 +1,6 @@
+; source: project .within validation fixture
+; behavior: required RHS entry (2 => tstr) is missing from the LHS
+
+bad = lhs .within rhs
+lhs = { 1 => int }
+rhs = { 1 => int, 2 => tstr }

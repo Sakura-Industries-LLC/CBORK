@@ -1,0 +1,2 @@
+; source: RFC 9741 Table 4 and Figure 1
+hexlabel<K> = text .printf (["0x%04x", K])

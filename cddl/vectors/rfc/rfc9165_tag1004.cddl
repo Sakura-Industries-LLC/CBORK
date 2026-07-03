@@ -1,0 +1,4 @@
+; source: RFC 9165 Figure 5
+Tag1004 = #6.1004(text .abnf full-date)
+
+;# import rfc9165

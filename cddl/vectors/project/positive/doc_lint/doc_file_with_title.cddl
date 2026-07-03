@@ -1,0 +1,16 @@
+; source: project doc-lint fixture
+;! # Doc fixture: file with module title
+;!
+;! This fixture demonstrates a well-formed module-level documentation block.
+;! The first documentation block before any non-whitespace source content
+;! is the file/module-level documentation block, and it must start with a
+;! level-1 Markdown heading (`#`).
+;!
+;! ```cddl
+;! doc_fixture_file_with_title = 1
+;! ```
+
+; The rule on the next line is intentionally trivial: it exists so the
+; module-level doc block has something to bind to without forcing any
+; specific shape on the rule itself.
+doc_fixture_file_with_title = 1

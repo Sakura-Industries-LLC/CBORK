@@ -1,0 +1,14 @@
+; source: project doc-lint fixture
+;! # Doc fix expected fixture
+;!
+;! This fixture is the *after* side of the `--doc --fix` round-trip.
+;! Compare against `doc_fix_input.cddl` to confirm that `rumdl` fixes
+;! rewrote only the `;!` lines and left the CDDL source untouched.
+;!
+;! The CDDL source on lines below the doc block must match the input
+;! fixture byte-for-byte.
+
+;! ### counter
+;! Description of the counter rule.
+
+doc_fixture_fix_counter = uint .lt 100

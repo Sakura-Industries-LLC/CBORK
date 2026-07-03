@@ -1,0 +1,4 @@
+; source: project import/include regression fixture
+; behavior: leaf material reached under an import chain
+
+transitive_import_leaf = int

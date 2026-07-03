@@ -1,0 +1,2 @@
+; source: RFC 8610 Section 3.8.3 Figure 11
+nai = tstr .regexp "[A-Za-z0-9]+@[A-Za-z0-9]+(\\.[A-Za-z0-9]+)+"

@@ -1,0 +1,3 @@
+; Support file A for distinct_origin_conflict.cddl.
+
+same_origin_distinct_conflict = 1

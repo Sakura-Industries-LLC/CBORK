@@ -1,0 +1,13 @@
+; source: project doc-lint fixture
+;! # Exported generic missing parameter description fixture
+;!
+;! This fixture exports a generic definition that documents only one of its
+;! two generic parameters. Documented generic definitions must describe
+;! every generic parameter.
+;! Expected doc-lint diagnostic: documented generic missing parameter `key`.
+
+;@ CBORK: Library
+;@ CBORK: Export
+;! ### container
+;! A generic container holding a value of type `value`.
+container<value, key> = [value, key]

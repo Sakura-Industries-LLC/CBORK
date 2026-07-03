@@ -1,0 +1,5 @@
+; Step 5.12 negative fixture: `;@ CBORK: Export` at EOF (no
+; following rule) must be rejected.
+
+;@ CBORK: Library
+;@ CBORK: Export

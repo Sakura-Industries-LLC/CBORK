@@ -1,0 +1,6 @@
+; source: project import/include regression fixture
+; behavior: middle module includes leaf with alias; the aliased rule names from leaf
+; must be visible through this module's own alias when transitively included
+
+;# include "./nested_alias_leaf.cddl" as lf
+mid_rule = lf.leaf_rule

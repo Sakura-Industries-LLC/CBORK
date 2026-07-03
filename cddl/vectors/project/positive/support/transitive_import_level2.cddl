@@ -1,0 +1,5 @@
+; source: project import/include regression fixture
+; behavior: nested include under an import stays prunable
+
+;# include "./transitive_import_leaf.cddl"
+transitive_import_level2 = transitive_import_leaf

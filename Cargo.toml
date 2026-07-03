@@ -1,0 +1,65 @@
+[workspace]
+members = [
+    "crates/cbork",
+    "crates/cbork-edn",
+    "crates/cbork-abnf-parser",
+    "crates/cbork-catalog",
+    "crates/cbork-cddl-compiler",
+    "crates/cbork-cddl-parser",
+    "crates/cbork-utils",
+]
+resolver = "3"
+
+[workspace.lints.clippy]
+arithmetic_side_effects = "deny"
+collapsible_if = "warn"
+exit = "deny"
+expect_used = "deny"
+field_reassign_with_default = "warn"
+format_in_format_args = "warn"
+get_unwrap = "deny"
+index_refutable_slice = "deny"
+indexing_slicing = "deny"
+len_zero = "warn"
+match_wild_err_arm = "deny"
+missing_docs_in_private_items = "deny"
+missing_panics_doc = "deny"
+needless_question_mark = "warn"
+panic = "deny"
+string_slice = "deny"
+todo = "deny"
+too_many_arguments = "warn"
+unchecked_time_subtraction = "deny"
+unimplemented = "deny"
+unnecessary_cast = "warn"
+unreachable = "deny"
+unwrap_used = "deny"
+
+[workspace.lints.clippy.pedantic]
+level = "deny"
+priority = -1
+
+[workspace.lints.rust]
+let_underscore_drop = "deny"
+missing_docs = "deny"
+non_ascii_idents = "deny"
+single_use_lifetimes = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+warnings = "deny"
+
+[workspace.lints.rustdoc]
+bare_urls = "deny"
+broken_intra_doc_links = "deny"
+invalid_codeblock_attributes = "deny"
+invalid_html_tags = "deny"
+invalid_rust_codeblocks = "deny"
+unescaped_backticks = "deny"
+
+[workspace.package]
+authors = ["Sakura Industries LLC"]
+edition = "2024"
+homepage = "https://github.com/SakuraIndustries/cbork"
+license = "MPL-2.0"
+repository = "https://github.com/SakuraIndustries/cbork"
+rust-version = "1.96.0"

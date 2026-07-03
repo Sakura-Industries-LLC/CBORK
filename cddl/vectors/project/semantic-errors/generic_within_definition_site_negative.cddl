@@ -1,0 +1,11 @@
+; Step 5.7 negative regression fixture.
+;
+; The imported generic's `.within` RHS requires a tstr array but the
+; concrete argument is uint.  The diagnostic must fail with E030 at the
+; consumer instantiation span and the effective RHS must be the
+; resolved definition (not an unresolved `std.Wrapper` /
+; `lib.std.Wrapper` reference).
+
+root = lib.wrapper<uint>
+
+;# import lib.wrapper from "./support/generic_within_definition_site_negative_lib.cddl" as lib

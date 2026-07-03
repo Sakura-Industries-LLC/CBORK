@@ -1,0 +1,6 @@
+; Step 5.12 cross-file consumer: importing a library and
+; referencing only an exported public-rule should NOT warn.
+
+;# import direct_use_export_lib.public-rule from "./support/direct_use_export_lib.cddl" as direct_use_export_lib
+
+ok = direct_use_export_lib.public-rule

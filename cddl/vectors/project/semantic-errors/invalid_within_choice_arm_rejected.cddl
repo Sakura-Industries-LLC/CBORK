@@ -1,0 +1,7 @@
+; source: project .within validation fixture
+; behavior: bad LHS choice arm ({ 1 => tstr }) is attributed to the
+;           rejected arm rather than collapsing the whole choice
+
+bad = lhs .within rhs
+lhs = { 1 => int } / { 1 => tstr }
+rhs = { 1 => int }

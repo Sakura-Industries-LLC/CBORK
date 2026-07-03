@@ -1,0 +1,5 @@
+; source: project import/include negative regression fixture
+; behavior: reciprocal import forms a cycle and must fail hard
+
+;# import "./recursive_import_a.cddl"
+recursive_import_b = recursive_import_a

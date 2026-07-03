@@ -1,0 +1,24 @@
+; source: project doc-lint fixture
+;! # Two-block fix fixture root
+;!
+;! Root definition used to wire the two fixture rules together so the
+;! CDDL linter does not flag them as unreferenced.
+
+doc_fixture_two_blocks_root = [
+  doc_fixture_two_blocks_first,
+  doc_fixture_two_blocks_second,
+]
+
+;! # First doc block fixture
+;!
+;! Documents the first definition in this fix-fixture pair.
+;! Two separate `;!` doc blocks must remain separate after `--doc --fix`
+;! even though only blank lines separate them in the source.
+
+doc_fixture_two_blocks_first = 1
+
+;! # Second doc block fixture
+;!
+;! Documents the second definition.
+
+doc_fixture_two_blocks_second = 2

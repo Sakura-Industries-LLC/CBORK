@@ -1,0 +1,77 @@
+$schema: "../cache/schemas/tasks.json"
+inheritedBy:
+  language: javascript
+
+fileGroups:
+  sources:
+    - "grammars/cddl/**/*.cjs"
+    - "grammars/cddl/**/*.js"
+    - "grammars/cddl/**/*.mjs"
+    - "grammars/cddl/**/*.json"
+    - "grammars/cddl/package.json"
+    - "grammars/cddl/package-lock.json"
+
+tasks:
+  bootstrap:
+    command: "bash"
+    args:
+      - "-lc"
+      - 'set -euo pipefail; export PATH=/root/.proto/bin:$PATH; cd grammars/cddl; if [ ! -f package-lock.json ]; then /root/.proto/shims/npm install --package-lock-only --ignore-scripts --no-fund --no-audit; fi; /root/.proto/shims/npm ci --ignore-scripts --no-fund --no-audit'
+    options:
+      runInCI: true
+      outputStyle: "stream"
+    inputs:
+      - "grammars/cddl/package.json"
+      - "grammars/cddl/package-lock.json"
+
+  format-check:
+    deps:
+      - "bootstrap"
+    command: "bash"
+    args:
+      - "-lc"
+      - 'export PATH=/root/.proto/bin:$PATH; cd grammars/cddl && /root/.proto/shims/npm exec -- prettier --check grammar.js'
+    options:
+      runInCI: true
+    inputs:
+      - "grammars/cddl/grammar.js"
+
+  fix-fmt:
+    deps:
+      - "bootstrap"
+    command: "bash"
+    args:
+      - "-lc"
+      - 'export PATH=/root/.proto/bin:$PATH; cd grammars/cddl && /root/.proto/shims/npm exec -- prettier --write grammar.js'
+    options:
+      runInCI: false
+    inputs:
+      - "grammars/cddl/grammar.js"
+
+  audit:
+    deps:
+      - "bootstrap"
+    command: "bash"
+    args:
+      - "-lc"
+      - 'export PATH=/root/.proto/bin:$PATH; cd grammars/cddl && /root/.proto/shims/npm audit --audit-level=high'
+    options:
+      runInCI: true
+    inputs:
+      - "grammars/cddl/package.json"
+      - "grammars/cddl/package-lock.json"
+
+  ci:
+    deps:
+      - "format-check"
+      - "audit"
+    options:
+      runDepsInParallel: false
+      runInCI: true
+
+  fix:
+    deps:
+      - "fix-fmt"
+    options:
+      runDepsInParallel: false
+      runInCI: false

@@ -1,0 +1,17 @@
+; Step 5.10 negative fixture: recursive bare group reference cycle.
+;
+; Group `Loop-A` includes group `Loop-B`, which in turn includes
+; `Loop-A`.  The renderer must detect the cycle and surface a
+; diagnostic rather than recursing forever.
+
+Loop-A = {
+  Loop-B,
+  * uint => int,
+}
+
+Loop-B = {
+  Loop-A,
+  * tstr => any,
+}
+
+root = Loop-A

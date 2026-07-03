@@ -1,0 +1,25 @@
+#cspell: words memchr
+
+[package]
+name = "cbork-catalog"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Compiled catalog of well-known CDDL and CBOR names used across the CBORK workspace."
+readme = "README.md"
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude = ["moon.yml"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lints]
+workspace = true
+
+[dependencies]
+phf = { version = "0.14", default-features = false }
+
+[build-dependencies]
+phf_codegen = "0.14"

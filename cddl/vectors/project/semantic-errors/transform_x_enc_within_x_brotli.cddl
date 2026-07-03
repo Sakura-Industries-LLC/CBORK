@@ -1,0 +1,7 @@
+; Step 5.11 negative fixture: `.x-enc` (encryption) is not within
+; `.x-brotli` (compression).  The two wrappers belong to distinct
+; transform families.
+
+not-ok = (bstr .x-enc payload) .within (bstr .x-brotli payload)
+
+payload = { 1 => int }

@@ -1,0 +1,21 @@
+# rumdl configuration for the doc-lint test fixtures under
+# `cddl/vectors/project/{positive,negative}/doc_lint/`. The fixtures
+# exist to exercise the *semantic* checks (E030, E031, E032, E033,
+# W040, E034) rather than the surrounding Markdown style rules, so the
+# noisy-by-default style rules are disabled here.
+#
+# This file is discovered by `resolve_rumdl_config_path` (step 7) via
+# its walk-up from the source-file directory, so the CLI fixtures
+# `cddl lint --doc <fixture>.cddl` pick it up without any extra
+# configuration.
+
+[global]
+disable = [
+    "MD001", "MD003", "MD004", "MD007", "MD009", "MD010", "MD012",
+    "MD013", "MD014", "MD018", "MD019", "MD022", "MD023", "MD024",
+    "MD025", "MD026", "MD027", "MD028", "MD030", "MD031", "MD032",
+    "MD033", "MD035", "MD036", "MD040", "MD041", "MD045", "MD046",
+    "MD047", "MD048", "MD049", "MD050", "MD051", "MD052", "MD053",
+    "MD054", "MD055", "MD056", "MD058", "MD059", "MD060", "MD061",
+    "MD062", "MD063", "MD064", "MD066", "MD082", "MD083",
+]

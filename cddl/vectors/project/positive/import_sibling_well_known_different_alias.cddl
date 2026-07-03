@@ -1,0 +1,13 @@
+; source: project import/include regression fixture
+; behavior: two sibling imports of the same well-known module under
+; different aliases.  Imports are weak, scope-bound references, so the
+; two imports produce two independent, non-conflicting subtrees
+; (`first.COSE_Key` and `second.COSE_Key`).  They must not be rejected
+; as a cycle just because the well-known name is the same.
+
+;# import rfc9052 as first
+
+;# import rfc9052 as second
+
+first_cose_key_ref = first.COSE_Key
+second_cose_key_ref = second.COSE_Key

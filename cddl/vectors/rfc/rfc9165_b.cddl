@@ -1,0 +1,2 @@
+; source: RFC 9165 Figure 2
+b = "foo\n  bar\n  baz\n"

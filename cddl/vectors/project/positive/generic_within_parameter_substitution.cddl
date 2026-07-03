@@ -1,0 +1,16 @@
+; Step 5.7 regression fixture.
+;
+; The consumer imports only lib.wrapper.
+; The imported generic's body uses bare generic parameters as
+; array entries, and its `.within` RHS refers to a definition-site
+; alias `std.Wrapper`.  The consumer must never see either the
+; unresolved formal parameter names or an unresolved `std.Wrapper`
+; in the diagnostic; both must be resolved through the library's own
+; scope after the wrapper generic is expanded.
+
+root = lib.wrapper<Concrete-Headers, Concrete-Payload>
+
+Concrete-Headers = uint
+Concrete-Payload = bstr
+
+;# import lib.wrapper from "./support/generic_within_parameter_substitution_lib.cddl" as lib

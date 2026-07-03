@@ -1,0 +1,9 @@
+; BUG-003 lib_a support: a generic `Wrapper<t>` whose body
+; references private helpers `tagged<t>` and `untagged<t>`.
+; When this library is imported under an alias, instantiating
+; the generic must retain the alias-qualified private helpers.
+
+Wrapper<t> = [tagged<t>, untagged<t>]
+
+tagged<t> = [t]
+untagged<t> = [t]

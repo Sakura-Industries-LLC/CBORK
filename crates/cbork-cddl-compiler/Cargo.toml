@@ -1,0 +1,33 @@
+[package]
+name = "cbork-cddl-compiler"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CDDL compiler and semantic resolver with control-operator support for CBOR schemas."
+readme = "README.md"
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude = ["moon.yml"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lints]
+workspace = true
+
+[dependencies]
+cbork-abnf-parser = { path = "../cbork-abnf-parser", version = "0.0.3" }
+cbork-cddl-parser = { path = "../cbork-cddl-parser", version = "0.0.3" }
+anyhow = "1.0"
+base64 = "0.22"
+base45 = "3"
+data-encoding = "2"
+hex = "0.4"
+regexml = "0.2.2"
+pest = { version = "2.8.6", features = ["std", "pretty-print", "memchr", "const_prec_climber"] }
+memchr = "2"
+rumdl = { version = "0.2.24", default-features = false }
+serde_json = "1.0.150"
+sprintf = "0.4.3"
+thiserror = "2.0.18"

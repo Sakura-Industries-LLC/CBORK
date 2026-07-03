@@ -1,0 +1,3435 @@
+// Copyright (c) 2026 Sakura Industries LLC.
+//
+// SPDX-License-Identifier: MPL-2.0
+
+//! Concrete CDDL rendering.
+//!
+//! Walks an enriched [`WrappedNode`] tree — the *complete* tree from
+//! [`CompiledCDDL::complete_nodes`], which has already had includes
+//! spliced in, generics expanded, and unreachable prunable rules
+//! pruned — and produces a "concrete view" of the CDDL the compiler
+//! actually sees. Named constants are folded to their resolved values,
+//! socket and group-socket plug augmentations are inlined into the
+//! group they appear in, type references are recursively inlined,
+//! redundant rules are dropped, and only the structurally meaningful
+//! top-level rules are emitted.
+//!
+//! In library mode (`--library` or `;@ CBORK: Library`), the named
+//! constant definitions are preserved verbatim so a downstream file
+//! can re-include them.
+//!
+//! The same renderer drives the [`cbork`](crate) `render` subcommand
+//! and the diff-style output for `.within` / `.and` diagnostics. The
+//! [`ConcretePolicy`] distinguishes the two consumers; the renderer
+//! itself is shared.
+//!
+//! # Architecture
+//!
+//! * [`render_cddl`] — render a slice of `WrappedNode`s into a sequence of [`Line`]s.
+//! * [`render_subtree`] — render a single sub-tree (used by the LSP hover layer).
+//! * [`build_resolution`] — build the [`ResolutionMap`] that the renderer consults for
+//!   inlining.
+//! * [`Line`] / [`LineKind`] — each emitted line carries a tag so the diff renderer can
+//!   align LHS against RHS.
+
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    fmt::Write as _,
+};
+
+use crate::{
+    error::{Diagnostic, DiagnosticLevel},
+    node::{SourceOrigin, WrappedNode},
+    resolver_cache::{EntryState, ResolverCache},
+    symbols::{AssignmentKind, RuleHead, SymbolKind, rule_head_from_children},
+};
+
+/// Which side of a check is being rendered.
+///
+/// The renderer is identical for both sides; the tag changes so the
+/// diff renderer can label its output and so library-mode rules can
+/// differ (LHS in a `.within` is the schema under test, RHS is the
+/// template).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TargetSide {
+    /// Render the full file (default; for the `cbork render` subcommand).
+    #[default]
+    Full,
+    /// Render the left-hand side of a check.
+    Lhs,
+    /// Render the right-hand side of a check.
+    Rhs,
+}
+
+/// Knobs controlling the concrete renderer.
+#[derive(Debug, Clone)]
+pub struct ConcretePolicy {
+    /// Emit `; was <name>` comments when a named reference is folded or
+    /// inlined. Default: `true`.
+    pub provenance_comments: bool,
+    /// Library mode. When `true`:
+    ///
+    /// * The first top-level rule is always emitted.
+    /// * Any other top-level `Define` rule whose name is not referenced by any other rule
+    ///   in the file is also emitted (so a library's public surface is visible).
+    /// * Named primitive constants (`name = 42`) are kept verbatim instead of folded into
+    ///   their use sites.
+    ///
+    /// When `false` (concrete mode), only the first top-level rule is
+    /// emitted; every other rule is reachable from it transitively and
+    /// is inlined. Named constants are folded.
+    ///
+    /// Set automatically when the file declares itself a library via
+    /// `;@ CBORK: Library` or when `--library` is passed to `cbork`.
+    pub library_mode: bool,
+    /// Which side of a check is being rendered. Default: `Full`.
+    pub target: TargetSide,
+    /// BUG-005 effective-mode rendering. When `true`, every inline
+    /// named-reference is recursively expanded to its concrete body
+    /// — even strong definitions, postlude aliases, and definitions
+    /// that the normal concrete renderer would keep symbolic for
+    /// readability.  Used by `.within`-diagnostic EFFECTIVE LHS/RHS
+    /// rendering to let the user see the shape the subtype checker
+    /// actually compared.
+    pub effective_mode: bool,
+}
+
+impl Default for ConcretePolicy {
+    fn default() -> Self {
+        Self {
+            provenance_comments: true,
+            library_mode: false,
+            target: TargetSide::Full,
+            effective_mode: false,
+        }
+    }
+}
+
+impl ConcretePolicy {
+    /// Construct a policy for the `cbork render` subcommand.
+    #[must_use]
+    pub fn for_render() -> Self {
+        Self::default()
+    }
+
+    /// Construct a policy for the left-hand side of a diff-style check.
+    #[must_use]
+    pub fn for_lhs() -> Self {
+        Self {
+            provenance_comments: false,
+            target: TargetSide::Lhs,
+            effective_mode: true,
+            ..Self::default()
+        }
+    }
+
+    /// Construct a policy for the right-hand side of a diff-style check.
+    #[must_use]
+    pub fn for_rhs() -> Self {
+        Self {
+            provenance_comments: false,
+            target: TargetSide::Rhs,
+            effective_mode: true,
+            ..Self::default()
+        }
+    }
+
+    /// Mark the policy as library mode (or back to concrete mode).
+    #[must_use]
+    pub fn with_library(
+        mut self,
+        library: bool,
+    ) -> Self {
+        self.library_mode = library;
+        self
+    }
+}
+
+/// One rendered line in a concrete view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Line {
+    /// Logical kind of this line, used by the diff renderer for
+    /// alignment. Plain CDDL viewers can ignore the tag and just print
+    /// the text.
+    pub kind: LineKind,
+    /// The line text, no trailing newline.
+    pub text: String,
+    /// Indent depth (number of two-space units). `0` for top level.
+    pub indent: usize,
+    /// Source origin of the line, if it maps to a real source span.
+    pub origin: Option<SourceOrigin>,
+}
+
+/// Logical classification of a rendered line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LineKind {
+    /// Top-level rule definition (`name = type`).
+    RuleLine,
+    /// Bareword constant or library-export definition preserved because
+    /// of library mode.
+    KeptDefinition,
+    /// `; comment ...` line.
+    Comment,
+    /// `; Module: ...` and `; End Module: ...` markers.
+    ModuleBoundary,
+    /// Blank line preserved for readability.
+    Blank,
+    /// A map key, value, or group element emitted as part of a larger
+    /// structure. Used by the diff renderer to align entries.
+    GroupEntry,
+    /// `; ...` provenance comment attached to the immediately preceding
+    /// line. Inline-only; the diff renderer should not strip these.
+    Provenance,
+}
+
+/// Sequence of rendered lines.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Concrete {
+    /// The ordered line stream produced by the renderer.
+    lines: Vec<Line>,
+}
+
+impl Concrete {
+    /// Construct an empty concrete view.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Push one line.
+    pub fn push(
+        &mut self,
+        line: Line,
+    ) {
+        self.lines.push(line);
+    }
+
+    /// Borrow the underlying lines.
+    #[must_use]
+    pub fn lines(&self) -> &[Line] {
+        &self.lines
+    }
+
+    /// Mutably borrow the underlying lines for in-place edits.
+    pub fn lines_mut(&mut self) -> &mut Vec<Line> {
+        &mut self.lines
+    }
+
+    /// Number of lines.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// True if no lines have been emitted.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    /// Flatten the lines into a single CDDL string, one line per
+    /// rendered line. Blank lines are emitted as empty lines; comments
+    /// are emitted with the leading `;`.
+    #[must_use]
+    pub fn to_cddl(&self) -> String {
+        let mut raw = String::new();
+        for line in &self.lines {
+            let indent = "  ".repeat(line.indent);
+            match line.kind {
+                LineKind::Provenance => {
+                    let _ = writeln!(raw, "{indent}; {}", line.text);
+                },
+                LineKind::Comment | LineKind::ModuleBoundary => {
+                    // Comment and ModuleBoundary lines already include the
+                    // leading `;` in their text, so emit verbatim.
+                    let _ = writeln!(raw, "{indent}{}", line.text);
+                },
+                LineKind::Blank => {
+                    let _ = writeln!(raw);
+                },
+                LineKind::RuleLine | LineKind::KeptDefinition | LineKind::GroupEntry => {
+                    let _ = writeln!(raw, "{indent}{}", line.text);
+                },
+            }
+        }
+        normalize_rendered_cddl_text(&raw)
+    }
+}
+
+/// Normalize physical rendered lines after structural rendering.
+fn normalize_rendered_cddl_text(raw: &str) -> String {
+    let mut out = String::new();
+    let mut depth = 0_usize;
+    let physical_lines: Vec<&str> = raw.lines().collect();
+    let mut idx = 0;
+    while let Some(current) = physical_lines.get(idx) {
+        let mut normalized_line = normalize_physical_choice_separator(current.trim_start());
+        if let Some(next) = physical_lines.get(idx.saturating_add(1))
+            && let Some(merged) = merge_trailing_choice_opener(&normalized_line, next.trim_start())
+        {
+            normalized_line = merged;
+            idx = idx.saturating_add(1);
+        }
+        let trimmed = normalized_line.as_str();
+        if trimmed.is_empty() {
+            let _ = writeln!(out);
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        if trimmed.starts_with(';') {
+            let _ = writeln!(out, "{trimmed}");
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        let leading_closers = leading_closer_count(trimmed);
+        let indent = depth.saturating_sub(leading_closers);
+        let _ = writeln!(out, "{}{}", "  ".repeat(indent), trimmed);
+        depth = update_depth(depth, trimmed);
+        idx = idx.saturating_add(1);
+    }
+    out
+}
+
+/// Move physical choice separators before provenance comments.
+fn normalize_physical_choice_separator(line: &str) -> String {
+    let Some(comment_idx) = line.find(" ; from") else {
+        return line.to_owned();
+    };
+    let (code, comment_and_rest) = line.split_at(comment_idx);
+    let Some(choice_rel_idx) = comment_and_rest.find(" /") else {
+        return normalize_misplaced_closers(line.to_owned());
+    };
+    let (comment, choice_and_rest) = comment_and_rest.split_at(choice_rel_idx);
+    if let Some(rest) = choice_and_rest.strip_prefix(" / ") {
+        normalize_misplaced_closers(format!("{} / {}{}", code.trim_end(), rest, comment))
+    } else if choice_and_rest == " /" {
+        normalize_misplaced_closers(format!("{} /{}", code.trim_end(), comment))
+    } else {
+        normalize_misplaced_closers(line.to_owned())
+    }
+}
+
+/// Merge a line ending in `/ ; from ...` with a following opener line.
+fn merge_trailing_choice_opener(
+    line: &str,
+    next: &str,
+) -> Option<String> {
+    let next = next.trim();
+    if !matches!(next, "[" | "(" | "{") {
+        return None;
+    }
+    let comment_idx = line.find(" ; from")?;
+    let (code, comment) = line.split_at(comment_idx);
+    let code = code.trim_end();
+    let code = code.strip_suffix('/')?.trim_end();
+    Some(format!("{code} / {next}{comment}"))
+}
+
+/// Move any closers accidentally stranded in provenance text back into code.
+fn normalize_misplaced_closers(line: String) -> String {
+    let Some(comment_idx) = line.find(" ; from") else {
+        return line;
+    };
+    let (code, comment) = line.split_at(comment_idx);
+    if !comment.contains(')') {
+        return line;
+    }
+    let close_count = comment.chars().filter(|c| *c == ')').count();
+    let cleaned_comment: String = comment.chars().filter(|c| *c != ')').collect();
+    let closers = ")".repeat(close_count);
+    if let Some((left, right)) = code.split_once(" / ") {
+        format!("{left}{closers} / {right}{cleaned_comment}")
+    } else if let Some(left) = code.strip_suffix(" /") {
+        format!("{left}{closers} /{cleaned_comment}")
+    } else {
+        format!("{code}{closers}{cleaned_comment}")
+    }
+}
+
+/// Count closing delimiters at the start of a physical code line.
+fn leading_closer_count(code: &str) -> usize {
+    code.trim_start()
+        .chars()
+        .take_while(|c| matches!(c, ']' | ')' | '}'))
+        .count()
+}
+
+/// Update rendered delimiter depth after emitting one physical line.
+fn update_depth(
+    mut depth: usize,
+    code: &str,
+) -> usize {
+    for ch in code.chars() {
+        match ch {
+            '(' | '[' | '{' => depth = depth.saturating_add(1),
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            _ => {},
+        }
+    }
+    depth
+}
+
+// ---------------------------------------------------------------------------
+// ResolutionMap
+// ---------------------------------------------------------------------------
+
+/// All the data the renderer needs to inline references and fold
+/// constants in one pass.
+#[derive(Debug)]
+pub struct ResolutionMap {
+    /// Map from a rule name to the underlying `RuleLine` node. Used to
+    /// inline `name = type` references into the rules that reference
+    /// them.
+    pub definitions: HashMap<String, WrappedNode>,
+    /// Map from a socket name (with `$` or `$$` prefix, or just the
+    /// bare groupname for implicitly-defined group sockets) to the
+    /// list of `//=` augmentation bodies that define the socket's
+    /// plug alternatives.
+    pub socket_plugs: HashMap<String, Vec<WrappedNode>>,
+    /// Map from a type socket name (with `$` prefix) to the list of
+    /// `/=` augmentation bodies that define the socket's alternatives.
+    pub type_plugs: HashMap<String, Vec<WrappedNode>>,
+    /// Primitive-constant resolver cache.
+    pub cache: ResolverCache,
+    /// Set of rule names that are referenced by at least one other rule
+    /// in the file. Used to decide which top-level `Define` rules are
+    /// "inlined helpers" (suppressed from the effective view) versus
+    /// "public surface" (emitted in library mode).
+    pub referenced_names: HashSet<String>,
+    /// Diagnostics collected by the renderer that callers may
+    /// surface to the user.  Currently used for group-reference
+    /// cycle detection (Step 5.10): the renderer must not stack-
+    /// overflow when a group recursively references itself, but
+    /// the user still needs to know the cycle was hit.
+    pub render_diagnostics: RefCell<Vec<Diagnostic>>,
+}
+
+impl ResolutionMap {
+    /// Look up a definition by name.
+    #[must_use]
+    pub fn get(
+        &self,
+        name: &str,
+    ) -> Option<&WrappedNode> {
+        self.definitions.get(name)
+    }
+
+    /// Return the plug bodies for a socket, if any.
+    #[must_use]
+    pub fn plugs_for(
+        &self,
+        name: &str,
+    ) -> &[WrappedNode] {
+        self.socket_plugs.get(name).map_or(&[], Vec::as_slice)
+    }
+
+    /// Return the type socket plug bodies, if any.
+    #[must_use]
+    pub fn type_plugs_for(
+        &self,
+        name: &str,
+    ) -> &[WrappedNode] {
+        self.type_plugs.get(name).map_or(&[], Vec::as_slice)
+    }
+
+    /// Resolve a primitive constant from the cache.
+    #[must_use]
+    pub fn resolve_constant(
+        &self,
+        name: &str,
+    ) -> Option<&EntryState> {
+        self.cache.peek(name)
+    }
+
+    /// Drain any render-time diagnostics collected so far.  Callers
+    /// invoke this after rendering to surface cycle detection and
+    /// similar render-only warnings.
+    #[must_use]
+    pub fn take_render_diagnostics(&self) -> Vec<Diagnostic> {
+        std::mem::take(&mut *self.render_diagnostics.borrow_mut())
+    }
+}
+
+/// Build a [`ResolutionMap`] from a slice of `WrappedNode`s
+/// (typically the post-prune `complete_nodes`).
+#[must_use]
+pub fn build_resolution(nodes: &[WrappedNode]) -> ResolutionMap {
+    let mut defs: HashMap<String, WrappedNode> = HashMap::new();
+    let mut plugs: HashMap<String, Vec<WrappedNode>> = HashMap::new();
+    let mut type_plugs: HashMap<String, Vec<WrappedNode>> = HashMap::new();
+    let mut cache = ResolverCache::new();
+
+    collect_all(nodes, &mut defs, &mut plugs, &mut type_plugs, &mut cache);
+
+    let def_names: HashSet<String> = defs.keys().cloned().collect();
+    let referenced_names = collect_referenced_names(nodes, &def_names);
+
+    ResolutionMap {
+        definitions: defs,
+        socket_plugs: plugs,
+        type_plugs,
+        cache,
+        referenced_names,
+        render_diagnostics: RefCell::new(Vec::new()),
+    }
+}
+
+/// Walk a node tree and populate the resolution helpers.
+fn collect_all(
+    nodes: &[WrappedNode],
+    defs: &mut HashMap<String, WrappedNode>,
+    plugs: &mut HashMap<String, Vec<WrappedNode>>,
+    type_plugs: &mut HashMap<String, Vec<WrappedNode>>,
+    cache: &mut ResolverCache,
+) {
+    for node in nodes {
+        match node {
+            WrappedNode::RuleLine { children, .. } => {
+                if let Some(head) = rule_head_from_children(children) {
+                    if head.assignment == AssignmentKind::Define {
+                        defs.entry(head.name.clone())
+                            .or_insert_with(|| node.clone());
+                    }
+                    if head.assignment == AssignmentKind::TypeAugment {
+                        type_plugs
+                            .entry(head.name.clone())
+                            .or_default()
+                            .push(node.clone());
+                    }
+                    if head.assignment == AssignmentKind::GroupAugment {
+                        plugs
+                            .entry(head.name.clone())
+                            .or_default()
+                            .push(node.clone());
+                    }
+                    if let Some(value) = extract_literal_value(node) {
+                        drop(cache.resolve(&head.name, value));
+                    }
+                }
+                collect_all(children, defs, plugs, type_plugs, cache);
+            },
+            WrappedNode::Directive { children, .. } | WrappedNode::Syntax { children, .. } => {
+                collect_all(children, defs, plugs, type_plugs, cache);
+            },
+            WrappedNode::Comment { .. }
+            | WrappedNode::ModuleStart { .. }
+            | WrappedNode::ModuleEnd { .. } => {},
+        }
+    }
+}
+
+/// Walk the post-resolution tree and collect every rule name that is
+/// *referenced* by some other rule (i.e. appears as a `typename` or
+/// `groupname` child of a non-LHS position). The set of names NOT in
+/// this set are the "public surface" of the file in library mode.
+fn collect_referenced_names(
+    nodes: &[WrappedNode],
+    def_names: &HashSet<String>,
+) -> HashSet<String> {
+    let mut lhss: HashSet<String> = HashSet::new();
+    for node in nodes {
+        if let WrappedNode::RuleLine { children, .. } = node
+            && let Some(head) = rule_head_from_children(children)
+        {
+            lhss.insert(head.name);
+        }
+    }
+    let mut referenced: HashSet<String> = HashSet::new();
+    walk_for_references(nodes, &lhss, def_names, &mut referenced);
+    referenced
+}
+
+/// Inner walker for [`collect_referenced_names`]. Kept at module
+/// scope so `#[allow]` annotations don't bleed into item-level lint
+/// suppressions elsewhere.
+#[allow(
+    clippy::items_after_statements,
+    reason = "Local helper only used from collect_referenced_names"
+)]
+fn walk_for_references(
+    nodes: &[WrappedNode],
+    lhs_set: &HashSet<String>,
+    def_names: &HashSet<String>,
+    out: &mut HashSet<String>,
+) {
+    for node in nodes {
+        match node {
+            WrappedNode::RuleLine { children, .. } => {
+                let mut past_lhs = false;
+                for c in children {
+                    if let WrappedNode::Syntax { rule, .. } = c {
+                        match rule.as_str() {
+                            "assignt" | "assigng" => past_lhs = true,
+                            "typename" | "groupname" => {
+                                let Some(name) = syntax_text(c) else {
+                                    continue;
+                                };
+                                if past_lhs && def_names.contains(&name) && !lhs_set.contains(&name)
+                                {
+                                    out.insert(name);
+                                }
+                            },
+                            _ => {},
+                        }
+                    }
+                }
+            },
+            WrappedNode::Directive { children, .. } | WrappedNode::Syntax { children, .. } => {
+                walk_for_references(children, lhs_set, def_names, out);
+            },
+            _ => {},
+        }
+    }
+}
+
+/// Best-effort text extraction for a syntax node (used by reference
+/// collection).
+fn syntax_text(node: &WrappedNode) -> Option<String> {
+    if let WrappedNode::Syntax { text, .. } = node {
+        Some(text.trim().to_owned())
+    } else {
+        None
+    }
+}
+
+/// Try to extract a primitive literal value from a `RuleLine`'s `RHS`.
+fn extract_literal_value(node: &WrappedNode) -> Option<EntryState> {
+    let WrappedNode::RuleLine { children, .. } = node else {
+        return None;
+    };
+    let WrappedNode::Syntax {
+        rule, children: tc, ..
+    } = children
+        .iter()
+        .find(|c| matches!(c, WrappedNode::Syntax { rule, .. } if rule == "expr"))
+        .or_else(|| {
+            children
+                .iter()
+                .find(|c| matches!(c, WrappedNode::Syntax { .. }))
+        })?
+    else {
+        return None;
+    };
+    if rule != "expr" {
+        return None;
+    }
+    let type_node = tc.iter().find(
+        |c| matches!(c, WrappedNode::Syntax { rule, .. } if rule == "type" || rule == "grpent"),
+    )?;
+    let WrappedNode::Syntax {
+        children: type_children,
+        ..
+    } = type_node
+    else {
+        return None;
+    };
+    let t2 = type_children.iter().find_map(|c| {
+        match c {
+            WrappedNode::Syntax { rule, children, .. } if rule == "type" => {
+                children.iter().find_map(|cc| {
+                    match cc {
+                WrappedNode::Syntax {
+                    rule, children: ic, ..
+                } if rule == "type1" => ic
+                    .iter()
+                    .find(|icc| matches!(icc, WrappedNode::Syntax { rule, .. } if rule == "type2")),
+                _ => None,
+            }
+                })
+            },
+            WrappedNode::Syntax { rule, children, .. } if rule == "type1" => {
+                children
+                    .iter()
+                    .find(|c| matches!(c, WrappedNode::Syntax { rule, .. } if rule == "type2"))
+            },
+            WrappedNode::Syntax { rule, children, .. } if rule == "grpent" => Some(c),
+            _ => None,
+        }
+    })?;
+    let value_node = match t2 {
+        WrappedNode::Syntax { children, .. } => {
+            children
+                .iter()
+                .find(|c| matches!(c, WrappedNode::Syntax { rule, .. } if rule == "value"))
+        },
+        _ => return None,
+    };
+    let value_node = value_node?;
+    let WrappedNode::Syntax { text, children, .. } = value_node else {
+        return None;
+    };
+    let trimmed = text.trim();
+    if let Ok(n) = trimmed.parse::<i128>() {
+        return Some(EntryState::Integer(n));
+    }
+    if let Ok(f) = trimmed.parse::<f64>() {
+        return Some(EntryState::Float(f));
+    }
+    if trimmed.starts_with('"')
+        && let Some(body) = trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
+    {
+        return Some(EntryState::Text(
+            crate::literals::text::TextLiteralBytes::from_bytes(body.as_bytes().to_vec()),
+        ));
+    }
+    if trimmed.starts_with('h') || trimmed.starts_with('b') {
+        return Some(EntryState::Bytes(
+            crate::literals::byte::ByteLiteralBytes::from_bytes(trimmed.as_bytes().to_vec()),
+        ));
+    }
+    let _ = children;
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Public entry points
+// ---------------------------------------------------------------------------
+
+/// Render a slice of `WrappedNode`s into a structured concrete view.
+///
+/// `resolution` is the [`ResolutionMap`] built from the same set of
+/// nodes (typically via [`build_resolution`] on `complete_nodes`).
+///
+/// Effective-view semantics:
+///
+/// * The first top-level `Define` rule is always emitted.
+/// * In library mode (`policy.library_mode`), any other top-level `Define` rule whose
+///   name is NOT referenced by any other rule is also emitted.
+/// * In concrete mode (default), every other top-level `Define` rule is suppressed (its
+///   contents are inlined wherever the rule is referenced).
+/// * Top-level group augmentations (`//=`) are never emitted as separate lines; they
+///   expand in place at the use site.
+#[must_use]
+pub fn render_cddl(
+    nodes: &[WrappedNode],
+    resolution: &ResolutionMap,
+    policy: &ConcretePolicy,
+) -> Concrete {
+    let mut out = Concrete::new();
+    let mut cx = RenderCx::new(resolution, policy);
+    let first_name = first_define_name(nodes);
+
+    for node in nodes {
+        render_top(node, &mut cx, 0, first_name.as_deref(), &mut out);
+    }
+    out
+}
+
+/// Find the name of the first top-level `Define` rule. The first rule
+/// is always emitted in the effective view, regardless of whether it
+/// is referenced anywhere.
+fn first_define_name(nodes: &[WrappedNode]) -> Option<String> {
+    for node in nodes {
+        if let WrappedNode::RuleLine { children, .. } = node
+            && let Some(head) = rule_head_from_children(children)
+            && head.assignment == AssignmentKind::Define
+        {
+            return Some(head.name);
+        }
+    }
+    None
+}
+
+/// Render a single sub-tree (used by LSP hover and the future diff
+/// renderer).
+#[must_use]
+pub fn render_subtree(
+    node: &WrappedNode,
+    resolution: &ResolutionMap,
+    policy: &ConcretePolicy,
+) -> Concrete {
+    let mut out = Concrete::new();
+    let mut cx = RenderCx::new(resolution, policy);
+    if policy.target != TargetSide::Full {
+        render_pretty_rhs(&mut cx, node, 0, text_of(node), &mut out);
+        if !out.lines().is_empty() {
+            return out;
+        }
+    }
+    let mut prov: Option<(String, String)> = None;
+    let (rendered, _) = cx.render_with_inlining(node, &mut prov);
+    out.push(Line {
+        kind: LineKind::RuleLine,
+        text: rendered,
+        indent: 0,
+        origin: None,
+    });
+    out
+}
+
+/// Convenience: render a slice to a CDDL string.
+#[must_use]
+pub fn render_to_string(
+    nodes: &[WrappedNode],
+    resolution: &ResolutionMap,
+    policy: &ConcretePolicy,
+) -> String {
+    render_cddl(nodes, resolution, policy).to_cddl()
+}
+
+// ---------------------------------------------------------------------------
+// Top-level rendering
+// ---------------------------------------------------------------------------
+
+/// Walk one top-level node, deciding whether to skip it, keep it
+/// verbatim, or render with substitutions.
+#[allow(
+    clippy::ref_option,
+    reason = "Mirrors the structure of the cached lookup in ResolutionMap"
+)]
+fn render_top(
+    node: &WrappedNode,
+    cx: &mut RenderCx<'_>,
+    indent: usize,
+    first_name: Option<&str>,
+    out: &mut Concrete,
+) {
+    match node {
+        WrappedNode::RuleLine {
+            children,
+            text,
+            origin,
+            ..
+        } => {
+            let Some(head) = rule_head_from_children(children) else {
+                return;
+            };
+            match head.assignment {
+                AssignmentKind::GroupAugment => {
+                    // `//=` augmentations are socket-plug extensions; they
+                    // are expanded in place at the plug use site. They
+                    // are never emitted as separate top-level lines.
+                },
+                AssignmentKind::TypeAugment => {
+                    // `name /= type` is rare in the effective view; keep
+                    // it verbatim for completeness.
+                    out.push(Line {
+                        kind: LineKind::RuleLine,
+                        text: text.trim().to_owned(),
+                        indent,
+                        origin: Some(origin.clone()),
+                    });
+                },
+                AssignmentKind::Define => {
+                    let is_first = first_name == Some(head.name.as_str());
+                    let is_referenced = cx.resolution.referenced_names.contains(&head.name);
+                    let is_constant = is_constant_rule(node, cx.resolution);
+
+                    if is_first {
+                        // Always emit the first rule.
+                        render_define(node, &head, cx, indent, out);
+                    } else if is_constant && cx.policy.library_mode {
+                        // Library mode: keep named primitive constants
+                        // verbatim so downstream re-includes still see
+                        // them.
+                        out.push(Line {
+                            kind: LineKind::KeptDefinition,
+                            text: text.trim().to_owned(),
+                            indent,
+                            origin: Some(origin.clone()),
+                        });
+                    } else if cx.policy.library_mode && !is_referenced {
+                        // Library mode + unreferenced: this is a public
+                        // helper that nobody references. Emit it.
+                        render_define(node, &head, cx, indent, out);
+                    } else {
+                        // Concrete mode, or library mode but referenced:
+                        // the rule is inlined wherever it is used.
+                        // Drop the separate top-level line.
+                    }
+                },
+            }
+        },
+        WrappedNode::Comment { text, origin, .. } => {
+            let body = text.trim();
+            if !body.is_empty() {
+                out.push(Line {
+                    kind: LineKind::Comment,
+                    text: body.to_owned(),
+                    indent,
+                    origin: Some(origin.clone()),
+                });
+            }
+        },
+        WrappedNode::ModuleStart { text, origin, .. }
+        | WrappedNode::ModuleEnd { text, origin, .. } => {
+            out.push(Line {
+                kind: LineKind::ModuleBoundary,
+                text: text.trim().to_owned(),
+                indent,
+                origin: Some(origin.clone()),
+            });
+        },
+        WrappedNode::Syntax { children, .. } | WrappedNode::Directive { children, .. } => {
+            for child in children {
+                render_top(child, cx, indent, first_name, out);
+            }
+        },
+    }
+}
+
+/// Render a `name = type` rule with substitutions applied.
+fn render_define(
+    node: &WrappedNode,
+    head: &RuleHead,
+    cx: &mut RenderCx<'_>,
+    indent: usize,
+    out: &mut Concrete,
+) {
+    if node.metadata().iter().any(|m| {
+        matches!(
+            m,
+            crate::MetaData::RedundantDefinition | crate::MetaData::ConflictingDefinition
+        )
+    }) {
+        return;
+    }
+
+    let WrappedNode::RuleLine {
+        children,
+        origin,
+        text: _,
+        ..
+    } = node
+    else {
+        return;
+    };
+
+    let rhs = find_rhs(children);
+    {
+        let mut head_text = String::new();
+        let _ = write!(&mut head_text, "{}", head.name);
+        if let Some(genericparm) = find_genericparm(children) {
+            let _ = write!(&mut head_text, "{}", genericparm.trim());
+        }
+        let _ = write!(&mut head_text, " = ");
+        out.push(Line {
+            kind: LineKind::RuleLine,
+            text: head_text,
+            indent,
+            origin: Some(origin.clone()),
+        });
+    }
+
+    if let Some(rhs_node) = rhs {
+        let rhs_text = text_of(rhs_node).trim().to_owned();
+        let body_start = out.len();
+        render_pretty_rhs(cx, rhs_node, indent.saturating_add(1), &rhs_text, out);
+        if out.len().saturating_sub(body_start) >= 1
+            && let Some(first_body) = out.lines().get(body_start)
+        {
+            let first_body_text = first_body.text.clone();
+            let body_tail: Vec<Line> = out
+                .lines()
+                .get(body_start.saturating_add(1)..)
+                .unwrap_or_default()
+                .to_vec();
+            out.lines_mut().truncate(body_start);
+            if let Some(head) = out.lines_mut().last_mut() {
+                head.text.push_str(&first_body_text);
+            }
+            for mut tail_line in body_tail {
+                tail_line.indent = tail_line.indent.saturating_sub(1);
+                out.push(tail_line);
+            }
+        }
+    }
+}
+
+/// Pretty-print the RHS of a top-level rule. The result is one or more
+/// `Line`s pushed onto `out`, with `Line.indent` honoured by
+/// `Concrete::to_cddl`.
+///
+/// Layout strategy:
+///
+/// * Short RHS (single typename, single literal, no `/`/`{`/`[`/`.within`) → one line,
+///   the existing compact inlining text.
+/// * `type` whose `type1` children are joined by `/` or `//` (a choice) → one indented
+///   line per arm, with `,` or `or` separators; the first arm sits on the same line as
+///   the LHS, the rest are stacked below at `indent` (one line each, `; provenance` for
+///   any inlined references). Single-arm choice stays inline.
+/// * `type2` whose source text starts with `{` or `[` → a block: opening bracket on its
+///   own line, then one entry per line, then closing bracket on its own line, with
+///   `,`-separated entries at `indent+1`. Each entry's grpent may further be a multi-line
+///   group if it's a plug expansion.
+/// * `.within` LHS expressions are pretty-printed recursively; `.within` sits on its own
+///   line at the parent indent; the RHS is a multi-line block.
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    reason = "Bounded indent arithmetic and indexed access on checked-bounds slices"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Single dispatch site, splitting harms readability"
+)]
+fn render_pretty_rhs(
+    cx: &mut RenderCx<'_>,
+    rhs_node: &WrappedNode,
+    indent: usize,
+    source_text: &str,
+    out: &mut Concrete,
+) {
+    for line in render_pretty_lines(cx, rhs_node, source_text) {
+        out.push(Line {
+            kind: LineKind::GroupEntry,
+            text: line.text,
+            indent: indent.saturating_add(line.indent),
+            origin: None,
+        });
+    }
+}
+
+/// One physical pretty-rendered line before final text normalization.
+#[derive(Debug, Clone)]
+struct PrettyLine {
+    /// Indent level relative to the expression being rendered.
+    indent: usize,
+    /// CDDL text for the physical line, without trailing newline.
+    text: String,
+}
+
+/// Construct a [`PrettyLine`].
+fn line(
+    indent: usize,
+    text: impl Into<String>,
+) -> PrettyLine {
+    PrettyLine {
+        indent,
+        text: text.into(),
+    }
+}
+
+/// Add extra indentation to all but the first line.
+fn nest_following_lines(
+    lines: &mut [PrettyLine],
+    extra_indent: usize,
+) {
+    for rendered_line in lines.iter_mut().skip(1) {
+        rendered_line.indent = rendered_line.indent.saturating_add(extra_indent);
+    }
+}
+
+/// Convert already-rendered multi-line text back into structured lines.
+fn split_rendered_lines(text: &str) -> Vec<PrettyLine> {
+    text.lines()
+        .map(|raw| {
+            let spaces = raw.chars().take_while(|c| *c == ' ').count();
+            let indent = spaces / 2;
+            line(indent, raw.trim_start().to_owned())
+        })
+        .collect()
+}
+
+/// Convert rendered text to one or more [`PrettyLine`]s.
+fn rendered_text_to_lines(text: String) -> Vec<PrettyLine> {
+    if text.contains('\n') {
+        split_rendered_lines(&text)
+    } else if let Some(lines) = structured_within_flat_lines(&text) {
+        lines
+    } else if let Some(lines) = structured_flat_lines(&text) {
+        lines
+    } else {
+        vec![line(0, text)]
+    }
+}
+
+/// Reflow a flat `.within` expression into physical lines.
+///
+/// Diagnostics must not collapse effective `.within` chains into a
+/// single unreadable line. This catches text produced by inlining named
+/// definitions, where we no longer have the original operand AST but
+/// still have balanced CDDL text.
+fn structured_within_flat_lines(text: &str) -> Option<Vec<PrettyLine>> {
+    let trimmed = text.trim();
+    let within_pos = find_within_split(trimmed)?;
+    let (lhs_src, rhs_src_with_op) = trimmed.split_at(within_pos);
+    let rhs_src = rhs_src_with_op.strip_prefix(".within")?.trim();
+    let mut lhs_lines = rendered_within_operand_lines(lhs_src.trim());
+    let rhs_lines = rendered_within_operand_lines(rhs_src);
+    join_control_lines(lhs_lines.as_mut_slice(), rhs_lines, ".within")
+}
+
+/// Render one operand of a flat `.within` expression.
+///
+/// Unlike general expression rendering, `.within` operands should not
+/// keep even a single-entry `{ ... }` or `[ ... ]` wrapper on one line:
+/// diagnostics need stable vertical structure.
+fn rendered_within_operand_lines(text: &str) -> Vec<PrettyLine> {
+    if let Some(lines) = structured_within_flat_lines(text) {
+        lines
+    } else if let Some(lines) = structured_wrapped_flat_lines(text, true) {
+        lines
+    } else {
+        rendered_text_to_lines(text.to_owned())
+    }
+}
+
+/// Join structured control-operator operands without ever producing a
+/// single physical line for a `.within` chain.
+fn join_control_lines(
+    left_lines: &mut [PrettyLine],
+    right_lines: Vec<PrettyLine>,
+    op: &str,
+) -> Option<Vec<PrettyLine>> {
+    if left_lines.is_empty() {
+        return Some(right_lines);
+    }
+    if right_lines.is_empty() {
+        return Some(left_lines.to_vec());
+    }
+    if left_lines.len() == 1 && right_lines.len() == 1 && op == ".within" {
+        let mut out = left_lines.to_vec();
+        out.push(line(0, op.to_owned()));
+        out.extend(right_lines);
+        return Some(out);
+    }
+    let (first_right, remaining_right) = right_lines.split_first()?;
+    let mut out = left_lines.to_vec();
+    if let Some(last_left) = out.last_mut() {
+        last_left.text.push(' ');
+        last_left.text.push_str(op);
+        last_left.text.push(' ');
+        last_left.text.push_str(&first_right.text);
+    }
+    out.extend(remaining_right.iter().cloned());
+    Some(out)
+}
+
+/// Reflow a flat but structurally delimited effective rendering into
+/// readable physical lines. This is deliberately syntax-light: it
+/// only splits at top-level separators inside a balanced wrapper and
+/// leaves quoted strings untouched.
+fn structured_flat_lines(text: &str) -> Option<Vec<PrettyLine>> {
+    structured_wrapped_flat_lines(text, false)
+}
+
+/// Reflow a flat expression with matching outer delimiters.
+///
+/// When `force_single_part` is true, even a single-entry `{ ... }`,
+/// `[ ... ]`, or `( ... )` wrapper is expanded to three physical
+/// lines. This is used for `.within` operands where compact output is
+/// harder to read than a stable block shape.
+fn structured_wrapped_flat_lines(
+    text: &str,
+    force_single_part: bool,
+) -> Option<Vec<PrettyLine>> {
+    let trimmed = text.trim();
+    let (open, close) = matching_outer_delimiters(trimmed)?;
+    let inner = strip_outer_delimiters(trimmed, open, close)?;
+    let separator = if has_top_level_separator(inner, ',') {
+        Some((',', ","))
+    } else if open == '('
+        && !has_top_level_member_operator(inner)
+        && has_top_level_separator(inner, '/')
+    {
+        Some(('/', " /"))
+    } else if force_single_part {
+        None
+    } else {
+        return None;
+    };
+    let parts = if let Some((separator_char, _)) = separator {
+        split_top_level(inner, separator_char)
+    } else {
+        vec![inner]
+    };
+    if parts.len() <= 1 && !force_single_part {
+        return None;
+    }
+    let mut lines = vec![line(0, open.to_string())];
+    let last_index = parts.len().saturating_sub(1);
+    for (idx, part) in parts.into_iter().enumerate() {
+        let mut part_lines =
+            structured_flat_lines(part.trim()).unwrap_or_else(|| vec![line(0, part.trim())]);
+        if idx != last_index
+            && let Some((_, separator_text)) = separator
+            && let Some(last) = part_lines.last_mut()
+        {
+            last.text.push_str(separator_text);
+        }
+        for mut part_line in part_lines {
+            part_line.indent = part_line.indent.saturating_add(1);
+            lines.push(part_line);
+        }
+    }
+    lines.push(line(0, close.to_string()));
+    Some(lines)
+}
+
+/// Return the matching outer delimiters if `text` is a wrapped
+/// expression.
+fn matching_outer_delimiters(text: &str) -> Option<(char, char)> {
+    let open = text.chars().next()?;
+    let close = match open {
+        '{' => '}',
+        '[' => ']',
+        '(' => ')',
+        _ => return None,
+    };
+    text.ends_with(close).then_some((open, close))
+}
+
+/// Strip a proven outer delimiter pair only when the closing delimiter
+/// balances the first character, not an earlier nested expression.
+fn strip_outer_delimiters(
+    text: &str,
+    open: char,
+    close: char,
+) -> Option<&str> {
+    let mut depth = 0_usize;
+    let mut in_string: Option<char> = None;
+    let mut escaped = false;
+    let mut chars = text.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if let Some(quote) = in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote {
+                in_string = None;
+            }
+            continue;
+        }
+        if matches!(ch, '"' | '\'') {
+            in_string = Some(ch);
+            continue;
+        }
+        if ch == open {
+            depth = depth.saturating_add(1);
+        } else if ch == close {
+            depth = depth.saturating_sub(1);
+            if depth == 0 && chars.peek().is_some() {
+                return None;
+            }
+            if depth == 0 {
+                return text.get(open.len_utf8()..idx);
+            }
+        }
+    }
+    None
+}
+
+/// Whether `separator` appears at top level in `text`.
+fn has_top_level_separator(
+    text: &str,
+    separator: char,
+) -> bool {
+    split_top_level(text, separator).len() > 1
+}
+
+/// Whether `text` contains a top-level map/group member operator.
+fn has_top_level_member_operator(text: &str) -> bool {
+    let mut paren = 0_usize;
+    let mut square = 0_usize;
+    let mut curly = 0_usize;
+    let mut in_string: Option<char> = None;
+    let mut escaped = false;
+    let mut chars = text.char_indices().peekable();
+    while let Some((_, ch)) = chars.next() {
+        if let Some(quote) = in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote {
+                in_string = None;
+            }
+            continue;
+        }
+        if matches!(ch, '"' | '\'') {
+            in_string = Some(ch);
+            continue;
+        }
+        match ch {
+            '(' => paren = paren.saturating_add(1),
+            ')' => paren = paren.saturating_sub(1),
+            '[' => square = square.saturating_add(1),
+            ']' => square = square.saturating_sub(1),
+            '{' => curly = curly.saturating_add(1),
+            '}' => curly = curly.saturating_sub(1),
+            ':' if paren == 0 && square == 0 && curly == 0 => return true,
+            '=' if paren == 0 && square == 0 && curly == 0 => {
+                if let Some((_, '>')) = chars.peek() {
+                    return true;
+                }
+            },
+            _ => {},
+        }
+    }
+    false
+}
+
+/// Split `text` on a separator that is not nested inside delimiters or
+/// quoted strings.
+fn split_top_level(
+    text: &str,
+    separator: char,
+) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0_usize;
+    let mut paren = 0_usize;
+    let mut square = 0_usize;
+    let mut curly = 0_usize;
+    let mut in_string: Option<char> = None;
+    let mut escaped = false;
+    for (idx, ch) in text.char_indices() {
+        if let Some(quote) = in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote {
+                in_string = None;
+            }
+            continue;
+        }
+        if matches!(ch, '"' | '\'') {
+            in_string = Some(ch);
+            continue;
+        }
+        match ch {
+            '(' => paren = paren.saturating_add(1),
+            ')' => paren = paren.saturating_sub(1),
+            '[' => square = square.saturating_add(1),
+            ']' => square = square.saturating_sub(1),
+            '{' => curly = curly.saturating_add(1),
+            '}' => curly = curly.saturating_sub(1),
+            _ if ch == separator && paren == 0 && square == 0 && curly == 0 => {
+                if let Some(part) = text.get(start..idx) {
+                    parts.push(part);
+                }
+                start = idx.saturating_add(ch.len_utf8());
+            },
+            _ => {},
+        }
+    }
+    if let Some(part) = text.get(start..) {
+        parts.push(part);
+    }
+    parts
+}
+
+/// Append text to code before any trailing provenance comment.
+fn append_before_provenance_comment(
+    text: &mut String,
+    suffix: &str,
+) {
+    if let Some(idx) = text.find(" ; from") {
+        let (head, tail) = text.split_at(idx);
+        *text = format!("{head}{suffix}{tail}");
+    } else {
+        text.push_str(suffix);
+    }
+}
+
+/// Append a `/` choice separator to the final line of an arm.
+fn append_choice_separator(lines: &mut [PrettyLine]) {
+    if let Some(last) = lines.last_mut() {
+        append_before_provenance_comment(&mut last.text, " /");
+    }
+}
+
+/// Return true when source text contains a top-level `/` separator.
+fn has_top_level_choice_separator(text: &str) -> bool {
+    let mut depth = 0_usize;
+    for ch in text.chars() {
+        match ch {
+            '(' | '[' | '{' => depth = depth.saturating_add(1),
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            '/' if depth == 0 => return true,
+            _ => {},
+        }
+    }
+    false
+}
+
+/// Render an expression as structured physical lines.
+fn render_pretty_lines(
+    cx: &mut RenderCx<'_>,
+    rhs_node: &WrappedNode,
+    source_text: &str,
+) -> Vec<PrettyLine> {
+    // Special case: `.within` chain. The node may be a type-level node
+    // whose source text contains `.within` — detect by scanning.
+    if let Some(within_pos) = find_within_split(source_text) {
+        // AST-driven split: rhs_node (a `type`) contains a single `type1`
+        // whose children are `type2` (LHS), `ctlop` (operator), `type2` (RHS).
+        // Rendering each side via the AST routes `{...}` and `[...]` bodies
+        // through `render_brace_block`, which expands socket plugs at use
+        // sites via `render_grpent`. This is the only way the LHS of a
+        // `.within` expression gets the same inlining treatment as a
+        // stand-alone brace/bracket body.
+        let (lhs_node, rhs_node_ast) = extract_within_operands(rhs_node);
+        // Render the LHS via AST so brace/bracket bodies get grpent expansion.
+        if let Some(lhs) = lhs_node {
+            let mut lhs_lines = render_pretty_lines(cx, lhs, text_of(lhs));
+            let rhs_lines = if let Some(rn) = rhs_node_ast {
+                render_pretty_lines(cx, rn, text_of(rn))
+            } else {
+                // Same byte-safety argument as the LHS fallback above.
+                let (_, rhs_src) = source_text.split_at(within_pos);
+                vec![line(
+                    0,
+                    rhs_src.trim_start_matches(".within").trim().to_owned(),
+                )]
+            };
+            if let Some(first_rhs) = rhs_lines.first() {
+                if lhs_lines.len() == 1 && rhs_lines.len() == 1 {
+                    lhs_lines.push(line(0, ".within"));
+                    lhs_lines.push(first_rhs.clone());
+                    return lhs_lines;
+                }
+                return join_control_lines(lhs_lines.as_mut_slice(), rhs_lines, ".within")
+                    .unwrap_or(lhs_lines);
+            }
+            return lhs_lines;
+        }
+        // Fallback: emit LHS as raw text. `within_pos` is a
+        // verified ASCII byte index from `find_within_split`,
+        // so `split_at` is safe here.
+        let (lhs_src, _) = source_text.split_at(within_pos);
+        let (_, rhs_src) = source_text.split_at(within_pos);
+        return vec![line(
+            0,
+            format!(
+                "{} .within {}",
+                lhs_src.trim(),
+                rhs_src.trim_start_matches(".within").trim()
+            ),
+        )];
+    }
+    let rule = syntax_rule(rhs_node);
+    match rule.unwrap_or("") {
+        "type" => render_type_lines(cx, rhs_node, source_text),
+        "type1" | "type2" | "grpent" | "group" | "grpchoice" => {
+            // Single type1 or a brace/bracket body. If the source text
+            // starts with `{` or `[`, lay it out as a block.
+            let trimmed = source_text.trim();
+            if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                render_brace_block_lines(cx, rhs_node)
+            } else if let Some(lines) = render_structured_non_block(cx, rhs_node, source_text) {
+                lines
+            } else {
+                let (rendered, _) = cx.render_with_inlining(rhs_node, &mut None);
+                let mut text = rendered;
+                if cx.policy.provenance_comments {
+                    annotate_inline_refs(cx, &mut text, rhs_node);
+                }
+                rendered_text_to_lines(text)
+            }
+        },
+        _ => render_default_pretty_lines(cx, rhs_node),
+    }
+}
+
+/// Render a `type` node, preserving real choice separators.
+fn render_type_lines(
+    cx: &mut RenderCx<'_>,
+    rhs_node: &WrappedNode,
+    source_text: &str,
+) -> Vec<PrettyLine> {
+    let type1s: Vec<&WrappedNode> = if let WrappedNode::Syntax { children, .. } = rhs_node {
+        children
+            .iter()
+            .filter(|c| syntax_rule(c) == Some("type1"))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if let [only_t1] = type1s.as_slice() {
+        let t1_text = text_of(only_t1).trim();
+        if t1_text.starts_with('{') || t1_text.starts_with('[') {
+            return render_brace_block_lines(cx, only_t1);
+        }
+    }
+    if type1s.is_empty() {
+        let (rendered, _) = cx.render_with_inlining(rhs_node, &mut None);
+        return rendered_text_to_lines(rendered);
+    }
+    if let [only_t1] = type1s.as_slice() {
+        let rendered_lines = render_pretty_lines(cx, only_t1, text_of(only_t1));
+        if rendered_lines.is_empty() {
+            let (rendered, _) = cx.render_with_inlining(only_t1, &mut None);
+            return rendered_text_to_lines(rendered);
+        }
+        return rendered_lines;
+    }
+    render_type_choice_arms(cx, &type1s, has_top_level_choice_separator(source_text))
+}
+
+/// Render each `type1` arm in a `type` choice.
+fn render_type_choice_arms(
+    cx: &mut RenderCx<'_>,
+    type1s: &[&WrappedNode],
+    is_choice: bool,
+) -> Vec<PrettyLine> {
+    let mut lines = Vec::new();
+    let mut arms = type1s.iter().peekable();
+    while let Some(t1) = arms.next() {
+        let mut arm_lines = render_pretty_lines(cx, t1, text_of(t1));
+        if is_choice && arms.peek().is_some() {
+            append_choice_separator(&mut arm_lines);
+        }
+        lines.extend(arm_lines);
+    }
+    lines
+}
+
+/// Render fallback syntax, with special handling for parenthesized choices.
+fn render_default_pretty_lines(
+    cx: &mut RenderCx<'_>,
+    rhs_node: &WrappedNode,
+) -> Vec<PrettyLine> {
+    if let Some(lines) = render_parenthesized_choice_lines(cx, rhs_node) {
+        return lines;
+    }
+    let (rendered, _) = cx.render_with_inlining(rhs_node, &mut None);
+    rendered_text_to_lines(rendered)
+}
+
+/// Render `(a / b / c)` as a multi-line parenthesized choice.
+fn render_parenthesized_choice_lines(
+    cx: &mut RenderCx<'_>,
+    rhs_node: &WrappedNode,
+) -> Option<Vec<PrettyLine>> {
+    let WrappedNode::Syntax { children, text, .. } = rhs_node else {
+        return None;
+    };
+    let trimmed = text.trim();
+    if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+        return None;
+    }
+    let Some(WrappedNode::Syntax {
+        children: type_kids,
+        ..
+    }) = children.iter().find(|c| syntax_rule(c) == Some("type"))
+    else {
+        return None;
+    };
+    let type1s: Vec<&WrappedNode> = type_kids
+        .iter()
+        .filter(|c| syntax_rule(c) == Some("type1"))
+        .collect();
+    if type1s.len() <= 1 {
+        return None;
+    }
+    Some(render_wrapped_choice_lines(cx, &type1s))
+}
+
+/// Wrap rendered choice arms in surrounding parentheses.
+fn render_wrapped_choice_lines(
+    cx: &mut RenderCx<'_>,
+    type1s: &[&WrappedNode],
+) -> Vec<PrettyLine> {
+    let mut lines = vec![line(0, "(")];
+    let mut arms = type1s.iter().peekable();
+    while let Some(t1) = arms.next() {
+        let mut arm_lines = render_pretty_lines(cx, t1, text_of(t1));
+        if arms.peek().is_some() {
+            append_choice_separator(&mut arm_lines);
+        }
+        for mut rendered_line in arm_lines {
+            rendered_line.indent = rendered_line.indent.saturating_add(1);
+            lines.push(rendered_line);
+        }
+    }
+    lines.push(line(0, ")"));
+    lines
+}
+
+/// Render non-bracket syntax forms that still need structured layout.
+fn render_structured_non_block(
+    cx: &mut RenderCx<'_>,
+    rhs_node: &WrappedNode,
+    source_text: &str,
+) -> Option<Vec<PrettyLine>> {
+    match syntax_rule(rhs_node) {
+        Some("type1") => render_type1_lines(cx, rhs_node),
+        Some("type2") => render_type2_lines(cx, rhs_node, source_text),
+        Some("grpent") => render_grpent_lines(cx, rhs_node),
+        _ => None,
+    }
+}
+
+/// Render `type1` control/range operators with structured operands.
+fn render_type1_lines(
+    cx: &mut RenderCx<'_>,
+    node: &WrappedNode,
+) -> Option<Vec<PrettyLine>> {
+    let WrappedNode::Syntax { children, .. } = node else {
+        return None;
+    };
+    let mut type2s: Vec<&WrappedNode> = Vec::new();
+    let mut operator: Option<String> = None;
+    for child in children {
+        match syntax_rule(child) {
+            Some("type2") => type2s.push(child),
+            Some("rangeop") => operator = Some("..".to_owned()),
+            Some("ctlop") => {
+                let ctlop_text = text_of(child).trim();
+                if let Some(name) = ctlop_text.split_whitespace().next()
+                    && operator.is_none()
+                {
+                    operator = Some(name.to_owned());
+                }
+            },
+            _ => {},
+        }
+    }
+    let [left, right] = type2s.as_slice() else {
+        return None;
+    };
+    let op = operator?;
+    let mut left_lines = render_pretty_lines(cx, left, text_of(left));
+    let right_lines = render_pretty_lines(cx, right, text_of(right));
+    join_control_lines(left_lines.as_mut_slice(), right_lines, &op)
+}
+
+/// Render `type2` tags and parenthesized choices as structured lines.
+fn render_type2_lines(
+    cx: &mut RenderCx<'_>,
+    node: &WrappedNode,
+    source_text: &str,
+) -> Option<Vec<PrettyLine>> {
+    let WrappedNode::Syntax { children, text, .. } = node else {
+        return None;
+    };
+    if let Some(tag) = leading_tag(children, text) {
+        let inner = children.iter().find(|c| {
+            matches!(c, WrappedNode::Syntax { rule, .. } if rule == "type" || rule == "type1" || rule == "type2")
+        })?;
+        let mut lines = render_pretty_lines(cx, inner, text_of(inner));
+        if let Some(first) = lines.first_mut() {
+            first.text = format!("{tag}({}", first.text);
+        }
+        nest_following_lines(&mut lines, 1);
+        if let Some(last) = lines.last_mut() {
+            last.text.push(')');
+        }
+        return Some(lines);
+    }
+    if source_text.trim().starts_with('(')
+        && source_text.trim().ends_with(')')
+        && let Some(WrappedNode::Syntax {
+            children: type_kids,
+            ..
+        }) = children.iter().find(|c| syntax_rule(c) == Some("type"))
+    {
+        let type1s: Vec<&WrappedNode> = type_kids
+            .iter()
+            .filter(|c| syntax_rule(c) == Some("type1"))
+            .collect();
+        if type1s.len() > 1 {
+            return Some(render_wrapped_choice_lines(cx, &type1s));
+        }
+    }
+    None
+}
+
+/// Render group entries that expand to socket plug choices.
+fn render_grpent_lines(
+    cx: &mut RenderCx<'_>,
+    node: &WrappedNode,
+) -> Option<Vec<PrettyLine>> {
+    let WrappedNode::Syntax { children, .. } = node else {
+        return None;
+    };
+    if let Some(plug_name) = RenderCx::find_socket_plug_name(children)
+        && !plug_name.is_empty()
+        && let Some(plugs) = cx.resolution.socket_plugs.get(&plug_name)
+        && !plugs.is_empty()
+    {
+        return Some(render_plug_choice_lines(cx, plugs));
+    }
+    None
+}
+
+/// Render `{ ... }` and `[ ... ]` bodies as nested blocks.
+fn render_brace_block_lines(
+    cx: &mut RenderCx<'_>,
+    node: &WrappedNode,
+) -> Vec<PrettyLine> {
+    let mut out = Vec::new();
+    let trimmed = text_of(node).trim();
+    let (open, close) = if trimmed.starts_with('[') {
+        ('[', ']')
+    } else {
+        ('{', '}')
+    };
+    out.push(line(0, open.to_string()));
+    let grp = find_group_child(node);
+    if let Some(g) = grp {
+        let entries = collect_group_entries(g);
+        let mut entries = entries.into_iter().peekable();
+        while let Some(entry) = entries.next() {
+            let mut entry_lines = render_group_entry_lines(cx, &entry);
+            if entries.peek().is_some()
+                && let Some(last) = entry_lines.last_mut()
+            {
+                if last.text.trim_end().ends_with(',') {
+                    // Already comma-terminated.
+                } else if let Some(idx) = last.text.find(" ; from") {
+                    let (head, tail) = last.text.split_at(idx);
+                    last.text = format!("{head},{tail}");
+                } else {
+                    last.text.push(',');
+                }
+            }
+            for mut rendered_line in entry_lines {
+                rendered_line.indent = rendered_line.indent.saturating_add(1);
+                out.push(rendered_line);
+            }
+        }
+    }
+    out.push(line(0, close.to_string()));
+    out
+}
+
+/// Render one collected group entry, expanding nested structure when needed.
+fn render_group_entry_lines(
+    cx: &mut RenderCx<'_>,
+    entry: &WrappedNode,
+) -> Vec<PrettyLine> {
+    if let WrappedNode::Syntax { rule, .. } = entry
+        && rule == "grpent"
+        && find_group_child(entry).is_some()
+    {
+        let first_char = text_of(entry).trim().chars().next();
+        if matches!(first_char, Some('{' | '[')) {
+            return render_brace_block_lines(cx, entry);
+        }
+    }
+    if let Some(lines) = render_structured_non_block(cx, entry, text_of(entry))
+        && !lines.is_empty()
+    {
+        return lines;
+    }
+    // BUG-005 follow-on: a `key: { ... }` entry whose value is a
+    // brace or bracket body must render the value across multiple
+    // indented lines instead of being collapsed to a single
+    // one-liner.  The inline `render_grpent` path would otherwise
+    // emit `key: {field1, field2, field3}` for arbitrarily long
+    // nested maps/arrays, which defeats the multi-line renderer
+    // contract from the `.within` diagnostic.
+    if let Some(lines) = render_grpent_keyed_block(cx, entry) {
+        return lines;
+    }
+    let rendered = if let WrappedNode::Syntax {
+        rule, children: gc, ..
+    } = entry
+        && rule == "grpent"
+    {
+        let (r, _) = cx.render_grpent(entry, gc, &mut None, &mut HashSet::new());
+        r
+    } else {
+        let (r, _) = cx.render_with_inlining(entry, &mut None);
+        r
+    };
+    let mut text = rendered;
+    if cx.policy.provenance_comments {
+        annotate_inline_refs(cx, &mut text, entry);
+    }
+    if text.contains('\n') {
+        split_rendered_lines(&text)
+    } else {
+        vec![line(0, text)]
+    }
+}
+
+/// Render a `grpent` whose value is a brace or bracket body using
+/// the multiline nested-block layout (the same layout the top-level
+/// brace renderer uses), so a `key: { ... }` entry with many fields
+/// expands each field onto its own indented line instead of being
+/// collapsed to a single one-liner.
+///
+/// Returns `None` when the entry is not a keyed brace/bracket body
+/// so the caller falls through to the inline renderer.
+fn render_grpent_keyed_block(
+    cx: &mut RenderCx<'_>,
+    entry: &WrappedNode,
+) -> Option<Vec<PrettyLine>> {
+    let WrappedNode::Syntax { children, .. } = entry else {
+        return None;
+    };
+    if syntax_rule(entry) != Some("grpent") {
+        return None;
+    }
+    // Walk children for: memberkey, occur, and the brace/bracket
+    // value type.  We need at least one memberkey and a value
+    // type whose text starts with `{` or `[`.
+    let mut memberkey: Option<&WrappedNode> = None;
+    let mut value: Option<&WrappedNode> = None;
+    let mut occur_text: Option<String> = None;
+    for child in children {
+        match syntax_rule(child) {
+            Some("memberkey") => memberkey = Some(child),
+            Some("type" | "type1") => {
+                if value.is_none() {
+                    value = Some(child);
+                }
+            },
+            Some("occur") => occur_text = Some(text_of(child).trim().to_owned()),
+            _ => {},
+        }
+    }
+    let (mk, val) = (memberkey?, value?);
+    // Render the value via the inline path first so we see the
+    // post-inlining text (`Headers` -> `{1: 57, 4: bstr .size 32,
+    // ...}`).  The raw node text still says `Headers` and would
+    // not match a brace/bracket prefix check.
+    let (rendered_val, _) = cx.render_with_inlining(val, &mut None);
+    let rendered_val = rendered_val.trim();
+    if !(rendered_val.starts_with('[') || rendered_val.starts_with('{')) {
+        return None;
+    }
+    let mk_text = render_memberkey_text(cx, mk);
+    let prefix = occur_text
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map_or(String::new(), |s| format!("{s} "));
+    // Render the inlined value as a multi-line brace/bracket block.
+    // The AST recursion (`render_pretty_lines(cx, val, ...)`) would
+    // re-walk the un-inlined `Body` typename and emit a single line,
+    // so we render the inlined text directly via a small helper
+    // that splits the body on top-level commas and emits each entry
+    // on its own indented line.  Group entries that themselves
+    // contain a brace block are indented one extra level.
+    let mut value_lines = render_inlined_brace_lines(rendered_val);
+    if value_lines.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(value_lines.len().saturating_add(1));
+    if let Some(first) = value_lines.first_mut() {
+        first.text = format!("{prefix}{mk_text} {}", first.text);
+    }
+    out.extend(value_lines);
+    Some(out)
+}
+
+/// Render an inlined `{...}` or `[...]` body whose AST node
+/// representation no longer matches its post-inlining text.  The
+/// top-level body is split on commas (respecting nested braces,
+/// brackets, and parens), and each entry is emitted on its own
+/// line indented one level past the `key {` header.  A trailing
+/// close delimiter is emitted last.
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::string_slice,
+    reason = "byte offsets walked manually; UTF-8 boundaries checked via char_indices"
+)]
+fn render_inlined_brace_lines(text: &str) -> Vec<PrettyLine> {
+    let trimmed = text.trim();
+    let (open, close) = if trimmed.starts_with('[') {
+        ('[', ']')
+    } else if trimmed.starts_with('{') {
+        ('{', '}')
+    } else {
+        return Vec::new();
+    };
+    let inner = trimmed
+        .get(1..trimmed.len().saturating_sub(1))
+        .unwrap_or("");
+    let entries = split_top_level_commas(inner);
+    let mut out = vec![line(0, open.to_string())];
+    let count = entries.len();
+    for (i, entry) in entries.into_iter().enumerate() {
+        let is_last = i + 1 == count;
+        let mut entry_line = entry.trim().to_owned();
+        if !is_last && !entry_line.ends_with(',') {
+            entry_line.push(',');
+        }
+        out.push(line(1, entry_line));
+    }
+    out.push(line(0, close.to_string()));
+    out
+}
+
+/// Split a body string on top-level commas, respecting nested
+/// braces, brackets, parens, and CDDL generic-argument angle
+/// brackets (so `Wrapper<A, B>` is kept on one line).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "depth counters advance by 1 per char, cannot overflow in practice"
+)]
+fn split_top_level_commas(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth_brace = 0_i32;
+    let mut depth_bracket = 0_i32;
+    let mut depth_paren = 0_i32;
+    let mut depth_angle = 0_i32;
+    let mut in_str = false;
+    let mut escape = false;
+    let mut start = 0_usize;
+    for (i, ch) in body.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_str {
+            if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '{' => depth_brace += 1,
+            '}' => depth_brace -= 1,
+            '[' => depth_bracket += 1,
+            ']' => depth_bracket -= 1,
+            '(' => depth_paren += 1,
+            ')' => depth_paren -= 1,
+            '<' => depth_angle += 1,
+            '>' => depth_angle -= 1,
+            ',' if depth_brace == 0
+                && depth_bracket == 0
+                && depth_paren == 0
+                && depth_angle == 0 =>
+            {
+                let chunk = body.get(start..i).unwrap_or("");
+                out.push(chunk.to_owned());
+                start = i + 1_usize;
+            },
+            _ => {},
+        }
+    }
+    let tail = body.get(start..).unwrap_or("").trim();
+    if !tail.is_empty() {
+        out.push(tail.to_owned());
+    }
+    out
+}
+
+/// Render a `memberkey` node's text, including any group
+/// occurrence markers from its sub-syntax.  Falls back to the
+/// trimmed source text for plain identifiers.
+fn render_memberkey_text(
+    cx: &mut RenderCx<'_>,
+    mk: &WrappedNode,
+) -> String {
+    let (rendered, _) = cx.render_with_inlining(mk, &mut None);
+    let trimmed = rendered.trim().to_owned();
+    if trimmed.is_empty() {
+        text_of(mk).trim().to_owned()
+    } else {
+        trimmed
+    }
+}
+
+/// Render all socket plug arms as a parenthesized choice.
+fn render_plug_choice_lines(
+    cx: &mut RenderCx<'_>,
+    plugs: &[WrappedNode],
+) -> Vec<PrettyLine> {
+    let mut lines = vec![line(0, "(")];
+    let mut plugs = plugs.iter().peekable();
+    while let Some(plug) = plugs.next() {
+        let rendered = render_plug_arm(cx, plug);
+        let suffix = if plugs.peek().is_none() { "" } else { " /" };
+        lines.push(line(1, format!("{rendered}{suffix}")));
+    }
+    lines.push(line(0, ")"));
+    lines
+}
+
+/// Render one socket plug augmentation body.
+fn render_plug_arm(
+    cx: &mut RenderCx<'_>,
+    plug: &WrappedNode,
+) -> String {
+    let WrappedNode::RuleLine { children, .. } = plug else {
+        return String::new();
+    };
+    let Some(rhs) = find_rhs(children) else {
+        return String::new();
+    };
+    if let Some(inner) = find_parenthesized_grpent(rhs)
+        && let WrappedNode::Syntax { children: gc, .. } = inner
+    {
+        let (rendered, _) = cx.render_grpent(inner, gc, &mut None, &mut HashSet::new());
+        return format!("({rendered})");
+    }
+    cx.render_with_inlining(rhs, &mut None).0
+}
+
+/// Find the innermost parenthesized group entry inside a plug arm.
+fn find_parenthesized_grpent(node: &WrappedNode) -> Option<&WrappedNode> {
+    let WrappedNode::Syntax { children, .. } = node else {
+        return None;
+    };
+    for child in children {
+        if syntax_rule(child) == Some("grpent") {
+            return Some(child);
+        }
+        if let Some(found) = find_parenthesized_grpent(child) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Locate the first top-level `.within` in a source string, returning
+/// the byte position of the `.within` keyword. `None` if not found.
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    reason = "Manual byte walk is bounded by the loop predicate and UTF-8 safety"
+)]
+fn find_within_split(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let needle = b".within";
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if &bytes[i..i + needle.len()] == needle {
+            // Must not be inside `[...]` or `{...}` or `(...)`.
+            let mut depth_sq = 0_i32;
+            let mut depth_cu = 0_i32;
+            let mut depth_pa = 0_i32;
+            for c in text[..i].chars() {
+                match c {
+                    '[' => depth_sq += 1,
+                    ']' => depth_sq -= 1,
+                    '{' => depth_cu += 1,
+                    '}' => depth_cu -= 1,
+                    '(' => depth_pa += 1,
+                    ')' => depth_pa -= 1,
+                    _ => {},
+                }
+            }
+            if depth_sq == 0 && depth_cu == 0 && depth_pa == 0 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Extract the LHS and RHS operand `type2` nodes from the AST
+/// shape produced for `LHS .within RHS` expressions. The
+/// grammar produces a `type` node containing a single
+/// `type1`, whose children are `type2`, `ctlop`, `type2`. We
+/// return the first two `type2`-shaped children so the
+/// pretty-printer can recurse into each side through the AST
+/// (which routes `{...}` and `[...]` bodies through
+/// `render_brace_block` and expands socket plugs at use sites).
+/// Returns `(None, None)` if the AST shape doesn't match.
+fn extract_within_operands(rhs_node: &WrappedNode) -> (Option<&WrappedNode>, Option<&WrappedNode>) {
+    let WrappedNode::Syntax { children, .. } = rhs_node else {
+        return (None, None);
+    };
+    for c in children {
+        if let WrappedNode::Syntax {
+            rule, children: tc, ..
+        } = c
+            && rule == "type1"
+        {
+            let mut ts = tc.iter().filter(|x| {
+                matches!(
+                    syntax_rule(x),
+                    Some("type2" | "type" | "type1" | "group" | "grpchoice")
+                )
+            });
+            return (ts.next(), ts.next());
+        }
+    }
+    (None, None)
+}
+
+/// Find the first `group` child of a node (used to walk into a
+/// `{ ... }` or `[ ... ]` body).
+fn find_group_child(node: &WrappedNode) -> Option<&WrappedNode> {
+    if let WrappedNode::Syntax { children, rule, .. } = node {
+        for c in children {
+            if syntax_rule(c) == Some("group") {
+                return Some(c);
+            }
+            if matches!(rule.as_str(), "type1" | "type2" | "type" | "grpent")
+                && matches!(syntax_rule(c), Some("type1" | "type2" | "type" | "group"))
+                && let Some(found) = find_group_child(c)
+            {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Collect grpent entries out of a `group`/`grpchoice` subtree, in
+/// order. `optcom` (comment) nodes are dropped — we don't try to
+/// preserve source comments here.
+#[allow(
+    clippy::items_after_statements,
+    reason = "Local walker only used from collect_group_entries"
+)]
+fn collect_group_entries(group: &WrappedNode) -> Vec<WrappedNode> {
+    let mut out = Vec::new();
+    walk_for_grpents(group, &mut out);
+    out
+}
+
+/// Inner walker for [`collect_group_entries`]. Recursively collects
+/// grpent nodes from a `group` or `grpchoice` subtree.
+fn walk_for_grpents(
+    node: &WrappedNode,
+    out: &mut Vec<WrappedNode>,
+) {
+    if let WrappedNode::Syntax { children, .. } = node {
+        for c in children {
+            if let Some(r) = syntax_rule(c) {
+                if r == "grpent" {
+                    out.push(c.clone());
+                } else if r == "group" || r == "grpchoice" {
+                    walk_for_grpents(c, out);
+                }
+            }
+        }
+    }
+}
+
+/// Scan a rendered string for an inlined typename reference; if found
+/// and the name has a definition we are emitting elsewhere, append a
+/// `; from <name>` tail-comment. Mutates `text` in place.
+fn annotate_inline_refs(
+    cx: &mut RenderCx<'_>,
+    text: &mut String,
+    node: &WrappedNode,
+) {
+    let defs = collect_bare_typenames(node);
+    for name in defs {
+        if cx.resolution.definitions.contains_key(&name)
+            && !name.starts_with('"')
+            && !is_primitive_keyword(&name)
+        {
+            let _ = write!(text, " ; from {name}");
+            break; // one comment is enough to keep it human-readable
+        }
+    }
+}
+
+/// Walk a node tree and collect bare `typename` / `groupname` child
+/// names. Used to add provenance comments to inlined references.
+#[allow(
+    clippy::items_after_statements,
+    reason = "Local walker only used from collect_bare_typenames"
+)]
+fn collect_bare_typenames(node: &WrappedNode) -> Vec<String> {
+    let mut out = Vec::new();
+    walk_for_typenames(node, &mut out);
+    out
+}
+
+/// Inner walker for [`collect_bare_typenames`]. Recursively collects
+/// `typename` and `groupname` child node texts.
+fn walk_for_typenames(
+    node: &WrappedNode,
+    out: &mut Vec<String>,
+) {
+    if let WrappedNode::Syntax { children, .. } = node {
+        for c in children {
+            if let WrappedNode::Syntax { rule, text, .. } = c {
+                if rule == "typename" || rule == "groupname" {
+                    let n = text.trim().to_owned();
+                    if !n.is_empty() {
+                        out.push(n);
+                    }
+                }
+                walk_for_typenames(c, out);
+            }
+        }
+    }
+}
+
+/// CDDL primitive keywords that we don't want to annotate as
+/// "from <keyword>".
+fn is_primitive_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "int"
+            | "uint"
+            | "nint"
+            | "integer"
+            | "float"
+            | "text"
+            | "tstr"
+            | "bytes"
+            | "bstr"
+            | "bool"
+            | "null"
+            | "any"
+            | "true"
+            | "false"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Sub-tree rendering with inlining
+// ---------------------------------------------------------------------------
+
+/// Threaded recursion context. Bundles the resolution map, the policy,
+/// and the cycle-tracking set into a single parameter so the recursion
+/// lints see one `cx` parameter that's used at every level rather
+/// than several parameters each only used in recursive calls.
+struct RenderCx<'a> {
+    /// Resolution state (definitions, plug sources, cache, exports).
+    resolution: &'a ResolutionMap,
+    /// Active render policy.
+    policy: &'a ConcretePolicy,
+    /// Session-level set of names currently being expanded through
+    /// inlining.  Acts as a safety net for recursive group
+    /// references that enter the inliner through a fresh local
+    /// `visited` set (e.g. via the pretty-printer's brace-block
+    /// walker).  Mirrors the local `visited` parameter of
+    /// [`RenderCx::render_named_reference`].
+    in_progress: HashSet<String>,
+}
+
+impl<'a> RenderCx<'a> {
+    /// Bundle a resolution map and policy into a render context.
+    fn new(
+        resolution: &'a ResolutionMap,
+        policy: &'a ConcretePolicy,
+    ) -> Self {
+        Self {
+            resolution,
+            policy,
+            in_progress: HashSet::new(),
+        }
+    }
+
+    /// Record that a recursive group reference was hit while inlining
+    /// `name`.  The renderer cannot fully expand the cycle, so it
+    /// leaves a stable placeholder behind; this method records the
+    /// diagnostic so the caller can surface it to the user.
+    fn record_cycle(
+        &self,
+        name: &str,
+    ) {
+        let origin = self.resolution.definitions.get(name).and_then(|n| {
+            match n {
+                WrappedNode::RuleLine { origin, .. } => Some(origin.clone()),
+                _ => None,
+            }
+        });
+        let mut diagnostics = self.resolution.render_diagnostics.borrow_mut();
+        let already_reported = diagnostics
+            .iter()
+            .any(|d| d.code == "E030" && d.message.contains(&format!("`{name}`")));
+        if already_reported {
+            return;
+        }
+        let origin = origin.unwrap_or_else(|| {
+            SourceOrigin {
+                source_path: std::path::PathBuf::from("<render>"),
+                line: 0,
+                column: 0,
+            }
+        });
+        diagnostics.push(Diagnostic {
+            code: "E030",
+            level: DiagnosticLevel::Warning,
+            message: format!(
+                "recursive group reference cycle through `{name}`: the renderer broke the cycle at this use site and emitted the bare name as a placeholder"
+            ),
+            source_file: Some(origin.source_path),
+            span: None,
+            previous_origin: None,
+            related: Vec::new(),
+        });
+    }
+
+    /// Render a single node, inlining typename references and folding
+    /// primitive constants. Returns the rendered CDDL text and an
+    /// optional provenance pair (folded name, folded value).
+    fn render_with_inlining(
+        &mut self,
+        node: &WrappedNode,
+        prov: &mut Option<(String, String)>,
+    ) -> (String, Option<(String, String)>) {
+        self.render_with_inlining_inner(node, prov, &mut HashSet::new())
+    }
+
+    /// Inner: render with a cycle-tracking set threaded through.
+    fn render_with_inlining_inner(
+        &mut self,
+        node: &WrappedNode,
+        prov: &mut Option<(String, String)>,
+        visited: &mut HashSet<String>,
+    ) -> (String, Option<(String, String)>) {
+        let WrappedNode::Syntax {
+            rule,
+            children,
+            text,
+            ..
+        } = node
+        else {
+            return (text_of(node).trim().to_owned(), None);
+        };
+
+        match rule.as_str() {
+            "expr" => self.render_expr(children, prov, visited),
+            "group" | "grpchoice" => self.render_group(children, prov, visited),
+            "type" => self.render_type_choice(children, prov, visited),
+            "type1" => {
+                self.render_type1(children, prov, visited)
+                    .unwrap_or_default()
+            },
+            "type2" => self.render_type2(node, children, text, prov, visited),
+            "grpent" => self.render_grpent(node, children, prov, visited),
+            _ => (text.trim().to_owned(), None),
+        }
+    }
+
+    /// Render the body of an `expr` rule. The `expr` children are:
+    /// LHS, optional `genericparm`, `assignt`/`assigng`, RHS. We only
+    /// render the RHS here (LHS is rendered by `render_define`).
+    fn render_expr(
+        &mut self,
+        children: &[WrappedNode],
+        prov: &mut Option<(String, String)>,
+        visited: &mut HashSet<String>,
+    ) -> (String, Option<(String, String)>) {
+        let mut out = String::new();
+        for child in children {
+            let Some(rule) = syntax_rule(child) else {
+                continue;
+            };
+            match rule {
+                "typename" | "groupname" | "assignt" | "assigng" | "genericparm" => {},
+                "type" | "type1" | "type2" | "grpent" => {
+                    let (rendered, p) = self.render_with_inlining_inner(child, prov, visited);
+                    if prov.is_none() {
+                        *prov = p;
+                    }
+                    let _ = write!(&mut out, "{rendered}");
+                },
+                _ => {
+                    let _ = write!(&mut out, "{}", text_of(child).trim());
+                },
+            }
+        }
+        (out, None)
+    }
+
+    /// Render a `type` (the choice-of-`type1` arm).
+    fn render_type_choice(
+        &mut self,
+        children: &[WrappedNode],
+        prov: &mut Option<(String, String)>,
+        visited: &mut HashSet<String>,
+    ) -> (String, Option<(String, String)>) {
+        let parts: Vec<String> = children
+            .iter()
+            .filter(|c| syntax_rule(c) == Some("type1"))
+            .map(|c| {
+                let t1_children = match c {
+                    WrappedNode::Syntax { children: cs, .. } => cs.as_slice(),
+                    _ => &[],
+                };
+                let (r, p) = self
+                    .render_type1(t1_children, prov, visited)
+                    .unwrap_or_default();
+                if prov.is_none() {
+                    *prov = p;
+                }
+                r
+            })
+            .collect();
+        (parts.join(" / "), None)
+    }
+
+    /// Render a `type1` (may contain a ctlop, a rangeop, or be a
+    /// simple `type2`).
+    fn render_type1(
+        &mut self,
+        children: &[WrappedNode],
+        prov: &mut Option<(String, String)>,
+        visited: &mut HashSet<String>,
+    ) -> Option<(String, Option<(String, String)>)> {
+        let mut type2s: Vec<&WrappedNode> = Vec::new();
+        let mut operator: Option<String> = None;
+        for child in children {
+            match syntax_rule(child) {
+                Some("type2") => type2s.push(child),
+                Some("rangeop") => operator = Some("..".to_owned()),
+                Some("ctlop") => {
+                    let ctlop_text = text_of(child).trim();
+                    if let Some(name) = ctlop_text.split_whitespace().next()
+                        && operator.is_none()
+                    {
+                        operator = Some(name.to_owned());
+                    }
+                },
+                _ => {},
+            }
+        }
+        let first = *type2s.first()?;
+        if let Some(op) = operator {
+            let (lo, _) = self.render_type2_inline(first, prov, visited);
+            if op.starts_with(".feature") {
+                return Some((lo, None));
+            }
+            let hi = type2s.get(1).copied().unwrap_or(first);
+            let hi_text = if op == ".det" {
+                text_of(hi).trim().to_owned()
+            } else {
+                self.render_type2_inline(hi, prov, visited).0
+            };
+            return Some((format!("{lo} {op} {hi_text}"), None));
+        }
+        Some(self.render_type2_inline(first, prov, visited))
+    }
+
+    /// Render a `type2` (the leaf type level in CDDL's grammar).
+    fn render_type2(
+        &mut self,
+        _node: &WrappedNode,
+        children: &[WrappedNode],
+        text: &str,
+        prov: &mut Option<(String, String)>,
+        visited: &mut HashSet<String>,
+    ) -> (String, Option<(String, String)>) {
+        if text.trim_start().starts_with("&(") {
+            return (simplify_singleton_enum_key(text), None);
+        }
+
+        if let Some(tag) = leading_tag(children, text) {
+            let inner = children.iter().find(|c| {
+                matches!(c, WrappedNode::Syntax { rule, .. } if rule == "type" || rule == "type1" || rule == "type2")
+            });
+            let inner_text = match inner {
+                Some(inner_node) => self.render_with_inlining_inner(inner_node, prov, visited).0,
+                None => String::new(),
+            };
+            // `leading_tag` already includes the leading `#`, so do not add one here.
+            return (format!("{tag}({inner_text})"), None);
+        }
+
+        if text.trim() == "#" {
+            return ("#".to_owned(), None);
+        }
+
+        if text.trim_start().starts_with('~')
+            && let Some(name) = first_type_or_group_name(children)
+        {
+            return self.render_named_reference(&name, prov, visited);
+        }
+
+        // Handle a type2 whose source text is `{ ... }` or `[ ... ]`
+        // by rendering the inner `group` child and re-wrapping it.
+        if let Some(WrappedNode::Syntax { children: gc, .. }) =
+            first_child_with_rule(children, "group")
+        {
+            let trimmed = text.trim();
+            if trimmed.starts_with('[') || trimmed.starts_with('{') {
+                let (open, close) = if trimmed.starts_with('[') {
+                    ('[', ']')
+                } else {
+                    ('{', '}')
+                };
+                let (inner_text, p) = self.render_group(gc, prov, visited);
+                if prov.is_none() {
+                    *prov = p;
+                }
+                return (format!("{open}{inner_text}{close}"), None);
+            }
+        }
+
+        if let Some(brackets) = detect_group_brackets(children) {
+            return (brackets, None);
+        }
+
+        if let Some(inner) = first_child_with_rule(children, "type") {
+            return self.render_with_inlining_inner(inner, prov, visited);
+        }
+
+        for child in children {
+            let Some(child_rule) = syntax_rule(child) else {
+                continue;
+            };
+            match child_rule {
+                "typename" => {
+                    let name = text_of(child).trim().to_owned();
+                    return self.render_named_reference(&name, prov, visited);
+                },
+                "groupname" => {
+                    let name = text_of(child).trim().to_owned();
+                    if let Some(plugs) = self.resolution.socket_plugs.get(&name)
+                        && !plugs.is_empty()
+                    {
+                        return self.render_plug_choice(plugs, prov, visited);
+                    }
+                    return self.render_named_reference(&name, prov, visited);
+                },
+                "value" => return (text_of(child).trim().to_owned(), None),
+                _ => {},
+            }
+        }
+        (text.trim().to_owned(), None)
+    }
+
+    /// Convenience: render a `type2` from a borrowed `&WrappedNode`.
+    fn render_type2_inline(
+        &mut self,
+        node: &WrappedNode,
+        prov: &mut Option<(String, String)>,
+        visited: &mut HashSet<String>,
+    ) -> (String, Option<(String, String)>) {
+        let WrappedNode::Syntax { children, text, .. } = node else {
+            return (text_of(node).trim().to_owned(), None);
+        };
+        self.render_type2(node, children, text, prov, visited)
+    }
+
+    /// Look up `name` in the resolution map and inline its body if
+    /// it's a structural type. Fold to a literal if it's a primitive
+    /// constant. Recursion is depth-limited by the local `visited`
+    /// parameter AND by the session-level `in_progress` set on the
+    /// render context.  Both checks are necessary because some
+    /// rendering paths (e.g. the brace-block pretty printer) reach
+    /// the inliner through a fresh `visited` set and would otherwise
+    /// allow recursive group references to stack-overflow.
+    fn render_named_reference(
+        &mut self,
+        name: &str,
+        prov: &mut Option<(String, String)>,
+        visited: &mut HashSet<String>,
+    ) -> (String, Option<(String, String)>) {
+        if let Some(plugs) = self.resolution.socket_plugs.get(name)
+            && !plugs.is_empty()
+        {
+            return self.render_plug_choice(plugs, prov, visited);
+        }
+
+        if let Some(plugs) = self.resolution.type_plugs.get(name)
+            && !plugs.is_empty()
+        {
+            return self.render_type_plug_choice(plugs, prov, visited);
+        }
+
+        if name.starts_with('$') {
+            return (name.to_owned(), None);
+        }
+
+        if !visited.insert(name.to_owned()) {
+            self.record_cycle(name);
+            return (name.to_owned(), None);
+        }
+        if self.in_progress.contains(name) {
+            self.record_cycle(name);
+            return (name.to_owned(), None);
+        }
+        self.in_progress.insert(name.to_owned());
+
+        if let Some(state) = self.resolution.resolve_constant(name)
+            && let Some(literal) = constant_to_cddl(state)
+        {
+            // BUG-005: in effective mode, keep well-known base type
+            // names readable (`bstr`, not its tag `#2`).  Constant
+            // folding still applies to user-defined constants.
+            if !(self.policy.effective_mode && is_effective_base_name(name)) {
+                let provenance = prov.is_none().then(|| (name.to_owned(), literal.clone()));
+                visited.remove(name);
+                self.in_progress.remove(name);
+                return (literal, provenance);
+            }
+        }
+
+        let mut def_node = self.resolution.get(name);
+        // BUG-005: in effective mode, when the bare name isn't
+        // found, scan the resolution map for qualified matches
+        // (e.g. `cose.Headers` for bare name `Headers`).  Imported
+        // library rules are stored under their aliased names in the
+        // consumer's tree, but the `.within` RHS references them
+        // by their library-local bare names because it IS the
+        // library's own source.
+        if def_node.is_none() && self.policy.effective_mode {
+            let suffix = format!(".{name}");
+            def_node = self
+                .resolution
+                .definitions
+                .iter()
+                .find(|(k, _)| k.ends_with(&suffix))
+                .map(|(_, v)| v);
+        }
+
+        if let Some(def_node) = def_node
+            && let Some(rendered) = self.inline_definition(def_node, prov, visited)
+        {
+            visited.remove(name);
+            self.in_progress.remove(name);
+            return (rendered, None);
+        }
+
+        visited.remove(name);
+        self.in_progress.remove(name);
+        (name.to_owned(), None)
+    }
+
+    /// Inline a definition by rendering its RHS with the LHS's name
+    /// already in the visited set. Returns `None` if the definition has
+    /// no inlinable RHS (e.g. it's a strong `:=` definition).
+    fn inline_definition(
+        &mut self,
+        def_node: &WrappedNode,
+        prov: &mut Option<(String, String)>,
+        visited: &mut HashSet<String>,
+    ) -> Option<String> {
+        let WrappedNode::RuleLine { children, .. } = def_node else {
+            return None;
+        };
+        let head = rule_head_from_children(children)?;
+        // BUG-005: effective mode inlines everything EXCEPT
+        // well-known postlude primitives which should stay readable
+        // (`bstr`, not `#2`).  Normal mode keeps strong definitions
+        // symbolic in Full renders and keeps postlude primitives
+        // readable.
+        if !self.policy.effective_mode
+            && head.assignment == AssignmentKind::Define
+            && is_strong_definition(def_node)
+            && self.policy.target == TargetSide::Full
+        {
+            return None;
+        }
+        // Postlude primitives stay symbolic even in effective mode
+        // so `bstr` stays `bstr` rather than folding to `#2`.
+        let in_postlude = def_node
+            .metadata()
+            .iter()
+            .any(|m| matches!(m, crate::MetaData::StandardPostlude));
+        if in_postlude
+            && (self.policy.target == TargetSide::Full || is_effective_base_name(&head.name))
+        {
+            return None;
+        }
+        let rhs = find_rhs(children)?;
+        // BUG-005: effective mode routes inlined bodies through the
+        // pretty-printer so nested maps, arrays, choice groups, and
+        // ctlop chains render across multiple indented lines.  The
+        // normal diff-side path returns `render_with_inlining_inner`
+        // which is always single-line; effective mode must use the
+        // same multiline pipeline as the `cbork render` subcommand.
+        if self.policy.effective_mode {
+            let text = text_of(rhs).trim().to_owned();
+            let mut out = Concrete::new();
+            render_pretty_rhs(self, rhs, 0, &text, &mut out);
+            let rendered = out.to_cddl();
+            let rendered = rendered.trim_end_matches('\n').to_owned();
+            if rendered.is_empty() {
+                return Some(self.render_with_inlining_inner(rhs, prov, visited).0);
+            }
+            return Some(rendered);
+        }
+        if self.policy.target != TargetSide::Full {
+            if text_of(rhs).trim().starts_with('(')
+                && let WrappedNode::Syntax { children: rc, .. } = rhs
+                && let Some(WrappedNode::Syntax { children: gc, .. }) =
+                    first_child_with_rule(rc, "group")
+            {
+                let rendered = self.render_group(gc, prov, visited).0;
+                return Some(format!("({rendered})"));
+            }
+            return Some(self.render_with_inlining_inner(rhs, prov, visited).0);
+        }
+        if text_of(rhs).contains(".size") {
+            return Some(self.render_with_inlining_inner(rhs, prov, visited).0);
+        }
+        // Route the inlined body through the pretty-printer so ctlop
+        // chains, parenthesized choices, and brace bodies inside the
+        // inlined definition appear on their own lines.
+        let text = text_of(rhs).trim().to_owned();
+        let mut out = Concrete::new();
+        render_pretty_rhs(self, rhs, 0, &text, &mut out);
+        let rendered = out.to_cddl();
+        // Trim trailing newline `to_cddl` always appends.
+        let rendered = rendered.trim_end_matches('\n').to_owned();
+        if rendered.is_empty() {
+            Some(self.render_with_inlining_inner(rhs, prov, visited).0)
+        } else {
+            Some(rendered)
+        }
+    }
+
+    /// Render a `grpent` (parenthesized group element) node, inlining
+    /// socket plugs and folding constants. Handles three shapes:
+    ///
+    /// * a single bare typename reference (e.g. `signature` inside `[signature, ...]`) ->
+    ///   resolve it via the cache or by inlining the definition;
+    /// * a `key => value` (or `key : value`) grpent -> recurse into each side so the key
+    ///   and value are independently resolved (this is what folds `ed25519` to `-19` in
+    ///   `{ ed25519 => bstr }`);
+    /// * a parenthesized expression (e.g. `(foo => bar)`) -> just recurse into the inner
+    ///   type.
+    fn render_grpent(
+        &mut self,
+        node: &WrappedNode,
+        children: &[WrappedNode],
+        prov: &mut Option<(String, String)>,
+        visited: &mut HashSet<String>,
+    ) -> (String, Option<(String, String)>) {
+        // Socket-plug check first: a grpent whose only meaningful
+        // child names a socket (`one-pq-signature //= ...`) is
+        // expanded to a `/`-joined choice of plug bodies.
+        if let Some(plug_name) = Self::find_socket_plug_name(children)
+            && !plug_name.is_empty()
+            && let Some(plugs) = self.resolution.socket_plugs.get(&plug_name)
+            && !plugs.is_empty()
+        {
+            return self.render_plug_choice(plugs, prov, visited);
+        }
+
+        // Detect `key <ctlop> value` structure. The ctlop separates
+        // two type-shaped operands; we recurse into each so constant
+        // folding and structural inlining fire on both sides.
+        //
+        // The grpent can carry the operator in two different shapes:
+        //
+        // * a `ctlop` child (e.g. inside a `{ ... }` body the ctlop is its own sibling) -- the
+        //   operator text is on the ctlop node;
+        // * a `memberkey` child whose text already contains the `=>` or `:` -- the operator is
+        //   part of the memberkey text and the next sibling is the value.
+        //
+        // We handle both.
+        let mut type_children: Vec<&WrappedNode> = Vec::new();
+        let mut ctlop_text: Option<String> = None;
+        let mut memberkey_node: Option<&WrappedNode> = None;
+        let mut occur_text: Option<String> = None;
+        for c in children {
+            if let Some(r) = syntax_rule(c) {
+                match r {
+                    "type" | "type1" | "type2" => type_children.push(c),
+                    "ctlop" => {
+                        ctlop_text = Some(text_of(c).trim().to_owned());
+                    },
+                    "memberkey" => {
+                        memberkey_node = Some(c);
+                    },
+                    "occur" => {
+                        occur_text = Some(text_of(c).trim().to_owned());
+                    },
+                    _ => {},
+                }
+            }
+        }
+        if ctlop_text.is_some() && type_children.len() == 2 {
+            let (left, p1) = match type_children.first() {
+                Some(n) => self.render_with_inlining_inner(n, prov, visited),
+                None => (String::new(), None),
+            };
+            let (right, _p2) = match type_children.get(1) {
+                Some(n) => self.render_with_inlining_inner(n, prov, visited),
+                None => (String::new(), None),
+            };
+            if prov.is_none() {
+                *prov = p1;
+            }
+            let sep = ctlop_text.unwrap_or_default();
+            return (format!("{left} {sep} {right}"), None);
+        }
+        if let Some(mk) = memberkey_node
+            && let Some((rendered_key, _)) = self.render_memberkey(mk, prov, visited)
+            && type_children.len() == 1
+        {
+            let (right, _p2) = match type_children.first() {
+                Some(n) => self.render_with_inlining_inner(n, prov, visited),
+                None => (String::new(), None),
+            };
+            let prefix = occur_text
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map_or(String::new(), |s| format!("{s} "));
+            return (format!("{prefix}{rendered_key} {right}"), None);
+        }
+
+        // Single bare typename reference: a grpent whose trimmed text
+        // is a bare identifier and whose only substantive child is
+        // a single type-shaped node. This is the
+        // `[signature, alg-sig-map-ed25519-ml-dsa-44]` case.
+        if let WrappedNode::Syntax {
+            text, children: gc, ..
+        } = node
+        {
+            let t = text.trim();
+            let is_bare = !t.is_empty() && t.chars().all(is_reference_name_char);
+            let non_comma = gc.iter().filter(|c| !is_comma_node(c)).count();
+            if is_bare
+                && non_comma == 1
+                && let Some(name) = bare_type_or_group_name(node)
+            {
+                return self.render_named_reference(&name, prov, visited);
+            }
+        }
+
+        (text_of(node).trim().to_owned(), None)
+    }
+
+    /// Render a `memberkey` (the `key =>` or `key :` half of a
+    /// grpent) so that the key side is also resolved through
+    /// constant folding. The memberkey text contains the trailing
+    /// operator (e.g. `ed25519 =>`); we strip the operator off
+    /// and recurse into the key shape.
+    fn render_memberkey(
+        &mut self,
+        node: &WrappedNode,
+        prov: &mut Option<(String, String)>,
+        visited: &mut HashSet<String>,
+    ) -> Option<(String, Option<(String, String)>)> {
+        let WrappedNode::Syntax { children, text, .. } = node else {
+            return None;
+        };
+        // The key is a type-shaped child. Render it and append the
+        // operator text from the trailing source text.
+        let key_node = children.iter().find(|c| {
+            matches!(
+                syntax_rule(c),
+                Some("type" | "type1" | "type2" | "value" | "bareword")
+            )
+        })?;
+        let (rendered_key, p) = self.render_with_inlining_inner(key_node, prov, visited);
+        if prov.is_none() {
+            *prov = p;
+        }
+        let rendered_key = simplify_singleton_enum_key(&rendered_key);
+        // Recover the operator (`=>` or `:` or `~`) from the trailing
+        // source text. The memberkey text is e.g. `ed25519 =>`.
+        let trailing = memberkey_operator(text);
+        Some((format!("{rendered_key}{trailing}"), None))
+    }
+
+    /// Look for a child that names a socket plug (bare typename,
+    /// groupname, or single-identifier type/type2) and return that
+    /// name. Returns `None` if no plausible name is found, an empty
+    /// `Some` if a candidate name was found but did not match a plug.
+    fn find_socket_plug_name(children: &[WrappedNode]) -> Option<String> {
+        let mut candidate: Option<String> = None;
+        for child in children {
+            if let WrappedNode::Syntax { rule, text, .. } = child {
+                let name_opt = match rule.as_str() {
+                    "typename" | "groupname" => Some(text.trim().to_owned()),
+                    "type" | "type2" => {
+                        let t = text.trim();
+                        if !t.is_empty() && t.chars().all(is_reference_name_char) {
+                            Some(t.to_owned())
+                        } else {
+                            None
+                        }
+                    },
+                    _ => None,
+                };
+                if let Some(name) = name_opt {
+                    candidate = Some(name);
+                    break;
+                }
+            }
+        }
+        candidate
+    }
+
+    /// Render a sequence of plug `RuleLines` as a `/`-joined choice
+    /// wrapped in parens (matching the CDDL grammar's `grpent` shape).
+    fn render_plug_choice(
+        &mut self,
+        plugs: &[WrappedNode],
+        prov: &mut Option<(String, String)>,
+        visited: &mut HashSet<String>,
+    ) -> (String, Option<(String, String)>) {
+        let parts: Vec<String> = plugs
+            .iter()
+            .filter_map(|plug| {
+                let WrappedNode::RuleLine { children, .. } = plug else {
+                    return None;
+                };
+                let rhs = find_rhs(children)?;
+                if let Some(inner) = find_parenthesized_grpent(rhs)
+                    && let WrappedNode::Syntax { children: gc, .. } = inner
+                {
+                    let rendered = self.render_grpent(inner, gc, prov, visited).0;
+                    return Some(format!("({rendered})"));
+                }
+                Some(self.render_with_inlining_inner(rhs, prov, visited).0)
+            })
+            .collect();
+        match parts.len() {
+            0 => (String::new(), None),
+            1 => (parts.into_iter().next().unwrap_or_default(), None),
+            _ => (format!("({})", parts.join(" / ")), None),
+        }
+    }
+
+    /// Render a sequence of type-socket `/=` `RuleLine`s as a
+    /// `/`-joined choice. Unlike group plugs, these are type
+    /// alternatives, so the rendered result is not forced into a
+    /// parenthesized group-entry shape unless the choice needs it.
+    fn render_type_plug_choice(
+        &mut self,
+        plugs: &[WrappedNode],
+        prov: &mut Option<(String, String)>,
+        visited: &mut HashSet<String>,
+    ) -> (String, Option<(String, String)>) {
+        let parts: Vec<String> = plugs
+            .iter()
+            .filter_map(|plug| {
+                let WrappedNode::RuleLine { children, .. } = plug else {
+                    return None;
+                };
+                let rhs = find_rhs(children)?;
+                let rendered = self.render_with_inlining_inner(rhs, prov, visited).0;
+                Some(simplify_singleton_enum_key(&rendered))
+            })
+            .collect();
+        match parts.len() {
+            0 => (String::new(), None),
+            1 => (parts.into_iter().next().unwrap_or_default(), None),
+            _ => (parts.join(" / "), None),
+        }
+    }
+
+    /// Render a `group` or `grpchoice` body, walking its `grpent` children
+    /// and inlining any socket-plug references. Returns a `, `-joined
+    /// entry list with no surrounding brackets (the caller adds them).
+    fn render_group(
+        &mut self,
+        children: &[WrappedNode],
+        prov: &mut Option<(String, String)>,
+        visited: &mut HashSet<String>,
+    ) -> (String, Option<(String, String)>) {
+        let mut entries: Vec<String> = Vec::new();
+        for child in children {
+            match child {
+                WrappedNode::Syntax {
+                    rule, children: gc, ..
+                } if rule == "grpent" => {
+                    let (rendered, p) = self.render_grpent(child, gc, prov, visited);
+                    if prov.is_none() {
+                        *prov = p;
+                    }
+                    if !rendered.is_empty() {
+                        entries.push(rendered);
+                    }
+                },
+                WrappedNode::Syntax {
+                    rule, children: gc, ..
+                } if rule == "group" || rule == "grpchoice" => {
+                    let (inner_text, p) = self.render_group(gc, prov, visited);
+                    if prov.is_none() {
+                        *prov = p;
+                    }
+                    if !inner_text.is_empty() {
+                        entries.push(inner_text);
+                    }
+                },
+                _ => {},
+            }
+        }
+        (entries.join(", "), None)
+    }
+}
+
+/// Render an `EntryState` as its CDDL literal form.
+fn constant_to_cddl(state: &EntryState) -> Option<String> {
+    match state {
+        EntryState::Integer(n) => Some(n.to_string()),
+        EntryState::Float(f) => Some(f.to_string()),
+        EntryState::Text(t) => Some(t.to_string()),
+        EntryState::Bytes(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tree-shape helpers
+// ---------------------------------------------------------------------------
+
+/// Find the RHS type-like node in a `RuleLine`'s children.
+fn find_rhs(children: &[WrappedNode]) -> Option<&WrappedNode> {
+    let mut past_lhs = false;
+    for child in children {
+        let Some(rule) = syntax_rule(child) else {
+            continue;
+        };
+        match rule {
+            "expr" => return find_rhs_in_expr(child),
+            "assignt" | "assigng" => past_lhs = true,
+            "type" | "type1" | "type2" | "group" | "grpent" if past_lhs => {
+                return Some(child);
+            },
+            _ => {},
+        }
+    }
+    None
+}
+
+/// Find the RHS type-like node inside an `expr` wrapper.
+fn find_rhs_in_expr(node: &WrappedNode) -> Option<&WrappedNode> {
+    let WrappedNode::Syntax { children, .. } = node else {
+        return None;
+    };
+    let mut past_lhs = false;
+    for child in children {
+        let Some(rule) = syntax_rule(child) else {
+            continue;
+        };
+        match rule {
+            "assignt" | "assigng" => past_lhs = true,
+            "type" | "type1" | "type2" | "group" | "grpent" if past_lhs => {
+                return Some(child);
+            },
+            _ => {},
+        }
+    }
+    None
+}
+
+/// Find the `genericparm` text (e.g. `<T, U>`) on the LHS, recursing
+/// into the `expr` wrapper that the parser emits inside a rule line.
+fn find_genericparm(children: &[WrappedNode]) -> Option<String> {
+    for child in children {
+        if let WrappedNode::Syntax { rule, text, .. } = child
+            && rule == "genericparm"
+        {
+            return Some(text.trim().to_owned());
+        }
+        if let WrappedNode::Syntax {
+            rule,
+            children: sub,
+            ..
+        } = child
+            && rule == "expr"
+        {
+            for c in sub {
+                if let WrappedNode::Syntax { rule: r, text, .. } = c
+                    && r == "genericparm"
+                {
+                    return Some(text.trim().to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Return the `rule` field of a `WrappedNode::Syntax`, or `None`.
+pub(crate) fn syntax_rule(node: &WrappedNode) -> Option<&str> {
+    if let WrappedNode::Syntax { rule, .. } = node {
+        Some(rule.as_str())
+    } else {
+        None
+    }
+}
+
+/// Return the source text of a `WrappedNode`, regardless of variant.
+pub(crate) fn text_of(node: &WrappedNode) -> &str {
+    match node {
+        WrappedNode::Syntax { text, .. }
+        | WrappedNode::RuleLine { text, .. }
+        | WrappedNode::Comment { text, .. } => text,
+        _ => "",
+    }
+}
+
+/// True if a `WrappedNode` is a CDDL optional-comma/comment node
+/// (`optcom`) that is irrelevant for arity checks.
+fn is_comma_node(node: &WrappedNode) -> bool {
+    if let WrappedNode::Syntax { rule, text, .. } = node {
+        if rule == "optcom" {
+            return true;
+        }
+        let t = text.trim();
+        return t == "," || t.is_empty();
+    }
+    false
+}
+
+/// If a node is (or contains as a child) a bare identifier that names
+/// a type or group, return that identifier. Used by grpent/group
+/// fallback paths to drive constant folding and structural inlining
+/// when the body of a group element is just a typename reference.
+fn bare_type_or_group_name(node: &WrappedNode) -> Option<String> {
+    match node {
+        WrappedNode::Syntax {
+            rule,
+            text,
+            children,
+            ..
+        } => {
+            match rule.as_str() {
+                "typename" | "groupname" => Some(text.trim().to_owned()),
+                "type" | "type1" | "grpent" => {
+                    // Bug 001: generic substitution replaces children
+                    // but leaves the parent text stale.  These
+                    // non-leaf rules must always recurse into
+                    // children to find the current typename.
+                    recurse_bare_name(children)
+                },
+                "type2" | "id" | "name" => {
+                    let t = text.trim();
+                    if !t.is_empty()
+                        && t.chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+                    {
+                        Some(t.to_owned())
+                    } else {
+                        recurse_bare_name(children)
+                    }
+                },
+                _ => recurse_bare_name(children),
+            }
+        },
+        _ => None,
+    }
+}
+
+/// Recursive helper for [`bare_type_or_group_name`].
+fn recurse_bare_name(children: &[WrappedNode]) -> Option<String> {
+    for c in children {
+        if let Some(name) = bare_type_or_group_name(c) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// True if a `RuleLine`'s RHS resolves to a primitive constant in the
+/// cache. Used by library-mode to decide whether to keep the rule
+/// verbatim.
+fn is_constant_rule(
+    node: &WrappedNode,
+    resolution: &ResolutionMap,
+) -> bool {
+    let WrappedNode::RuleLine { children, .. } = node else {
+        return false;
+    };
+    let Some(head) = rule_head_from_children(children) else {
+        return false;
+    };
+    if head.assignment != AssignmentKind::Define {
+        return false;
+    }
+    if matches!(head.kind, SymbolKind::TypeSocket | SymbolKind::GroupSocket) {
+        return false;
+    }
+    resolution.resolve_constant(&head.name).is_some()
+}
+
+/// True if a node is a strong `name := ...` definition.
+fn is_strong_definition(node: &WrappedNode) -> bool {
+    let WrappedNode::RuleLine { children, .. } = node else {
+        return false;
+    };
+    let Some(head) = rule_head_from_children(children) else {
+        return false;
+    };
+    matches!(head.assignment, AssignmentKind::Define)
+        && !head.name.is_empty()
+        && has_colon_eq(text_of(node))
+}
+
+/// True if the rule text contains the `:=` operator.
+fn has_colon_eq(text: &str) -> bool {
+    text.contains(":=")
+}
+
+/// Find the first child whose `WrappedNode::Syntax::rule` matches.
+fn first_child_with_rule<'a>(
+    children: &'a [WrappedNode],
+    rule: &str,
+) -> Option<&'a WrappedNode> {
+    children.iter().find(|c| syntax_rule(c) == Some(rule))
+}
+
+/// Return the first type/group name directly contained in a node's children.
+fn first_type_or_group_name(children: &[WrappedNode]) -> Option<String> {
+    children.iter().find_map(|child| {
+        let WrappedNode::Syntax { rule, text, .. } = child else {
+            return None;
+        };
+        matches!(rule.as_str(), "typename" | "groupname").then(|| text.trim().to_owned())
+    })
+}
+
+/// Characters allowed in references and socket names.
+fn is_reference_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '$')
+}
+
+/// Names that should remain symbolic in an effective diagnostic view.
+fn is_effective_base_name(name: &str) -> bool {
+    matches!(
+        name,
+        "any"
+            | "uint"
+            | "nint"
+            | "bstr"
+            | "tstr"
+            | "text"
+            | "int"
+            | "float"
+            | "bool"
+            | "nil"
+            | "null"
+            | "integer"
+    )
+}
+
+/// Recover the member-key operator from the source text without
+/// carrying symbolic enum/key syntax forward after the rendered key
+/// has been simplified.
+fn memberkey_operator(text: &str) -> &'static str {
+    let trimmed = text.trim();
+    if trimmed.contains("=>") {
+        " =>"
+    } else if trimmed.contains(':') {
+        ":"
+    } else if trimmed.contains('~') {
+        " ~"
+    } else {
+        ""
+    }
+}
+
+/// Collapse a singleton enum literal key like `&(ClockClass: -2)`
+/// to its only concrete value, `-2`.
+fn simplify_singleton_enum_key(rendered_key: &str) -> String {
+    let trimmed = rendered_key.trim();
+    let Some(inner) = trimmed.strip_prefix("&(").and_then(|s| s.strip_suffix(')')) else {
+        return rendered_key.to_owned();
+    };
+    let Some((_, value)) = inner.split_once(':') else {
+        return rendered_key.to_owned();
+    };
+    if value.contains('/') || value.contains(',') {
+        rendered_key.to_owned()
+    } else {
+        value.trim().to_owned()
+    }
+}
+
+/// Detect a `[ ... ]` or `{ ... }` group bracket on a type2's children.
+fn detect_group_brackets(children: &[WrappedNode]) -> Option<String> {
+    for child in children {
+        if let WrappedNode::Syntax { rule, text, .. } = child
+            && (rule == "group" || rule == "grpchoice" || rule == "grpent")
+        {
+            let trimmed = text.trim();
+            if trimmed.starts_with('[') || trimmed.starts_with('{') {
+                return Some(trimmed.to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Detect a leading `#N.tag` tag, recovering the family digit from the
+/// source text because the grammar consumes it without surfacing it as
+/// a child.
+fn leading_tag(
+    children: &[WrappedNode],
+    source_text: &str,
+) -> Option<String> {
+    let mut number: Option<String> = None;
+    for child in children {
+        if let WrappedNode::Syntax { rule, text, .. } = child
+            && rule == "head_number"
+        {
+            number = Some(text.trim().to_owned());
+        }
+    }
+    let number = number?;
+    let trimmed = source_text.trim_start();
+    if !trimmed.starts_with('#') {
+        return None;
+    }
+    let after_hash = trimmed.get(1..)?;
+    let family = after_hash.chars().next()?;
+    if !family.is_ascii_digit() {
+        return None;
+    }
+    Some(format!("#{family}.{number}"))
+}
+
+// ---------------------------------------------------------------------------
+// Library detection
+// ---------------------------------------------------------------------------
+
+/// Inspect a slice of top-level nodes and return `true` if the file
+/// declares itself a library via the `;@ CBORK: Library` directive
+/// or a top-level `library = ...` rule.
+#[must_use]
+pub fn file_is_library(nodes: &[WrappedNode]) -> bool {
+    for node in nodes {
+        if let WrappedNode::Comment { text, .. } = node
+            && (text.contains("CBORK: Library") || text.contains("@ library"))
+        {
+            return true;
+        }
+        if let WrappedNode::RuleLine { text, .. } = node {
+            let head_text = text.split(['=', ' ']).next().unwrap_or("").trim();
+            if head_text == "library" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use cbork_cddl_parser::{parse_cddl, parse_postlude};
+
+    use super::*;
+    use crate::{
+        compiled::CompiledCDDL,
+        preprocessor::{inject_directives, process_ast},
+    };
+
+    fn parse_to_nodes(src: &str) -> Vec<WrappedNode> {
+        let pairs = parse_cddl(src).expect("parse");
+        let pairs = process_ast(pairs).expect("preprocess");
+        inject_directives(&PathBuf::from("<test>"), &pairs, src).expect("inject")
+    }
+
+    #[allow(clippy::expect_used, reason = "Allowed in tests")]
+    fn compile(src: &str) -> CompiledCDDL {
+        let dir = std::env::temp_dir().join("cbork_concrete_test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let path = dir.join(format!("test_{pid}_{nanos}.cddl"));
+        std::fs::write(&path, src).expect("write cddl");
+        CompiledCDDL::compile(&path, None).expect("compile")
+    }
+
+    fn render_user(src: &str) -> String {
+        let compiled = compile(src);
+        let res = build_resolution(&compiled.complete_nodes);
+        render_to_string(
+            &compiled.complete_nodes,
+            &res,
+            &ConcretePolicy::for_render(),
+        )
+    }
+
+    fn render_user_library(src: &str) -> String {
+        let compiled = compile(src);
+        let res = build_resolution(&compiled.complete_nodes);
+        render_to_string(
+            &compiled.complete_nodes,
+            &res,
+            &ConcretePolicy::for_render().with_library(true),
+        )
+    }
+
+    #[test]
+    fn folds_integer_constant_in_map() {
+        let cddl = render_user("x = {\n  a => 1\n}\nA = 1\n");
+        let normalized = cddl.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized.contains("a => 1"), "missing `a => 1`:\n{cddl}");
+    }
+
+    #[test]
+    fn inlines_socket_plug_into_map() {
+        let cddl = render_user(
+            "plug //= (a => int)\n\
+             plug //= (b => int)\n\
+             root = { plug }\n",
+        );
+        let normalized = cddl.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized.contains("(a => int) / (b => int)"),
+            "expected inline plug choice:\n{cddl}"
+        );
+    }
+
+    #[test]
+    fn does_not_render_top_level_socket_augmentations() {
+        let cddl = render_user(
+            "plug //= (a => int)\n\
+             root = { plug }\n",
+        );
+        let normalized = cddl.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized.contains("a => int"),
+            "missing plug entry:\n{cddl}"
+        );
+    }
+
+    #[test]
+    fn library_mode_keeps_named_constants() {
+        let cddl = render_user_library(
+            "A = 1\n\
+             root = { a => A }\n",
+        );
+        assert!(cddl.contains("A = 1"), "A should be preserved:\n{cddl}");
+    }
+
+    #[test]
+    fn inlines_structural_references() {
+        let cddl = render_user(
+            "inner = { a => int }\n\
+             outer = inner / bstr\n",
+        );
+        let normalized = cddl.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            // The structural type is rendered as a multi-line block,
+            // so after whitespace normalization the contents collapse to
+            // `{ a => int, }` (the entry comma is preserved).
+            normalized.contains("{ a => int") && normalized.contains("=> int"),
+            "expected inline:\n{cddl}"
+        );
+    }
+
+    #[test]
+    fn pqsig_style_socket_plug_expands_to_choice() {
+        let cddl = render_user(
+            "one-pq-signature //= (ml-dsa-44 => bstr)\n\
+             one-pq-signature //= (ml-dsa-65 => bstr)\n\
+             one-pq-signature //= (ml-dsa-87 => bstr)\n\
+             alg-sig-map = {\n\
+               ed25519 => bstr,\n\
+               one-pq-signature\n\
+             } .within { 2*2 int => bstr }\n\
+             bstr = bytes .size 64\n",
+        );
+        assert!(
+            cddl.contains("ml-dsa-44") && cddl.contains("ml-dsa-65") && cddl.contains("ml-dsa-87"),
+            "expected all three plug entries inlined:\n{cddl}"
+        );
+    }
+
+    #[test]
+    fn detects_library_via_directive() {
+        let nodes = parse_to_nodes(";@ CBORK: Library\nlibrary = foo\n");
+        assert!(file_is_library(&nodes));
+    }
+
+    #[test]
+    fn postlude_parsing_smoke() {
+        drop(parse_postlude().expect("postlude parses"));
+    }
+
+    #[test]
+    fn resolves_unresolved_name_unchanged() {
+        let compiled = compile("x = undefined_name\n");
+        let res = build_resolution(&compiled.complete_nodes);
+        let cddl = render_to_string(
+            &compiled.complete_nodes,
+            &res,
+            &ConcretePolicy::for_render(),
+        );
+        assert!(cddl.contains("undefined_name"), "missing ref:\n{cddl}");
+    }
+}

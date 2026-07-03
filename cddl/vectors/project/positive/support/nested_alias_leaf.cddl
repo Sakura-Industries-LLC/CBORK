@@ -1,0 +1,6 @@
+; source: project import/include regression fixture
+; behavior: leaf module with a self-referencing rule; included with an alias, references
+; to own rules must be alias-prefixed
+
+leaf_value = int
+leaf_rule = [ leaf_value ]

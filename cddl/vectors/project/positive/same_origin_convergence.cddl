@@ -1,0 +1,15 @@
+; Step 5.9 regression fixture: same-origin import convergence.
+;
+; The consumer imports the same library helper through two paths that
+; resolve to the same canonical file but under different aliases.
+; Both paths reach the same rule at the same source location; the
+; second arrival must NOT emit a W001 redundant-definition warning
+; because it is the same effective definition reached through a
+; different import route.  The local `consumer_a` references the
+; helper via the `primary` alias.
+
+consumer_a = primary.helper
+
+;# import primary.helper from "./support/same_origin_convergence_lib.cddl" as primary
+
+;# import secondary.helper from "./support/same_origin_convergence_lib.cddl" as secondary

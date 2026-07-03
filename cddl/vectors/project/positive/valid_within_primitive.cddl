@@ -1,0 +1,5 @@
+; source: project .within validation fixture
+; behavior: uint is a subtype of int
+
+root = my_uint .within int
+my_uint = uint

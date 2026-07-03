@@ -1,0 +1,6 @@
+; Step 5.11 negative fixture: `.x-enc` and `.x-hash` are distinct
+; transform families and are never mutually within each other.
+
+not-ok = (bstr .x-enc payload) .within (bstr .x-hash payload)
+
+payload = { 1 => int }

@@ -1,0 +1,9 @@
+; Step 5.12 include-style export contract: a consumer that
+; includes a library (rather than importing it under an alias)
+; and references only the library's exported rule must NOT
+; warn.  Include should be subject to the same export contract
+; as `import`.
+
+;# include "./support/include_export_lib.cddl" as include_export_lib
+
+ok = include_export_lib.public-rule

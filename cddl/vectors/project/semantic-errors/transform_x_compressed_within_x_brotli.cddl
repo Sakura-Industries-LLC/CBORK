@@ -1,0 +1,6 @@
+; Step 5.11 negative fixture: `.x-compressed` is broader than any
+; named compression algorithm and must NOT subtype one.
+
+not-ok = (bstr .x-compressed payload) .within (bstr .x-brotli payload)
+
+payload = { 1 => int }

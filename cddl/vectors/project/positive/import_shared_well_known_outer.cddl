@@ -1,0 +1,15 @@
+; source: project import/include regression fixture
+; behavior: the outer file imports a library that already imports
+; `rfc9052 as cose`, and then imports `rfc9052 as cose` itself.  The
+; well-known catalog entry is reached in two different scopes (once
+; transitively under `defs`, once directly), and both must resolve
+; without being treated as a cycle.  Neither of the `library`-style
+; rules is referenced from a non-prunable root, so neither the
+; transitive nor the direct import is allowed to trigger an
+; E014 conflict.
+
+;# import defs.defs_cose_key_ref from "./support/import_shared_well_known_lib.cddl" as defs
+
+;# import rfc9052 as cose
+
+outer_cose_key_ref = cose.COSE_Key

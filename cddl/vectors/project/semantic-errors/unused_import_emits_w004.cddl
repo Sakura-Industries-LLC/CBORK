@@ -1,0 +1,7 @@
+; Step 5.12 unused-import warning: importing a name from a
+; library and never referencing it must emit a W004 (whole
+; directive unused) and a W005 (selected name unused).
+
+;# import unused_lib.helper from "./support/unused_lib.cddl"
+
+ok = uint

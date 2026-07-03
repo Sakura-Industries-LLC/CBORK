@@ -1,0 +1,6 @@
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+arithmetic-side-effects-allowed = ["num_bigint::BigInt"]
+msrv = "1.96"

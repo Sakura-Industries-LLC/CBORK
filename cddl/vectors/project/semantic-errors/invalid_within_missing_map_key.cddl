@@ -1,0 +1,7 @@
+; source: project .within validation fixture
+; behavior: required LHS map entry (2 => tstr) is rejected by the RHS after
+;           the RFC9581 map-entry fix; the RHS only declares 1 => int.
+
+bad = lhs .within rhs
+lhs = { 1 => int, 2 => tstr }
+rhs = { 1 => int }

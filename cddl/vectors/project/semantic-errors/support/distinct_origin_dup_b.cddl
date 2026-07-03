@@ -1,0 +1,3 @@
+; Support file B for distinct_origin_duplicate.cddl.
+
+same_origin_distinct_dup = 1
