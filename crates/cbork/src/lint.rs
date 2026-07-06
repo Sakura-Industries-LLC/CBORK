@@ -2190,6 +2190,82 @@ rule_b = 2
     }
 
     #[test]
+    fn cli_doc_lint_fix_preserves_blank_doc_lines_within_block() {
+        // Feature 004 regression guard: blank `;!` doc lines inside a
+        // continuous doc block must survive `cbork lint --doc --fix`.
+        // Previously the reverse transform stripped them.
+        let dir = std::env::temp_dir().join("cbork_doc_fix_blank_doc_lines");
+        let _unused = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(
+            dir.join(".rumdl.toml"),
+            "[global]\ndisable = [\"MD001\", \"MD063\", \"MD013\", \"MD041\"]\n",
+        )
+        .expect("write rumdl config");
+        let fixture = dir.join("blank_doc.cddl");
+        std::fs::write(
+            &fixture,
+            "\
+;! # Name Registration Payload v1
+;!
+;! ## Overview
+;!
+;! This file defines the v1 name-registration payload that is carried inside a blockchain transaction.
+;! The blockchain transaction wrapper itself is out of scope here.
+
+rule = 1
+",
+        )
+        .expect("write fixture");
+
+        let output = std::process::Command::new(env!("CARGO"))
+            .arg("run")
+            .arg("--quiet")
+            .arg("--bin")
+            .arg("cbork")
+            .arg("lint")
+            .arg("--doc")
+            .arg("--fix")
+            .arg(&fixture)
+            .arg("--no-banner")
+            .output()
+            .expect("run cbork lint --doc --fix");
+        let combined = String::from_utf8_lossy(&output.stdout).into_owned()
+            + &String::from_utf8_lossy(&output.stderr);
+        // Must read the modified file BEFORE removing the temp dir.
+        let modified = std::fs::read_to_string(&fixture).expect("read modified fixture");
+        let _unused = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            combined.contains("W035"),
+            "--doc --fix must report W035 (wrote fixed CDDL to disk), got:\n{combined}"
+        );
+        assert!(
+            !combined.contains("E035"),
+            "--doc --fix must not reject the fix with E035, got:\n{combined}"
+        );
+        // The blank `;!` lines between the headings and the body must
+        // survive.
+        assert!(
+            modified.contains(
+                ";! # Name Registration Payload v1\n;!\n;! ## Overview\n;!\n;! This file defines"
+            ),
+            "blank `;!` lines between heading and body must survive --fix, got:\n{modified}"
+        );
+        // The CDDL rules themselves must not have changed.
+        assert!(
+            modified.contains("rule = 1"),
+            "rule = 1 must be preserved:\n{modified}"
+        );
+        // Triple blank lines must not appear: collapse_blank_doc_lines
+        // collapses runs of `;!` to a single `;!`.
+        assert!(
+            !modified.contains(";!\n;!\n;!\n"),
+            "must not contain three or more consecutive blank doc lines:\n{modified}"
+        );
+    }
+
+    #[test]
     fn cli_doc_lint_fix_does_not_alter_non_doc_cddl_source() {
         let dir = std::env::temp_dir().join("cbork_doc_fix_non_doc");
         let _unused = std::fs::remove_dir_all(&dir);

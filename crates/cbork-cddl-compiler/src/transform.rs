@@ -315,8 +315,13 @@ impl std::error::Error for ReverseTransformError {}
 /// * Non-doc CDDL spans are restored from the original source byte-for-byte using the
 ///   splice-marker line table.
 /// * Generated blank-line wrappers around splice markers are removed.
-/// * Multiple consecutive blank lines in the final output are collapsed to one blank
-///   line.
+/// * Blank lines that exist between doc lines in the fixed synthetic are preserved as
+///   canonical `;!` doc lines (so a single blank between heading and body survives `--doc
+///   --fix`).
+/// * Consecutive runs of blank `;!` doc lines collapse to a single blank `;!`, matching
+///   what MD012 expects.
+/// * Multiple consecutive truly blank lines in the final output are collapsed to one
+///   blank line.
 ///
 /// The function never re-reads the on-disk file — the original CDDL
 /// comes from `original_source` (in-memory capture).
@@ -339,61 +344,67 @@ pub fn reverse_transform(
         source_lines.pop();
     }
 
-    // Filter the fixed synthetic to non-blank lines.  Rumdl can
-    // add or remove blank lines in Markdown, but its fixes never
-    // change the splice-marker spans or the number of non-blank
-    // doc-content lines (verified above).  By filtering both
-    // sides to their non-blank content we can align them
-    // one-to-one.
-    let fixed_non_blanks: Vec<&str> = fixed_synthetic
-        .split('\n')
-        .filter(|l| !l.trim().is_empty())
-        .collect::<Vec<_>>();
-    let original_entries: Vec<&SyntheticLine> = original_synthetic
-        .lines
-        .iter()
-        .filter(|l| {
-            !matches!(l.kind, SyntheticLineKind::GeneratedBlank) && !l.text.trim().is_empty()
-        })
-        .collect();
-
-    if fixed_non_blanks.len() != original_entries.len() {
-        return Err(ReverseTransformError::SpliceMarkerIntegrity {
-            detail: format!(
-                "expected {} non-blank entries in the fixed synthetic, found {}",
-                original_entries.len(),
-                fixed_non_blanks.len()
-            ),
-        });
-    }
-
+    // Walk the fixed synthetic line-by-line instead of relying on
+    // non-blank alignment. Generated-blank wrappers are detected
+    // structurally: a blank line is a wrapper iff it sits immediately
+    // above or below a splice marker in the fixed stream. All other
+    // blank lines are real doc-content blanks and are preserved as
+    // canonical `;!` lines.
     let mut output = String::new();
-    for (fixed_line, original_line) in fixed_non_blanks.iter().zip(original_entries.iter()) {
-        match &original_line.kind {
-            SyntheticLineKind::DocLine { .. } => {
-                output.push_str(";! ");
-                output.push_str(fixed_line);
-                output.push('\n');
-            },
-            SyntheticLineKind::SpliceMarker {
-                span_start,
-                span_end,
-            } => {
-                for i in *span_start..=*span_end {
-                    if let Some(line) = source_lines.get(i.saturating_sub(1)) {
-                        output.push_str(line);
-                        output.push('\n');
-                    }
+    let body_lines: Vec<&str> = fixed_synthetic.lines().collect();
+    let mut i = 0usize;
+    while let Some(line) = body_lines.get(i).copied() {
+        let trimmed = line.trim();
+        if let Some((span_start, span_end)) = parse_splice_marker_line(trimmed) {
+            for src_idx in span_start..=span_end {
+                if let Some(src_line) = source_lines.get(src_idx.saturating_sub(1)) {
+                    output.push_str(src_line);
+                    output.push('\n');
                 }
-            },
-            SyntheticLineKind::GeneratedBlank => {
-                // Already filtered above; reachable only if the enum
-                // changes and this arm is added for exhaustiveness.
-            },
+            }
+            // Skip the wrapper-blank below the marker if present so
+            // we never emit a `;!` for a synthetic GeneratedBlank.
+            if body_lines
+                .get(i.saturating_add(1))
+                .is_some_and(|next| next.trim().is_empty())
+            {
+                i = i.saturating_add(1);
+            }
+        } else if trimmed.is_empty()
+            && body_lines
+                .get(i.saturating_add(1))
+                .and_then(|next| parse_splice_marker_line(next.trim()))
+                .is_none()
+        {
+            // A real blank doc line is reconstructed as a canonical
+            // `;!` (no trailing space). The wrapper-above case is
+            // handled by skipping when the next line is a splice
+            // marker.
+            output.push_str(";!\n");
+        } else if !trimmed.is_empty() {
+            output.push_str(";! ");
+            output.push_str(line);
+            output.push('\n');
         }
+        i = i.saturating_add(1);
     }
 
-    Ok(trim_trailing_whitespace(&collapse_blank_lines(&output)))
+    let collapsed = collapse_blank_doc_lines(&output);
+    let collapsed = collapse_blank_lines(&collapsed);
+    Ok(trim_trailing_whitespace(&collapsed))
+}
+
+/// Parse a single line that has already been trimmed. Returns
+/// `Some((start, end))` when the line is a `<!-- CBORK CDDL FROM X-Y -->`
+/// splice marker with a valid span; `None` otherwise.
+fn parse_splice_marker_line(trimmed: &str) -> Option<(usize, usize)> {
+    let body = trimmed
+        .strip_prefix("<!-- CBORK CDDL FROM ")?
+        .strip_suffix(" -->")?;
+    let (s, e) = body.split_once('-')?;
+    let start = s.parse::<usize>().ok()?;
+    let end = e.parse::<usize>().ok()?;
+    Some((start, end))
 }
 
 /// Parse the `<!-- CBORK CDDL FROM start-end -->` markers from
@@ -480,6 +491,48 @@ pub fn collapse_blank_lines(text: &str) -> String {
             output.push_str(line);
             output.push('\n');
             prev_blank = false;
+        }
+    }
+    output
+}
+
+/// Collapse consecutive runs of blank `;!` documentation lines into a
+/// single blank `;!`.
+///
+/// The reverse transform emits canonical `;!` blank lines for every
+/// blank synthetic line that is not a generated splice-marker wrapper.
+/// Rumdl may legitimately add extra blanks (for example MD022 around
+/// headings) which then show up as runs of `;!` blank lines in the
+/// reconstructed text. This pass collapses those runs back to one
+/// blank `;!` so the output does not contain three or more consecutive
+/// blank doc lines.
+///
+/// The pass is doc-aware: it only collapses runs of literal `;!`
+/// lines. Truly blank CDDL lines (already inside a non-doc span from
+/// a splice-marker restoration) and lines crossing a non-doc source
+/// line are left alone.
+#[must_use]
+pub fn collapse_blank_doc_lines(text: &str) -> String {
+    let mut output = String::new();
+    let body_lines: Vec<&str> = text.lines().collect();
+    let mut i = 0usize;
+    while let Some(line) = body_lines.get(i).copied() {
+        if line == ";!" {
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str(";!\n");
+            i = i.saturating_add(1);
+            while body_lines.get(i) == Some(&";!") {
+                i = i.saturating_add(1);
+            }
+        } else {
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str(line);
+            output.push('\n');
+            i = i.saturating_add(1);
         }
     }
     output
@@ -1069,5 +1122,160 @@ rule = 1
         assert!(result.contains(";! # Title"));
         assert!(result.contains(";! Description"));
         assert!(result.contains("rule = 1"));
+    }
+
+    // Feature 004: a blank `;!` doc line inside a continuous doc block
+    // is part of the Markdown structure. The old non-blank alignment
+    // treated it as noise and stripped it; the new reverse transform
+    // walks the fixed stream and preserves it as canonical `;!`.
+
+    #[test]
+    fn reverse_transform_preserves_single_blank_doc_lines() {
+        let source = "\
+;! # Name Registration Payload v1
+;!
+;! ## Overview
+;!
+;! This file defines the v1 name-registration payload that is carried inside a blockchain transaction.
+;! The blockchain transaction wrapper itself is out of scope here.
+";
+        let original = transform_to_markdown(source);
+        let result =
+            reverse_transform(&original.text, source, &original).expect("reverse must succeed");
+        assert_eq!(
+            result, source,
+            "single blank `;!` lines must survive a no-op reverse transform"
+        );
+    }
+
+    #[test]
+    fn reverse_transform_collapses_repeated_blank_doc_lines() {
+        let source = "\
+;! # Name Registration Payload v1
+;!
+;!
+;!
+;! ## Overview
+
+rule = 1
+";
+        let original = transform_to_markdown(source);
+        let result =
+            reverse_transform(&original.text, source, &original).expect("reverse must succeed");
+        // Three consecutive blank `;!` lines must collapse to one.
+        assert!(
+            !result.contains(";!\n;!\n"),
+            "consecutive blank `;!` lines must be collapsed, got:\n{result}"
+        );
+        // And the body still binds to the heading via a single blank.
+        assert!(
+            result.contains(";! # Name Registration Payload v1\n;!\n;! ## Overview"),
+            "single blank between heading and next heading must survive, got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn reverse_transform_keeps_blank_doc_line_between_heading_and_paragraph() {
+        let source = "\
+;! # Heading
+;!
+;! Body paragraph.
+rule = 1
+";
+        let original = transform_to_markdown(source);
+        let result =
+            reverse_transform(&original.text, source, &original).expect("reverse must succeed");
+        assert_eq!(
+            result, source,
+            "blank `;!` between heading and paragraph must survive a no-op reverse"
+        );
+    }
+
+    #[test]
+    fn reverse_transform_removes_generated_splice_wrapper_blanks() {
+        let source = ";! # A\nrule = 1\ntrailing = 2\n";
+        let original = transform_to_markdown(source);
+        let result =
+            reverse_transform(&original.text, source, &original).expect("reverse must succeed");
+        assert_eq!(
+            result, source,
+            "the wrapper blanks the transform emits around the splice marker must be removed"
+        );
+    }
+
+    #[test]
+    fn reverse_transform_rejects_missing_splice_marker_still() {
+        let source = ";! # Title\nrule = 1\n";
+        let original = transform_to_markdown(source);
+        // Drop the splice marker line entirely.
+        let fixed_md = " # Title\n";
+        let err = reverse_transform(fixed_md, source, &original)
+            .expect_err("should still reject when a splice marker is deleted");
+        assert!(
+            err.to_string()
+                .contains("splice-marker integrity violation"),
+            "missing-marker rejection must remain, got: {err}"
+        );
+    }
+
+    #[test]
+    fn reverse_transform_rejects_changed_splice_marker_span_still() {
+        let source = ";! # Title\nrule = 1\n";
+        let original = transform_to_markdown(source);
+        let fixed_md = " # Title\n\n<!-- CBORK CDDL FROM 2-99 -->\n";
+        let err = reverse_transform(fixed_md, source, &original)
+            .expect_err("should still reject when a splice-marker span changes");
+        assert!(err.to_string().contains("splice-marker integrity"));
+    }
+
+    #[test]
+    fn reverse_transform_emits_canonical_blank_doc_line() {
+        // A blank `;!` line in the source must reconstruct with the
+        // canonical `;!` form (no trailing space). The previous
+        // implementation emitted `;! \n` because it joined the
+        // marker prefix to an empty trimmed Markdown line.
+        let source = "\
+;! # Title
+;!
+rule = 1
+";
+        let original = transform_to_markdown(source);
+        let result =
+            reverse_transform(&original.text, source, &original).expect("reverse must succeed");
+        assert!(
+            result.contains(";!\nrule"),
+            "blank `;!` must use the canonical no-trailing-space form, got:\n{result}"
+        );
+        assert!(
+            !result.contains(";! \n"),
+            "no trailing-space blank doc lines should be emitted, got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn collapse_blank_doc_lines_collapses_runs_to_one() {
+        let input = ";! A\n;!\n;!\n;!\n;! B\n";
+        assert_eq!(collapse_blank_doc_lines(input), ";! A\n;!\n;! B\n");
+    }
+
+    #[test]
+    fn collapse_blank_doc_lines_preserves_single_blank() {
+        let input = ";! A\n;!\n;! B\n";
+        assert_eq!(collapse_blank_doc_lines(input), ";! A\n;!\n;! B\n");
+    }
+
+    #[test]
+    fn collapse_blank_doc_lines_does_not_coll_across_non_doc() {
+        let input = ";! A\n;!\nrule = 1\n;!\n;! B\n";
+        assert_eq!(
+            collapse_blank_doc_lines(input),
+            ";! A\n;!\nrule = 1\n;!\n;! B\n"
+        );
+    }
+
+    #[test]
+    fn collapse_blank_doc_lines_handles_empty_runs_only() {
+        let input = ";!\n;!\n;!\n";
+        assert_eq!(collapse_blank_doc_lines(input), ";!\n");
     }
 }
