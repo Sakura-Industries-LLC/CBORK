@@ -472,7 +472,9 @@ fn run_doc_lint(
         // restoration.
         match cbork_cddl_compiler::reverse_transform(&fixed_synthetic, &source_text, &synthetic) {
             Ok(reconstructed) => {
-                if reconstructed == source_text {
+                if std::fs::read(source_path)
+                    .is_ok_and(|current| current == reconstructed.as_bytes())
+                {
                     return collect_doc_diagnostics(source_path, compiled, opts, &source_text);
                 }
                 if let Err(e) = std::fs::write(source_path, &reconstructed) {
