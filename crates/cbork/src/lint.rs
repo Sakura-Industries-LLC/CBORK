@@ -472,6 +472,9 @@ fn run_doc_lint(
         // restoration.
         match cbork_cddl_compiler::reverse_transform(&fixed_synthetic, &source_text, &synthetic) {
             Ok(reconstructed) => {
+                if reconstructed == source_text {
+                    return collect_doc_diagnostics(source_path, compiled, opts, &source_text);
+                }
                 if let Err(e) = std::fs::write(source_path, &reconstructed) {
                     diagnostics.push(Diagnostic {
                         code: "W034",
@@ -2127,12 +2130,14 @@ mod tests {
         let fixture = dir.join("fix_test.cddl");
         std::fs::write(
             &fixture,
-            "\
+            concat!(
+                "\
 ;! # Title
 ;!
 ;! Description
-rule = 1
 ",
+                "rule = 1   \t\n",
+            ),
         )
         .expect("write fixture");
 
@@ -2160,6 +2165,63 @@ rule = 1
         assert!(
             !combined.contains("E035"),
             "--doc --fix must not reject the fix with E035, got:\n{combined}"
+        );
+    }
+
+    #[test]
+    fn cli_doc_lint_fix_does_not_write_when_content_is_unchanged() {
+        let dir = std::env::temp_dir().join(format!("cbork_doc_fix_noop_{}", std::process::id()));
+        let _unused = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(dir.join(".rumdl.toml"), "[global]\ndisable = [\"all\"]\n")
+            .expect("write rumdl config");
+        let fixture = dir.join("noop.cddl");
+        let source = "\
+;! # Noop Fixture
+;! Already formatted documentation.
+rule = 1
+";
+        std::fs::write(&fixture, source).expect("write fixture");
+        let before_modified = std::fs::metadata(&fixture)
+            .expect("fixture metadata before")
+            .modified()
+            .expect("fixture mtime before");
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        let output = std::process::Command::new(env!("CARGO"))
+            .arg("run")
+            .arg("--quiet")
+            .arg("--bin")
+            .arg("cbork")
+            .arg("lint")
+            .arg("--doc")
+            .arg("--fix")
+            .arg(&fixture)
+            .arg("--no-banner")
+            .output()
+            .expect("run cbork lint --doc --fix");
+        let combined = String::from_utf8_lossy(&output.stdout).into_owned()
+            + &String::from_utf8_lossy(&output.stderr);
+        let after_modified = std::fs::metadata(&fixture)
+            .expect("fixture metadata after")
+            .modified()
+            .expect("fixture mtime after");
+        let after = std::fs::read_to_string(&fixture).expect("read fixture after");
+        let _unused = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            output.status.success(),
+            "cbork lint --doc --fix must succeed, got:\n{combined}"
+        );
+        assert!(
+            !combined.contains("W035"),
+            "no-op --doc --fix must not report a write, got:\n{combined}"
+        );
+        assert_eq!(after, source, "no-op --doc --fix must not change content");
+        assert_eq!(
+            after_modified, before_modified,
+            "no-op --doc --fix must not update file mtime"
         );
     }
 
@@ -2300,7 +2362,8 @@ rule_b = 2
         let fixture = dir.join("blank_doc.cddl");
         std::fs::write(
             &fixture,
-            "\
+            concat!(
+                "\
 ;! # Name Registration Payload v1
 ;!
 ;! ## Overview
@@ -2308,8 +2371,9 @@ rule_b = 2
 ;! This file defines the v1 name-registration payload that is carried inside a blockchain transaction.
 ;! The blockchain transaction wrapper itself is out of scope here.
 
-rule = 1
 ",
+                "rule = 1   \t\n",
+            ),
         )
         .expect("write fixture");
 
