@@ -535,7 +535,8 @@ fn collect_post_fix_diagnostics(
         Ok(compiled) => compiled,
         Err(e) => return vec![wrote, post_fix_recompile_failed(source_path, &e)],
     };
-    let mut diagnostics = collect_doc_diagnostics(source_path, &fresh_compiled, opts, reconstructed);
+    let mut diagnostics =
+        collect_doc_diagnostics(source_path, &fresh_compiled, opts, reconstructed);
     diagnostics.insert(0, wrote);
     diagnostics
 }
@@ -1899,12 +1900,14 @@ mod tests {
 
         // The fixture's `doc_fixture_file_with_title = 1` rule must be
         // covered by some splice marker.
-        let covered = synthetic.lines.iter().any(|l| match &l.kind {
-            cbork_cddl_compiler::SyntheticLineKind::SpliceMarker {
-                span_start,
-                span_end,
-            } => *span_start <= 16 && *span_end >= 16,
-            _ => false,
+        let covered = synthetic.lines.iter().any(|l| {
+            match &l.kind {
+                cbork_cddl_compiler::SyntheticLineKind::SpliceMarker {
+                    span_start,
+                    span_end,
+                } => *span_start <= 16 && *span_end >= 16,
+                _ => false,
+            }
         });
         assert!(
             covered,
@@ -1955,11 +1958,13 @@ mod tests {
         let doc_line = synthetic
             .lines
             .iter()
-            .find_map(|l| match &l.kind {
-                cbork_cddl_compiler::SyntheticLineKind::DocLine { source_line, .. } => {
-                    Some((*source_line, l.text.clone()))
-                },
-                _ => None,
+            .find_map(|l| {
+                match &l.kind {
+                    cbork_cddl_compiler::SyntheticLineKind::DocLine { source_line, .. } => {
+                        Some((*source_line, l.text.clone()))
+                    },
+                    _ => None,
+                }
             })
             .expect("expected at least one doc line");
         assert_eq!(
@@ -2463,10 +2468,8 @@ rule = 1
 
     #[test]
     fn cli_doc_lint_fix_rechecks_exported_docs_with_fresh_line_numbers() {
-        let dir = std::env::temp_dir().join(format!(
-            "cbork_doc_fix_fresh_lines_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("cbork_doc_fix_fresh_lines_{}", std::process::id()));
         let _unused = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
         std::fs::write(
@@ -2709,14 +2712,11 @@ rule = 1
 
         let result = lint_file(
             &path,
-            &LintRunOptions::from_flags_and_doc(
-                FLAG_SUMMARY,
-                DocLintOptions {
-                    enable: true,
-                    apply_fixes: false,
-                    doc_internal: cbork_cddl_compiler::DocInternalPolicy::No,
-                },
-            ),
+            &LintRunOptions::from_flags_and_doc(FLAG_SUMMARY, DocLintOptions {
+                enable: true,
+                apply_fixes: false,
+                doc_internal: cbork_cddl_compiler::DocInternalPolicy::No,
+            }),
             FilePrintMode::SingleFile,
         );
 
@@ -2911,10 +2911,10 @@ rule = 1
 
     #[test]
     fn cli_recursive_lint_summary_is_single_line() {
-        let (code, output) = run_lint_cli(
-            "cddl/vectors/project/semantic-errors",
-            &["--recursive", "--summary"],
-        );
+        let (code, output) = run_lint_cli("cddl/vectors/project/semantic-errors", &[
+            "--recursive",
+            "--summary",
+        ]);
         assert_eq!(
             code, 1,
             "semantic-errors fixtures contain errors, exit must be 1, got {code}:\n{output}"
@@ -2940,10 +2940,11 @@ rule = 1
 
     #[test]
     fn cli_recursive_doc_lint_summary_is_single_line() {
-        let (code, output) = run_lint_cli(
-            "cddl/vectors/project/positive/doc_lint",
-            &["--recursive", "--doc", "--summary"],
-        );
+        let (code, output) = run_lint_cli("cddl/vectors/project/positive/doc_lint", &[
+            "--recursive",
+            "--doc",
+            "--summary",
+        ]);
         assert_eq!(
             code, 0,
             "positive doc_lint fixtures pass under --doc, exit must be 0, got {code}:\n{output}"
