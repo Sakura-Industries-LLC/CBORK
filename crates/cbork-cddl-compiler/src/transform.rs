@@ -17,7 +17,8 @@
 //! # Transform rules
 //!
 //! * Each contiguous standalone `;!` block is emitted as Markdown after the `;!` marker
-//!   is stripped and common leading space is removed from non-blank lines.
+//!   and one optional separator space are stripped. Any additional leading spaces are
+//!   Markdown content and are preserved.
 //! * Every contiguous run of non-doc CDDL lines (definitions, regular comments, `;@` and
 //!   `;#` directives, blank lines) is collapsed into a single splice marker of the form
 //!   `<!-- CBORK CDDL FROM start-end -->` where `start` and `end` are the inclusive
@@ -57,8 +58,8 @@ pub enum SyntheticLineKind {
         /// Number of stripped characters before synthetic column 1.
         ///
         /// This includes source indentation before `;!`, the two-byte
-        /// marker itself, and any common block indent removed from the
-        /// Markdown text.
+        /// marker itself, and the optional separator space after the
+        /// marker when present.
         source_column_offset: usize,
     },
     /// A generated splice marker, e.g. `<!-- CBORK CDDL FROM 12-27 -->`.
@@ -139,22 +140,18 @@ pub fn transform_to_markdown(source_text: &str) -> SyntheticMarkdown {
                     idx = idx.saturating_add(1);
                 }
 
-                let stripped: Vec<String> = doc_lines
-                    .iter()
-                    .map(|(_, line)| strip_doc_marker(line))
-                    .collect();
-                let common_indent = common_leading_space_indent(&stripped);
-
-                for ((source_line, original_line), text) in doc_lines.iter().zip(stripped) {
+                for (source_line, original_line) in doc_lines {
                     let leading_ws_len = original_line
                         .len()
                         .saturating_sub(original_line.trim_start().len());
-                    output_text.push(dedent_doc_line(&text, common_indent));
+                    let stripped = strip_doc_marker(original_line);
+                    let (text, separator_len) = strip_doc_separator(&stripped);
+                    output_text.push(text.to_owned());
                     output_kinds.push(SyntheticLineKind::DocLine {
-                        source_line: *source_line,
+                        source_line,
                         source_column_offset: leading_ws_len
                             .saturating_add(2)
-                            .saturating_add(common_indent),
+                            .saturating_add(separator_len),
                     });
                 }
             },
@@ -194,36 +191,15 @@ pub fn transform_to_markdown(source_text: &str) -> SyntheticMarkdown {
     }
 }
 
-/// Return the minimum leading-space indent across non-blank doc lines.
-fn common_leading_space_indent(lines: &[String]) -> usize {
-    let mut min = usize::MAX;
-    for line in lines {
-        if line.trim().is_empty() {
-            continue;
-        }
-        min = min.min(line.bytes().take_while(|b| *b == b' ').count());
-    }
-
-    if min == usize::MAX { 0 } else { min }
-}
-
-/// Remove `common_indent` leading spaces from a doc line when present.
-fn dedent_doc_line(
-    line: &str,
-    common_indent: usize,
-) -> String {
-    if line.trim().is_empty() {
-        return String::new();
-    }
-
-    let remove = line
-        .bytes()
-        .take_while(|b| *b == b' ')
-        .count()
-        .min(common_indent);
-    debug_assert!(line.is_char_boundary(remove));
-    line.get(remove..)
-        .map_or_else(String::new, ToOwned::to_owned)
+/// Strip one conventional separator space after `;!`.
+///
+/// Everything after that single separator is Markdown content and must
+/// be preserved exactly. This is what makes `--doc --fix` idempotent:
+/// reverse-transform writes `;! ` before non-blank Markdown lines and
+/// the next transform removes exactly that prefix, not semantic list
+/// indentation.
+fn strip_doc_separator(line: &str) -> (&str, usize) {
+    line.strip_prefix(' ').map_or((line, 0), |rest| (rest, 1))
 }
 
 /// Emit a blank line, then the splice marker for the covered span,
@@ -613,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn doc_line_strips_marker_and_common_indent() {
+    fn doc_line_strips_marker_and_separator() {
         let source = ";! # Title\nrule = 1\n";
         let synthetic = transform_to_markdown(source);
 
@@ -633,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn doc_block_dedents_numbered_list() {
+    fn doc_block_strips_doc_separator_from_numbered_list() {
         let source = "\
 ;! # Title
 ;!
@@ -664,10 +640,38 @@ rule = 1
                 .collect::<Vec<_>>(),
             vec![
                 (1, 3, "# Title"),
-                (2, 3, ""),
+                (2, 2, ""),
                 (3, 3, "1. Concatenate the UTF-8 key bytes."),
                 (4, 3, "2. Hash the result."),
             ]
+        );
+    }
+
+    #[test]
+    fn doc_block_preserves_nested_list_indentation_after_separator() {
+        let source = "\
+;! 3. For each recipient:
+;!    a. Derive the blinded recipient tag from the context hash and
+;!    recipient public key.
+;!    b. HPKE-seal the CEK to the recipient's public key using the
+;!    X-Wing KEM.
+;! 4. Emit `[headers, ciphertext, [recipient1, ...]]`.
+rule = 1
+";
+        let synthetic = transform_to_markdown(source);
+        let expected = concat!(
+            "3. For each recipient:\n",
+            "   a. Derive the blinded recipient tag from the context hash and\n",
+            "   recipient public key.\n",
+            "   b. HPKE-seal the CEK to the recipient's public key using the\n",
+            "   X-Wing KEM.\n",
+            "4. Emit `[headers, ciphertext, [recipient1, ...]]`"
+        );
+
+        assert!(
+            synthetic.text.starts_with(expected),
+            "nested-list indentation after `;! ` must be preserved exactly:\n{}",
+            synthetic.text
         );
     }
 
@@ -853,6 +857,33 @@ rule = {
         let fixed = reverse_transform(&original.text, source, &original)
             .expect("reverse should succeed on an unmodified synthetic");
         assert_eq!(fixed, source);
+    }
+
+    #[test]
+    fn reverse_transform_roundtrips_nested_list_markdown_indent() {
+        let source = "\
+;! 3. For each recipient:
+;!    a. Derive the blinded recipient tag from the context hash and
+;!    recipient public key.
+;!    b. HPKE-seal the CEK to the recipient's public key using the
+;!    X-Wing KEM.
+;!    c. Store the 1120-byte encapsulation in unprotected header `-4`.
+;!    d. Store the 48-byte encrypted CEK as the recipient ciphertext.
+;!    e. Build HPKE-9-KE protected headers: `{1: 57, 4: tag}`.
+;! 4. Emit `[headers, ciphertext, [recipient1, ...]]`.
+
+rule = 1
+";
+        let first = transform_to_markdown(source);
+        let reconstructed = reverse_transform(&first.text, source, &first)
+            .expect("reverse transform must succeed on a no-op fix");
+        let second = transform_to_markdown(&reconstructed);
+
+        assert_eq!(reconstructed, source);
+        assert_eq!(
+            second.text, first.text,
+            "transform(reverse_transform(transform(source))) must preserve Markdown indentation"
+        );
     }
 
     #[test]

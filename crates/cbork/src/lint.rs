@@ -1856,7 +1856,7 @@ mod tests {
     }
 
     #[test]
-    fn transform_strips_bang_marker_and_common_indent_in_doc_lines() {
+    fn transform_strips_bang_marker_and_separator_in_doc_lines() {
         let source = ";! # Title\nrule = 1\n";
         let synthetic = cbork_cddl_compiler::transform_to_markdown(source);
 
@@ -2262,6 +2262,96 @@ rule = 1
         assert!(
             !modified.contains(";!\n;!\n;!\n"),
             "must not contain three or more consecutive blank doc lines:\n{modified}"
+        );
+    }
+
+    #[test]
+    fn cli_doc_lint_fix_is_idempotent_for_nested_lists() {
+        let dir = std::env::temp_dir().join("cbork_doc_fix_idempotent_nested");
+        let _unused = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(
+            dir.join(".rumdl.toml"),
+            "[global]\ndisable = [\"MD001\", \"MD063\", \"MD013\", \"MD041\"]\n",
+        )
+        .expect("write rumdl config");
+        let fixture = dir.join("nested.cddl");
+        std::fs::write(
+            &fixture,
+            "\
+;! 3. For each recipient:
+;!    a. Derive the blinded recipient tag from the context hash and
+;!    recipient public key.
+;!    b. HPKE-seal the CEK to the recipient's public key using the
+;!    X-Wing KEM.
+;!    c. Store the 1120-byte encapsulation in unprotected header `-4`.
+;!    d. Store the 48-byte encrypted CEK as the recipient ciphertext.
+;!    e. Build HPKE-9-KE protected headers: `{1: 57, 4: tag}`.
+;! 4. Emit `[headers, ciphertext, [recipient1, ...]]`.
+
+rule = 1
+",
+        )
+        .expect("write fixture");
+
+        let run_fix = || {
+            let output = std::process::Command::new(env!("CARGO"))
+                .arg("run")
+                .arg("--quiet")
+                .arg("--bin")
+                .arg("cbork")
+                .arg("lint")
+                .arg("--doc")
+                .arg("--fix")
+                .arg(&fixture)
+                .arg("--no-banner")
+                .output()
+                .expect("run cbork lint --doc --fix");
+            let combined = String::from_utf8_lossy(&output.stdout).into_owned()
+                + &String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "cbork lint --doc --fix must succeed, got:\n{combined}"
+            );
+        };
+
+        run_fix();
+        let after_first = std::fs::read_to_string(&fixture).expect("read after first fix");
+        run_fix();
+        let after_second = std::fs::read_to_string(&fixture).expect("read after second fix");
+        run_fix();
+        let after_third = std::fs::read_to_string(&fixture).expect("read after third fix");
+        let _unused = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            after_first, after_second,
+            "`--doc --fix` must be stable on the second run.\n\
+             after first:\n{after_first}\n---\nafter second:\n{after_second}"
+        );
+        assert_eq!(
+            after_second, after_third,
+            "`--doc --fix` must stay stable on later runs.\n\
+             after second:\n{after_second}\n---\nafter third:\n{after_third}"
+        );
+        assert!(
+            !after_first.contains("For each recipient: a."),
+            "sub-list marker `a.` must not be joined onto the parent line:\n{after_first}"
+        );
+        assert!(
+            !after_first.contains("recipient public key. b."),
+            "sub-list marker `b.` must not be joined onto its paragraph:\n{after_first}"
+        );
+        assert!(
+            !after_first.contains("X-Wing KEM. c."),
+            "sub-list marker `c.` must not be joined onto its paragraph:\n{after_first}"
+        );
+        assert!(
+            !after_first.contains("header `-4`. d."),
+            "sub-list marker `d.` must not be joined onto its paragraph:\n{after_first}"
+        );
+        assert!(
+            !after_first.contains("recipient ciphertext. e."),
+            "sub-list marker `e.` must not be joined onto its paragraph:\n{after_first}"
         );
     }
 
