@@ -341,6 +341,7 @@ nlsb
 nocapture
 nodenum
 NONASCII
+no-fail
 nonfin
 NOPAD
 normalised

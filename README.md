@@ -55,6 +55,29 @@ cargo run -p cbork -- render path/to/schema.cddl
 
 The full usage surface is documented in the `cbork` crate README.
 
+## Advisory runs with `--no-fail`
+
+`cbork` exposes a global `--no-fail` switch that forces the process to exit `0` even
+when a subcommand would normally report a failure:
+
+```shell
+# Run lint as an advisory check: diagnostics are still printed,
+# but the process exits 0 so the job is not broken.
+cbork --no-fail lint --recursive schemas/
+```
+
+`--no-fail` does not suppress diagnostics, change command output, skip work, or downgrade errors —
+it only overrides the process exit code.
+Use it for:
+
+* advisory/reporting runs in CI where diagnostics should be visible but should not break the job
+* staged adoption of lint rules
+* local bulk-audit workflows where you want a complete report and a zero shell status
+
+Parse/usage errors that occur before a subcommand runs
+(for example, an unknown flag rejected by the argument parser) still produce a non-zero exit.
+`--no-fail` only overrides the command-result exit code.
+
 ## Features
 
 * **CDDL linting** — `cbork lint` checks CDDL documents for parse errors, semantic errors, and warnings.

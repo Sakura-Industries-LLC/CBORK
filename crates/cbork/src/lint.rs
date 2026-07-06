@@ -483,15 +483,7 @@ fn run_doc_lint(
                         related: Vec::new(),
                     });
                 } else {
-                    diagnostics.push(Diagnostic {
-                        code: "W035",
-                        level: DiagnosticLevel::Warning,
-                        message: "--doc --fix wrote the fixed CDDL back to disk".to_owned(),
-                        source_file: Some(source_path.to_path_buf()),
-                        span: None,
-                        previous_origin: None,
-                        related: Vec::new(),
-                    });
+                    return collect_post_fix_diagnostics(source_path, opts, &reconstructed);
                 }
             },
             Err(e) => {
@@ -519,6 +511,108 @@ fn run_doc_lint(
     let scan = scan_doc_blocks(&source_text);
     let semantics = check_doc_semantics(
         &source_text,
+        source_path,
+        &compiled.user_nodes,
+        &scan,
+        &cbork_cddl_compiler::DocSemanticsConfig {
+            doc_internal: opts.doc.doc_internal,
+            exported_names: compiled.exported_names.clone(),
+        },
+    );
+    diagnostics.extend(semantics.diagnostics);
+
+    diagnostics
+}
+
+/// Recompile the just-written fixed file and collect post-fix doc diagnostics.
+fn collect_post_fix_diagnostics(
+    source_path: &Path,
+    opts: &LintRunOptions,
+    reconstructed: &str,
+) -> Vec<Diagnostic> {
+    let wrote = fixed_cddl_written_diagnostic(source_path);
+    let fresh_compiled = match check_file(source_path) {
+        Ok(compiled) => compiled,
+        Err(e) => return vec![wrote, post_fix_recompile_failed(source_path, &e)],
+    };
+    let mut diagnostics = collect_doc_diagnostics(source_path, &fresh_compiled, opts, reconstructed);
+    diagnostics.insert(0, wrote);
+    diagnostics
+}
+
+/// Build the successful `--doc --fix` write diagnostic.
+fn fixed_cddl_written_diagnostic(source_path: &Path) -> Diagnostic {
+    Diagnostic {
+        code: "W035",
+        level: DiagnosticLevel::Warning,
+        message: "--doc --fix wrote the fixed CDDL back to disk".to_owned(),
+        source_file: Some(source_path.to_path_buf()),
+        span: None,
+        previous_origin: None,
+        related: Vec::new(),
+    }
+}
+
+/// Build the warning used when a just-written fixed file cannot be
+/// compiled for post-fix diagnostic reporting.
+fn post_fix_recompile_failed(
+    source_path: &Path,
+    error: &anyhow::Error,
+) -> Diagnostic {
+    Diagnostic {
+        code: "W037",
+        level: DiagnosticLevel::Warning,
+        message: format!("failed to recompile fixed CDDL for post-fix diagnostics: {error}"),
+        source_file: Some(source_path.to_path_buf()),
+        span: None,
+        previous_origin: None,
+        related: Vec::new(),
+    }
+}
+
+/// Collect documentation diagnostics for an already-loaded source text
+/// without applying fixes.
+fn collect_doc_diagnostics(
+    source_path: &Path,
+    compiled: &CompiledCDDL,
+    opts: &LintRunOptions,
+    source_text: &str,
+) -> Vec<Diagnostic> {
+    let safety = validate_doc_source(source_text);
+    let mut diagnostics = safety.diagnostics;
+    if diagnostics
+        .iter()
+        .any(cbork_cddl_compiler::Diagnostic::is_error)
+    {
+        return diagnostics;
+    }
+
+    diagnostics.extend(spacing_diagnostics(compiled, source_text));
+
+    let synthetic = transform_to_markdown(source_text);
+    let rumdl_warnings =
+        match cbork_cddl_compiler::lint_synthetic_markdown(&synthetic, source_path, None) {
+            Ok(run) => run.warnings,
+            Err(e) => {
+                diagnostics.push(Diagnostic {
+                    code: "W031",
+                    level: DiagnosticLevel::Warning,
+                    message: format!("rumdl integration failed: {e}"),
+                    source_file: Some(source_path.to_path_buf()),
+                    span: None,
+                    previous_origin: None,
+                    related: Vec::new(),
+                });
+                return diagnostics;
+            },
+        };
+
+    let mapped = map_rumdl_diagnostics(rumdl_warnings, &synthetic, source_text, source_path);
+    diagnostics.extend(mapped.diagnostics);
+
+    let scan = scan_doc_blocks(source_text);
+    let semantics = check_doc_semantics(
+        source_text,
         source_path,
         &compiled.user_nodes,
         &scan,
@@ -1805,14 +1899,12 @@ mod tests {
 
         // The fixture's `doc_fixture_file_with_title = 1` rule must be
         // covered by some splice marker.
-        let covered = synthetic.lines.iter().any(|l| {
-            match &l.kind {
-                cbork_cddl_compiler::SyntheticLineKind::SpliceMarker {
-                    span_start,
-                    span_end,
-                } => *span_start <= 16 && *span_end >= 16,
-                _ => false,
-            }
+        let covered = synthetic.lines.iter().any(|l| match &l.kind {
+            cbork_cddl_compiler::SyntheticLineKind::SpliceMarker {
+                span_start,
+                span_end,
+            } => *span_start <= 16 && *span_end >= 16,
+            _ => false,
         });
         assert!(
             covered,
@@ -1863,13 +1955,11 @@ mod tests {
         let doc_line = synthetic
             .lines
             .iter()
-            .find_map(|l| {
-                match &l.kind {
-                    cbork_cddl_compiler::SyntheticLineKind::DocLine { source_line, .. } => {
-                        Some((*source_line, l.text.clone()))
-                    },
-                    _ => None,
-                }
+            .find_map(|l| match &l.kind {
+                cbork_cddl_compiler::SyntheticLineKind::DocLine { source_line, .. } => {
+                    Some((*source_line, l.text.clone()))
+                },
+                _ => None,
             })
             .expect("expected at least one doc line");
         assert_eq!(
@@ -2281,9 +2371,9 @@ rule = 1
             "\
 ;! 3. For each recipient:
 ;!    a. Derive the blinded recipient tag from the context hash and
-;!    recipient public key.
+;!       recipient public key.
 ;!    b. HPKE-seal the CEK to the recipient's public key using the
-;!    X-Wing KEM.
+;!       X-Wing KEM.
 ;!    c. Store the 1120-byte encapsulation in unprotected header `-4`.
 ;!    d. Store the 48-byte encrypted CEK as the recipient ciphertext.
 ;!    e. Build HPKE-9-KE protected headers: `{1: 57, 4: tag}`.
@@ -2313,15 +2403,23 @@ rule = 1
                 output.status.success(),
                 "cbork lint --doc --fix must succeed, got:\n{combined}"
             );
+            combined
         };
 
-        run_fix();
+        let first_output = run_fix();
         let after_first = std::fs::read_to_string(&fixture).expect("read after first fix");
-        run_fix();
+        let second_output = run_fix();
         let after_second = std::fs::read_to_string(&fixture).expect("read after second fix");
-        run_fix();
+        let third_output = run_fix();
         let after_third = std::fs::read_to_string(&fixture).expect("read after third fix");
         let _unused = std::fs::remove_dir_all(&dir);
+
+        for output in [&first_output, &second_output, &third_output] {
+            assert!(
+                !output.contains("MD077"),
+                "`--doc --fix` output must describe post-fix diagnostics, not fixed pre-fix MD077 warnings:\n{output}"
+            );
+        }
 
         assert_eq!(
             after_first, after_second,
@@ -2342,8 +2440,16 @@ rule = 1
             "sub-list marker `b.` must not be joined onto its paragraph:\n{after_first}"
         );
         assert!(
+            after_first.contains(";!    recipient public key."),
+            "fixed continuation indentation must be preserved on rerun:\n{after_first}"
+        );
+        assert!(
             !after_first.contains("X-Wing KEM. c."),
             "sub-list marker `c.` must not be joined onto its paragraph:\n{after_first}"
+        );
+        assert!(
+            after_first.contains(";!    X-Wing KEM."),
+            "fixed continuation indentation must be preserved on rerun:\n{after_first}"
         );
         assert!(
             !after_first.contains("header `-4`. d."),
@@ -2352,6 +2458,71 @@ rule = 1
         assert!(
             !after_first.contains("recipient ciphertext. e."),
             "sub-list marker `e.` must not be joined onto its paragraph:\n{after_first}"
+        );
+    }
+
+    #[test]
+    fn cli_doc_lint_fix_rechecks_exported_docs_with_fresh_line_numbers() {
+        let dir = std::env::temp_dir().join(format!(
+            "cbork_doc_fix_fresh_lines_{}",
+            std::process::id()
+        ));
+        let _unused = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(
+            dir.join(".rumdl.toml"),
+            "[global]\ndisable = [\"MD001\", \"MD063\", \"MD013\", \"MD041\"]\n",
+        )
+        .expect("write rumdl config");
+        let fixture = dir.join("fresh_lines.cddl");
+        std::fs::write(
+            &fixture,
+            "\
+;! # Fixture
+;! File docs.
+;@ CBORK: Library
+
+;! ### COSE_Encrypt0
+;! Documented exported generic definition.
+;!
+;! **`headers`** are the protected headers.
+;! **`payload`** is the plaintext model.
+;@ CBORK: Export
+COSE_Encrypt0<headers, payload> = [
+  headers,
+  payload: bstr,
+]
+",
+        )
+        .expect("write fixture");
+
+        let output = std::process::Command::new(env!("CARGO"))
+            .arg("run")
+            .arg("--quiet")
+            .arg("--bin")
+            .arg("cbork")
+            .arg("lint")
+            .arg("--doc")
+            .arg("--fix")
+            .arg(&fixture)
+            .arg("--no-banner")
+            .output()
+            .expect("run cbork lint --doc --fix");
+        let combined = String::from_utf8_lossy(&output.stdout).into_owned()
+            + &String::from_utf8_lossy(&output.stderr);
+        let _unused = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            output.status.success(),
+            "cbork lint --doc --fix must succeed, got:\n{combined}"
+        );
+        assert!(
+            combined.contains("W035"),
+            "--doc --fix must report that it wrote the file, got:\n{combined}"
+        );
+        assert!(
+            !combined.contains("E032"),
+            "post-fix diagnostics must use fresh compiled line numbers, got:\n{combined}"
         );
     }
 
@@ -2538,11 +2709,14 @@ rule = 1
 
         let result = lint_file(
             &path,
-            &LintRunOptions::from_flags_and_doc(FLAG_SUMMARY, DocLintOptions {
-                enable: true,
-                apply_fixes: false,
-                doc_internal: cbork_cddl_compiler::DocInternalPolicy::No,
-            }),
+            &LintRunOptions::from_flags_and_doc(
+                FLAG_SUMMARY,
+                DocLintOptions {
+                    enable: true,
+                    apply_fixes: false,
+                    doc_internal: cbork_cddl_compiler::DocInternalPolicy::No,
+                },
+            ),
             FilePrintMode::SingleFile,
         );
 
@@ -2737,10 +2911,10 @@ rule = 1
 
     #[test]
     fn cli_recursive_lint_summary_is_single_line() {
-        let (code, output) = run_lint_cli("cddl/vectors/project/semantic-errors", &[
-            "--recursive",
-            "--summary",
-        ]);
+        let (code, output) = run_lint_cli(
+            "cddl/vectors/project/semantic-errors",
+            &["--recursive", "--summary"],
+        );
         assert_eq!(
             code, 1,
             "semantic-errors fixtures contain errors, exit must be 1, got {code}:\n{output}"
@@ -2766,11 +2940,10 @@ rule = 1
 
     #[test]
     fn cli_recursive_doc_lint_summary_is_single_line() {
-        let (code, output) = run_lint_cli("cddl/vectors/project/positive/doc_lint", &[
-            "--recursive",
-            "--doc",
-            "--summary",
-        ]);
+        let (code, output) = run_lint_cli(
+            "cddl/vectors/project/positive/doc_lint",
+            &["--recursive", "--doc", "--summary"],
+        );
         assert_eq!(
             code, 0,
             "positive doc_lint fixtures pass under --doc, exit must be 0, got {code}:\n{output}"
@@ -2790,6 +2963,96 @@ rule = 1
         assert_eq!(
             recursive_count, 1,
             "exactly one final Recursive lint summary: line is required, got {recursive_count}:\n{output}"
+        );
+    }
+
+    // `--no-fail` is a global CLI switch (plans/plan-006-no-fail.md) that
+    // forces the process exit code to 0 even when a subcommand would
+    // normally report a failure. It must not suppress diagnostics or
+    // change the visible command output.
+
+    fn run_cbork(args: &[&str]) -> (i32, String) {
+        let output = std::process::Command::new(env!("CARGO"))
+            .arg("run")
+            .arg("--quiet")
+            .arg("--bin")
+            .arg("cbork")
+            .arg("--")
+            .args(args)
+            .arg("--no-banner")
+            .output()
+            .expect("run cbork");
+        let exit_code = output.status.code().unwrap_or(-1);
+        let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        (exit_code, combined)
+    }
+
+    fn write_no_fail_cddl(
+        name: &str,
+        content: &str,
+    ) -> PathBuf {
+        let dir = std::env::temp_dir().join("cbork_no_fail_test");
+        std::fs::create_dir_all(&dir).expect("temp no-fail dir should exist");
+        let path = dir.join(name);
+        std::fs::write(&path, content).expect("temp no-fail file should be written");
+        path
+    }
+
+    #[test]
+    fn cli_without_no_fail_still_returns_nonzero_for_syntax_error() {
+        let path = write_no_fail_cddl("no_fail_syntax.cddl", "totally = invalid ) cddl syntax\n");
+        let (code, output) = run_cbork(&["lint", path.to_str().expect("utf-8 path")]);
+        assert_ne!(
+            code, 0,
+            "lint of a broken file without --no-fail must be non-zero, got {code}:\n{output}"
+        );
+    }
+
+    #[test]
+    fn cli_no_fail_lint_returns_zero_for_syntax_error() {
+        let path = write_no_fail_cddl(
+            "no_fail_syntax_ok.cddl",
+            "totally = invalid ) cddl syntax\n",
+        );
+        let (code, output) = run_cbork(&["--no-fail", "lint", path.to_str().expect("utf-8 path")]);
+        assert_eq!(
+            code, 0,
+            "--no-fail lint of a broken file must still exit 0, got {code}:\n{output}"
+        );
+    }
+
+    #[test]
+    fn cli_no_fail_preserves_lint_diagnostics() {
+        let path = write_no_fail_cddl("no_fail_diag.cddl", "totally = invalid ) cddl syntax\n");
+        let (code, output) = run_cbork(&["--no-fail", "lint", path.to_str().expect("utf-8 path")]);
+        assert_eq!(code, 0, "expected exit 0, got {code}:\n{output}");
+        assert!(
+            output.contains("syntax error"),
+            "--no-fail must still print the syntax error diagnostic, got:\n{output}"
+        );
+        assert!(
+            output.contains("expected EOI"),
+            "--no-fail must still include the parser detail, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn cli_no_fail_unknown_why_code_returns_zero() {
+        let (code, output) = run_cbork(&["--no-fail", "why", "Z9999"]);
+        assert_eq!(
+            code, 0,
+            "--no-fail why for an unknown code must exit 0, got {code}:\n{output}"
+        );
+        assert!(
+            output.contains("unknown diagnostic code"),
+            "--no-fail must still print the unknown-code message, got:\n{output}"
+        );
+
+        let (code, output) = run_cbork(&["why", "Z9999"]);
+        assert_ne!(
+            code, 0,
+            "why for an unknown code without --no-fail must be non-zero, got {code}:\n{output}"
         );
     }
 }

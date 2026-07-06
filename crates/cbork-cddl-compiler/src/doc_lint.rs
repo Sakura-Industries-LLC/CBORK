@@ -46,9 +46,9 @@ const CODE_RESERVED_MARKER: &str = "E040";
 /// comments than it closes.
 const CODE_UNCLOSED_HTML_COMMENT: &str = "E041";
 
-/// Default `MarkdownFlavor` for cbork's documentation linting. The
-/// CDDL doc-block transform does not need MkDocs-specific handling;
-/// standard `CommonMark` is the right baseline.
+/// Default `MarkdownFlavor` for cbork's documentation linting.
+/// Standard `CommonMark` is the baseline unless the loaded rumdl
+/// configuration changes rule behavior.
 const DEFAULT_RUMDL_FLAVOR: MarkdownFlavor = MarkdownFlavor::Standard;
 
 // ---------------------------------------------------------------------

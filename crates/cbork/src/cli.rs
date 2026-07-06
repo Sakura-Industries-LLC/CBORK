@@ -21,6 +21,7 @@ use crate::{
 /// Global `cbork` options.
 #[derive(Debug, Clone, Bpaf)]
 #[bpaf(options, version)]
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct Cli {
     /// Color policy for terminal output.
     #[bpaf(long, argument("auto|always|never"), fallback(ColorMode::Auto))]
@@ -45,6 +46,14 @@ pub(crate) struct Cli {
     /// Optional configuration file for future expansion.
     #[bpaf(long, argument("PATH"))]
     config: Option<PathBuf>,
+
+    /// Always exit with status 0 after running the command.
+    ///
+    /// Diagnostics and command output are unchanged; only the process
+    /// exit code is forced to zero. Parse/usage errors that occur before
+    /// the subcommand runs are still surfaced as non-zero exits.
+    #[bpaf(long)]
+    no_fail: bool,
 
     /// Selected cbork subcommand.
     #[bpaf(external(command))]
@@ -77,7 +86,7 @@ impl Cli {
             Command::Lsp(args) => args.exec_stub("lsp"),
         };
 
-        if !ok {
+        if !ok && !self.no_fail {
             exit(1);
         }
     }
@@ -809,5 +818,19 @@ mod tests {
             },
             _ => panic!("expected validate command"),
         }
+    }
+
+    #[test]
+    fn parses_global_no_fail() {
+        let with_flag = cli()
+            .run_inner(&["--no-fail", "lint", "input.cddl"])
+            .expect("no-fail command should parse");
+        assert!(with_flag.no_fail);
+        assert!(matches!(with_flag.command, Command::Lint(_)));
+
+        let without_flag = cli()
+            .run_inner(&["lint", "input.cddl"])
+            .expect("default command should parse");
+        assert!(!without_flag.no_fail);
     }
 }

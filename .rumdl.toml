@@ -19,7 +19,7 @@ list-item-empty-lines = false
 strict = false
 
 [MD010]
-spaces-per-tab = 3
+spaces-per-tab = 4
 
 [MD012]
 maximum = 1

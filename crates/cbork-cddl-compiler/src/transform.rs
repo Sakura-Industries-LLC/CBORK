@@ -193,11 +193,10 @@ pub fn transform_to_markdown(source_text: &str) -> SyntheticMarkdown {
 
 /// Strip one conventional separator space after `;!`.
 ///
-/// Everything after that single separator is Markdown content and must
-/// be preserved exactly. This is what makes `--doc --fix` idempotent:
-/// reverse-transform writes `;! ` before non-blank Markdown lines and
-/// the next transform removes exactly that prefix, not semantic list
-/// indentation.
+/// This makes the transform a mechanical left shift by three
+/// characters for normal `;! ` documentation lines. Reverse transform
+/// performs the matching right shift by writing `;! ` before each
+/// non-blank Markdown line.
 fn strip_doc_separator(line: &str) -> (&str, usize) {
     line.strip_prefix(' ').map_or((line, 0), |rest| (rest, 1))
 }
@@ -652,9 +651,9 @@ rule = 1
         let source = "\
 ;! 3. For each recipient:
 ;!    a. Derive the blinded recipient tag from the context hash and
-;!    recipient public key.
+;!       recipient public key.
 ;!    b. HPKE-seal the CEK to the recipient's public key using the
-;!    X-Wing KEM.
+;!       X-Wing KEM.
 ;! 4. Emit `[headers, ciphertext, [recipient1, ...]]`.
 rule = 1
 ";
@@ -662,9 +661,9 @@ rule = 1
         let expected = concat!(
             "3. For each recipient:\n",
             "   a. Derive the blinded recipient tag from the context hash and\n",
-            "   recipient public key.\n",
+            "      recipient public key.\n",
             "   b. HPKE-seal the CEK to the recipient's public key using the\n",
-            "   X-Wing KEM.\n",
+            "      X-Wing KEM.\n",
             "4. Emit `[headers, ciphertext, [recipient1, ...]]`"
         );
 
@@ -864,9 +863,9 @@ rule = {
         let source = "\
 ;! 3. For each recipient:
 ;!    a. Derive the blinded recipient tag from the context hash and
-;!    recipient public key.
+;!       recipient public key.
 ;!    b. HPKE-seal the CEK to the recipient's public key using the
-;!    X-Wing KEM.
+;!       X-Wing KEM.
 ;!    c. Store the 1120-byte encapsulation in unprotected header `-4`.
 ;!    d. Store the 48-byte encrypted CEK as the recipient ciphertext.
 ;!    e. Build HPKE-9-KE protected headers: `{1: 57, 4: tag}`.

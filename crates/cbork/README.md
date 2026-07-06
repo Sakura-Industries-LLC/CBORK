@@ -28,6 +28,22 @@ cbork validate --schema path/to/schema.cddl path/to/data.cbor
 
 `cbork --help` lists every subcommand and option.
 
+### Advisory / CI runs with `--no-fail`
+
+The global `--no-fail` switch forces the process to exit `0` even when a subcommand would normally report a failure.
+Diagnostics and command output are unchanged; only the process exit code is forced to zero.
+This is useful for advisory lint runs, staged adoption of new rules,
+and local bulk audits where you want a complete report and a zero shell status:
+
+```shell
+# Always exit 0 even when individual schemas fail lint.
+cbork --no-fail lint --recursive schemas/
+```
+
+Note: parse/usage errors that occur before a subcommand runs
+(for example, an unknown flag rejected by the argument parser) still produce a non-zero exit.
+`--no-fail` only overrides the command-result exit code.
+
 ## License
 
 `cbork` is licensed under `AGPL-3.0-only`.
