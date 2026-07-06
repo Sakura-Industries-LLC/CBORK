@@ -17,10 +17,10 @@ use cbork_cddl_compiler::{
 use cbork_cddl_parser::{try_extract_syntax_error, validate_cddl};
 use console::{Emoji, style};
 
-use crate::diagnostics::{has_error_diagnostics, print_compiler_diagnostics};
+use crate::diagnostics::print_compiler_diagnostics;
 
 /// Check the CDDL file and return the compiled document.
-fn check_file(file_path: &PathBuf) -> anyhow::Result<CompiledCDDL> {
+fn check_file(file_path: &Path) -> anyhow::Result<CompiledCDDL> {
     let content = std::fs::read_to_string(file_path)?;
     validate_cddl(&content)?;
     Ok(CompiledCDDL::compile(file_path, None)?)
@@ -121,97 +121,273 @@ impl PrintOptions {
     }
 }
 
+/// Per-file lint outcome with split diagnostic counters.
+///
+/// `counts` holds the combined compiler + doc totals, while
+/// `compiler_counts` and `doc_counts` keep the breakdown so callers can
+/// build either a single combined `Summary:` line (one file, one run)
+/// or an aggregate over many files without re-walking diagnostics.
+#[allow(
+    dead_code,
+    reason = "compiler_counts / doc_counts / syntax_error / fatal_error are consumed by the lint tests and reserved for the future --breakdown mode described in plans/enhancements-fixes-plan.md item 001"
+)]
+#[derive(Debug, Clone)]
+pub(crate) struct LintFileResult {
+    /// Path that was linted.
+    pub(crate) path: PathBuf,
+    /// Whether the file passes lint (no errors and no warnings under `--strict`).
+    pub(crate) ok: bool,
+    /// Combined error/warning counts (compiler + doc).
+    pub(crate) counts: DiagnosticCounts,
+    /// Compiler-only diagnostic counts.
+    pub(crate) compiler_counts: DiagnosticCounts,
+    /// Documentation-lint diagnostic counts.
+    pub(crate) doc_counts: DiagnosticCounts,
+    /// Whether the file failed with a CDDL syntax error.
+    pub(crate) syntax_error: bool,
+    /// Whether the file failed with a non-syntax, non-compile error.
+    pub(crate) fatal_error: bool,
+}
+
+/// Recursive-directory aggregate result.
+///
+/// Carries total file counts, the number that failed, and the combined
+/// diagnostic counts so a single "Recursive lint summary:" line can be
+/// produced after the walk without re-evaluating anything.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct LintAggregateResult {
+    /// Number of CDDL files processed.
+    pub(crate) files: usize,
+    /// Number of files whose lint result was not `ok`.
+    pub(crate) failed_files: usize,
+    /// Total error/warning counts across all files.
+    pub(crate) counts: DiagnosticCounts,
+}
+
+impl LintAggregateResult {
+    /// Number of files that linted cleanly.
+    #[must_use]
+    pub(crate) fn clean_files(&self) -> usize {
+        self.files.saturating_sub(self.failed_files)
+    }
+
+    /// Whether the directory traversal had any failed files.
+    #[must_use]
+    pub(crate) fn ok(&self) -> bool {
+        self.failed_files == 0
+    }
+}
+
+/// How `lint_file` should format per-file output.
+///
+/// `RecursiveItem` suppresses per-file `Summary:` and stats lines
+/// because the owning directory traversal prints a single aggregate
+/// line at the end of the walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FilePrintMode {
+    /// The user passed a single file; print the full single-file layout
+    /// (path line, optional summary, optional stats).
+    SingleFile,
+    /// The user passed a directory and we are about to print one item
+    /// inside that directory.
+    RecursiveItem,
+}
+
 /// Check the CDDL file, prints any errors into the stdout.
 pub(crate) fn check_file_with_print(
-    file_path: &PathBuf,
+    file_path: &Path,
     opts: &LintRunOptions,
 ) -> bool {
+    lint_file(file_path, opts, FilePrintMode::SingleFile).ok
+}
+
+/// Run the lint pipeline for one file and return its structured result.
+///
+/// Always prints the per-file compiler and doc diagnostics plus the
+/// emoji+path line. In `SingleFile` mode it additionally honors
+/// `--summary` and `--stats`. In `RecursiveItem` mode those two
+/// per-file details are suppressed; the directory traversal owns
+/// the final aggregate summary.
+pub(crate) fn lint_file(
+    file_path: &Path,
+    opts: &LintRunOptions,
+    mode: FilePrintMode,
+) -> LintFileResult {
     match check_file(file_path) {
-        Ok(compiled) => {
-            print_compiler_diagnostics(file_path, &compiled.warnings, opts.print.print_why());
-            let counts = DiagnosticCounts::from_diagnostics(&compiled.warnings);
-
-            let doc_diagnostics = if opts.doc.enable {
-                run_doc_lint(file_path, &compiled, opts)
-            } else {
-                Vec::new()
-            };
-            print_compiler_diagnostics(file_path, &doc_diagnostics, opts.print.print_why());
-            let doc_counts = DiagnosticCounts::from_diagnostics(&doc_diagnostics);
-
-            let total_warnings = counts.warnings.saturating_add(doc_counts.warnings);
-            let ok = !has_error_diagnostics(&compiled.warnings)
-                && !has_error_diagnostics(&doc_diagnostics)
-                && (!opts.print.fail_on_warnings() || total_warnings == 0);
-            let (emoji, fallback) = if ok {
-                ("✅", "Success")
-            } else {
-                ("🚨", "Errors")
-            };
-            println!(
-                "{} {}",
-                Emoji::new(emoji, fallback),
-                style(file_path.display()).bold()
-            );
-            if opts.print.print_summary() {
-                counts.print();
-                if opts.doc.enable {
-                    doc_counts.print();
-                }
-            }
-            if opts.print.print_stats() {
-                LintStats::from_compiled(&compiled, counts).print();
-            }
-            ok
-        },
-        Err(e) => {
-            // Per the plan: when normal CDDL lint has errors, skip the
-            // doc-lint pass entirely. Either the file did not parse or
-            // it did not compile; either way the CDDL is not in a
-            // state where doc comments are meaningful.
-            if let Some(error) = e.downcast_ref::<cbork_cddl_compiler::CompileError>() {
-                print_compiler_diagnostics(file_path, &error.diagnostics, opts.print.print_why());
-                let counts = DiagnosticCounts::from_diagnostics(&error.diagnostics);
-                let ok = !has_error_diagnostics(&error.diagnostics)
-                    && (!opts.print.fail_on_warnings() || counts.warnings == 0);
-                let (emoji, fallback) = if ok {
-                    ("✅", "Success")
-                } else {
-                    ("🚨", "Errors")
-                };
-                println!(
-                    "{} {}",
-                    Emoji::new(emoji, fallback),
-                    style(file_path.display()).bold()
-                );
-                if opts.print.print_summary() {
-                    counts.print();
-                }
-                if opts.print.print_stats() {
-                    LintStats::from_error(counts).print();
-                }
-                ok
-            } else if try_extract_syntax_error(e.as_ref()).is_some() {
-                println!(
-                    "{} {} (1 syntax error):
-{}",
-                    Emoji::new("🚨", "Syntax error"),
-                    style(file_path.display()).bold(),
-                    style(e).red()
-                );
-                false
-            } else {
-                println!(
-                    "{} {}:
-{}",
-                    Emoji::new("🚨", "Errors"),
-                    file_path.display(),
-                    style(e).red()
-                );
-                false
-            }
-        },
+        Ok(compiled) => lint_file_compiled(file_path, opts, mode, &compiled),
+        Err(e) => lint_file_failed(file_path, opts, mode, &e),
     }
+}
+
+/// Compile-succeeded branch: print diagnostics, accumulate counts, and
+/// emit the success path output. Includes the doc-lint pass when
+/// `--doc` is set.
+fn lint_file_compiled(
+    file_path: &Path,
+    opts: &LintRunOptions,
+    mode: FilePrintMode,
+    compiled: &CompiledCDDL,
+) -> LintFileResult {
+    print_compiler_diagnostics(file_path, &compiled.warnings, opts.print.print_why());
+    let compiler_counts = DiagnosticCounts::from_diagnostics(&compiled.warnings);
+
+    let doc_diagnostics = if opts.doc.enable {
+        run_doc_lint(file_path, compiled, opts)
+    } else {
+        Vec::new()
+    };
+    print_compiler_diagnostics(file_path, &doc_diagnostics, opts.print.print_why());
+    let doc_counts = DiagnosticCounts::from_diagnostics(&doc_diagnostics);
+
+    let counts = compiler_counts.combined_with(doc_counts);
+    let ok = !compiler_counts.has_errors()
+        && !doc_counts.has_errors()
+        && (!opts.print.fail_on_warnings() || counts.warnings == 0);
+
+    let result = LintFileResult {
+        path: file_path.to_path_buf(),
+        ok,
+        counts,
+        compiler_counts,
+        doc_counts,
+        syntax_error: false,
+        fatal_error: false,
+    };
+
+    print_path_line(&result);
+
+    if mode == FilePrintMode::SingleFile {
+        if opts.print.print_summary() {
+            result.counts.print();
+        }
+        if opts.print.print_stats() {
+            LintStats::from_compiled(compiled, counts).print();
+        }
+    }
+
+    result
+}
+
+/// Top-level failure dispatch: routes to the compile-error, syntax-error,
+/// or fatal-error branch based on the error type.
+fn lint_file_failed(
+    file_path: &Path,
+    opts: &LintRunOptions,
+    mode: FilePrintMode,
+    e: &anyhow::Error,
+) -> LintFileResult {
+    if let Some(error) = e.downcast_ref::<cbork_cddl_compiler::CompileError>() {
+        return lint_compile_error(file_path, opts, mode, error);
+    }
+    if try_extract_syntax_error(e.as_ref()).is_some() {
+        return lint_syntax_error(file_path, e);
+    }
+    lint_fatal_error(file_path, e)
+}
+
+/// Compile-error branch: the CDDL parsed but failed semantic checks.
+///
+/// Per the design, the doc-lint pass is skipped because the CDDL is
+/// not in a state where doc comments are meaningful.
+fn lint_compile_error(
+    file_path: &Path,
+    opts: &LintRunOptions,
+    mode: FilePrintMode,
+    error: &cbork_cddl_compiler::CompileError,
+) -> LintFileResult {
+    print_compiler_diagnostics(file_path, &error.diagnostics, opts.print.print_why());
+    let compiler_counts = DiagnosticCounts::from_diagnostics(&error.diagnostics);
+    let ok = !compiler_counts.has_errors()
+        && (!opts.print.fail_on_warnings() || compiler_counts.warnings == 0);
+    let result = LintFileResult {
+        path: file_path.to_path_buf(),
+        ok,
+        counts: compiler_counts,
+        compiler_counts,
+        doc_counts: DiagnosticCounts::default(),
+        syntax_error: false,
+        fatal_error: false,
+    };
+    print_path_line(&result);
+    if mode == FilePrintMode::SingleFile {
+        if opts.print.print_summary() {
+            result.counts.print();
+        }
+        if opts.print.print_stats() {
+            LintStats::from_error(compiler_counts).print();
+        }
+    }
+    result
+}
+
+/// Syntax-error branch: pest reported a parse failure.
+///
+/// The aggregate contribution is exactly one error per file.
+fn lint_syntax_error(
+    file_path: &Path,
+    e: &anyhow::Error,
+) -> LintFileResult {
+    println!(
+        "{} {} (1 syntax error):
+{}",
+        Emoji::new("🚨", "Syntax error"),
+        style(file_path.display()).bold(),
+        style(e).red()
+    );
+    LintFileResult {
+        path: file_path.to_path_buf(),
+        ok: false,
+        counts: DiagnosticCounts {
+            errors: 1,
+            warnings: 0,
+        },
+        compiler_counts: DiagnosticCounts::default(),
+        doc_counts: DiagnosticCounts::default(),
+        syntax_error: true,
+        fatal_error: false,
+    }
+}
+
+/// Fatal-error branch: any non-compile, non-syntax failure (I/O, etc.).
+///
+/// The aggregate contribution is exactly one error per file.
+fn lint_fatal_error(
+    file_path: &Path,
+    e: &anyhow::Error,
+) -> LintFileResult {
+    println!(
+        "{} {}:
+{}",
+        Emoji::new("🚨", "Errors"),
+        file_path.display(),
+        style(e).red()
+    );
+    LintFileResult {
+        path: file_path.to_path_buf(),
+        ok: false,
+        counts: DiagnosticCounts {
+            errors: 1,
+            warnings: 0,
+        },
+        compiler_counts: DiagnosticCounts::default(),
+        doc_counts: DiagnosticCounts::default(),
+        syntax_error: false,
+        fatal_error: true,
+    }
+}
+
+/// Print the success/error emoji + file path line for one lint result.
+fn print_path_line(result: &LintFileResult) {
+    let (emoji, fallback) = if result.ok {
+        ("✅", "Success")
+    } else {
+        ("🚨", "Errors")
+    };
+    println!(
+        "{} {}",
+        Emoji::new(emoji, fallback),
+        style(result.path.display()).bold()
+    );
 }
 
 /// Run the `--doc` documentation linting pass against the compiled
@@ -376,43 +552,87 @@ fn spacing_diagnostics(
 const CDDL_FILE_EXTENSION: &str = "cddl";
 
 /// Returns directory entries sorted by path for deterministic processing.
-fn sorted_dir_entries(dir_path: &PathBuf) -> anyhow::Result<Vec<DirEntry>> {
+fn sorted_dir_entries(dir_path: &Path) -> anyhow::Result<Vec<DirEntry>> {
     let mut entries = std::fs::read_dir(dir_path)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(std::fs::DirEntry::path);
     Ok(entries)
 }
 
-/// Check the directory, prints any errors into the stdout.
+/// Check the directory tree (compatibility wrapper).
+///
+/// Returns `true` iff every `.cddl` file in the tree lints cleanly.
+/// The aggregate summary line is only printed when `--summary` is
+/// passed via `opts`.
 pub(crate) fn check_dir_with_print(
-    dir_path: &PathBuf,
+    dir_path: &Path,
     opts: &LintRunOptions,
 ) -> bool {
-    let fun = |dir_path| -> anyhow::Result<bool> {
-        let mut res = true;
-        for entry in sorted_dir_entries(dir_path)? {
-            let path = entry.path();
-            if path.is_file() && path.extension().is_some_and(|e| e.eq(CDDL_FILE_EXTENSION)) {
-                res &= check_file_with_print(&path, opts);
-            } else if path.is_dir() {
-                res &= check_dir_with_print(&path, opts);
-            }
-        }
-        Ok(res)
-    };
+    lint_dir(dir_path, opts).ok()
+}
 
-    match fun(dir_path) {
-        Ok(ok) => ok,
-        Err(e) => {
-            println!(
-                "{} {}:
+/// Walk a directory tree, lint each `.cddl` file, and accumulate totals.
+///
+/// Per-file output is printed in [`FilePrintMode::RecursiveItem`] mode
+/// (one emoji+path line each, no per-file summary or stats). If
+/// `--summary` was requested, a single "Recursive lint summary:" line is
+/// emitted at the very end of the walk so users see one clear total
+/// instead of one summary per file.
+pub(crate) fn lint_dir(
+    dir_path: &Path,
+    opts: &LintRunOptions,
+) -> LintAggregateResult {
+    let mut aggregate = LintAggregateResult::default();
+    if let Err(e) = lint_dir_inner(dir_path, opts, &mut aggregate) {
+        println!(
+            "{} {}:
 {}",
-                Emoji::new("🚨", "Errors"),
-                dir_path.display(),
-                style(e).red()
-            );
-            false
-        },
+            Emoji::new("🚨", "Errors"),
+            dir_path.display(),
+            style(&e).red()
+        );
+        aggregate.failed_files = aggregate.failed_files.saturating_add(1);
+        aggregate.counts.errors = aggregate.counts.errors.saturating_add(1);
     }
+    if opts.print.print_summary() {
+        println!(
+            "{}",
+            style(format!(
+                "Recursive lint summary: {} file(s), {} failed, {} clean, {} error(s), {} warning(s)",
+                aggregate.files,
+                aggregate.failed_files,
+                aggregate.clean_files(),
+                aggregate.counts.errors,
+                aggregate.counts.warnings
+            ))
+            .dim()
+        );
+    }
+    aggregate
+}
+
+/// Walk one level of `dir_path`, linting each `.cddl` file in
+/// `RecursiveItem` mode and accumulating counts into `aggregate`.
+///
+/// Subdirectories are recursed into; non-CDDL files are skipped.
+fn lint_dir_inner(
+    dir_path: &Path,
+    opts: &LintRunOptions,
+    aggregate: &mut LintAggregateResult,
+) -> anyhow::Result<()> {
+    for entry in sorted_dir_entries(dir_path)? {
+        let path = entry.path();
+        if path.is_file() && path.extension().is_some_and(|e| e.eq(CDDL_FILE_EXTENSION)) {
+            let result = lint_file(&path, opts, FilePrintMode::RecursiveItem);
+            aggregate.files = aggregate.files.saturating_add(1);
+            if !result.ok {
+                aggregate.failed_files = aggregate.failed_files.saturating_add(1);
+            }
+            aggregate.counts = aggregate.counts.combined_with(result.counts);
+        } else if path.is_dir() {
+            lint_dir_inner(&path, opts, aggregate)?;
+        }
+    }
+    Ok(())
 }
 /// Summary statistics emitted for a lint run.
 #[derive(Debug, Default)]
@@ -578,11 +798,11 @@ impl LintStats {
 
 /// Error/warning totals for a lint run.
 #[derive(Debug, Clone, Copy, Default)]
-struct DiagnosticCounts {
+pub(crate) struct DiagnosticCounts {
     /// Number of error diagnostics.
-    errors: usize,
+    pub(crate) errors: usize,
     /// Number of warning diagnostics.
-    warnings: usize,
+    pub(crate) warnings: usize,
 }
 
 impl DiagnosticCounts {
@@ -597,6 +817,28 @@ impl DiagnosticCounts {
             }
         }
         counts
+    }
+
+    /// Returns `true` if any error count is non-zero.
+    #[must_use]
+    pub(crate) fn has_errors(&self) -> bool {
+        self.errors > 0
+    }
+
+    /// Combine two counts using saturating addition per field.
+    ///
+    /// Used in `lint_file` (compiler + doc) and `lint_dir_inner`
+    /// (per-file + running aggregate) without going through `+=` so
+    /// the `arithmetic_side_effects` clippy lint stays quiet.
+    #[must_use]
+    pub(crate) fn combined_with(
+        self,
+        other: Self,
+    ) -> Self {
+        Self {
+            errors: self.errors.saturating_add(other.errors),
+            warnings: self.warnings.saturating_add(other.warnings),
+        }
     }
 
     /// Print the compact summary line.
@@ -665,8 +907,9 @@ mod tests {
     };
 
     use super::{
-        DocLintOptions, FLAG_FAIL_ON_WARNINGS, FLAG_STATS, FLAG_SUMMARY, LintRunOptions,
-        check_dir_with_print, check_file, check_file_with_print, sorted_dir_entries,
+        DocLintOptions, FLAG_FAIL_ON_WARNINGS, FLAG_STATS, FLAG_SUMMARY, FilePrintMode,
+        LintAggregateResult, LintRunOptions, check_dir_with_print, check_file,
+        check_file_with_print, lint_dir, lint_file, sorted_dir_entries,
     };
     use crate::diagnostics::has_error_diagnostics;
 
@@ -2109,6 +2352,278 @@ rule = 1
                 )
             }),
             "fixture must produce at least one splice marker"
+        );
+    }
+
+    // Step 8 (recap, feature 001): the new structured per-file and
+    // directory-aggregate counters must behave correctly even without
+    // touching the printer code paths. The four tests below cover:
+    //   * the combined compiler + doc counts relationship
+    //   * the syntax-error-as-one-error semantics
+    //   * directory aggregates over clean + warning + errored files
+    //   * `--strict` at the directory level failing on a warning
+
+    #[test]
+    fn lint_file_combines_compiler_and_doc_counts() {
+        let path = write_temp_file(
+            "lint_combined_counts.cddl",
+            ";@ CBORK: Library\nwidget = external-value\n",
+        );
+
+        let result = lint_file(
+            &path,
+            &LintRunOptions::from_flags_and_doc(FLAG_SUMMARY, DocLintOptions {
+                enable: true,
+                apply_fixes: false,
+                doc_internal: cbork_cddl_compiler::DocInternalPolicy::No,
+            }),
+            FilePrintMode::SingleFile,
+        );
+
+        let combined = super::DiagnosticCounts {
+            errors: result.compiler_counts.errors + result.doc_counts.errors,
+            warnings: result.compiler_counts.warnings + result.doc_counts.warnings,
+        };
+        assert_eq!(
+            result.counts.errors, combined.errors,
+            "combined errors must equal compiler + doc errors"
+        );
+        assert_eq!(
+            result.counts.warnings, combined.warnings,
+            "combined warnings must equal compiler + doc warnings"
+        );
+
+        let _unused = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn syntax_error_counts_as_one_error() {
+        let path = write_temp_file(
+            "lint_syntax_one_error.cddl",
+            "totally = invalid ) cddl syntax\n",
+        );
+
+        let result = lint_file(
+            &path,
+            &LintRunOptions::from_flags_and_doc(0, DocLintOptions::default_off()),
+            FilePrintMode::SingleFile,
+        );
+
+        assert!(!result.ok, "syntax error must produce ok=false");
+        assert!(result.syntax_error, "syntax_error flag must be set");
+        assert!(!result.fatal_error, "syntax_error must not be fatal_error");
+        assert_eq!(
+            result.counts.errors, 1,
+            "syntax errors contribute exactly 1 error to the aggregate"
+        );
+        assert_eq!(result.counts.warnings, 0);
+        assert_eq!(
+            result.compiler_counts.errors, 0,
+            "we have no diagnostic vec for syntax errors, so compiler_counts stays 0"
+        );
+        assert_eq!(result.doc_counts.errors, 0);
+        assert_eq!(
+            result.compiler_counts.warnings + result.doc_counts.warnings,
+            0
+        );
+
+        let _unused = std::fs::remove_file(&path);
+    }
+
+    fn build_recursive_aggregate_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        let _unused = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp lint dir should exist");
+        dir
+    }
+
+    #[test]
+    fn directory_lint_aggregates_file_counts() {
+        let dir = build_recursive_aggregate_dir("cbork_lint_aggregate_counts");
+        std::fs::write(dir.join("clean.cddl"), "clean = uint\n").expect("write");
+        std::fs::write(
+            dir.join("warn.cddl"),
+            ";@ CBORK: Library\nwidget = external-value\n",
+        )
+        .expect("write");
+        std::fs::write(dir.join("broken.cddl"), "broken ) = cddl\n").expect("write");
+
+        let aggregate = lint_dir(
+            &dir,
+            &LintRunOptions::from_flags_and_doc(0, DocLintOptions::default_off()),
+        );
+
+        assert_eq!(aggregate.files, 3, "three CDDL files were processed");
+        assert_eq!(
+            aggregate.failed_files, 1,
+            "only the syntax-error file is failed"
+        );
+        assert_eq!(aggregate.clean_files(), 2);
+        assert_eq!(
+            aggregate.counts.errors, 1,
+            "exactly one syntax-error contributes to error count"
+        );
+        assert!(
+            aggregate.counts.warnings >= 1,
+            "the unresolved external reference contributes at least one warning"
+        );
+        assert!(
+            !aggregate.ok(),
+            "aggregate with one failing file must report ok=false"
+        );
+    }
+
+    #[test]
+    fn directory_lint_counts_failed_and_clean_files() {
+        let dir = build_recursive_aggregate_dir("cbork_lint_aggregate_mix");
+        std::fs::write(dir.join("clean_a.cddl"), "alpha = uint\n").expect("write");
+        std::fs::write(dir.join("clean_b.cddl"), "beta = uint\n").expect("write");
+        std::fs::write(dir.join("errored.cddl"), "broken ) = cddl\n").expect("write");
+
+        let aggregate = lint_dir(
+            &dir,
+            &LintRunOptions::from_flags_and_doc(0, DocLintOptions::default_off()),
+        );
+
+        assert_eq!(aggregate.files, 3);
+        assert_eq!(aggregate.failed_files, 1);
+        assert_eq!(aggregate.clean_files(), 2);
+        assert_eq!(aggregate.counts.errors, 1);
+        assert_eq!(aggregate.counts.warnings, 0);
+
+        assert!(
+            LintAggregateResult {
+                files: 0,
+                failed_files: 0,
+                counts: super::DiagnosticCounts::default(),
+            }
+            .ok()
+        );
+        assert!(
+            !LintAggregateResult {
+                files: 5,
+                failed_files: 1,
+                counts: super::DiagnosticCounts::default(),
+            }
+            .ok()
+        );
+    }
+
+    #[test]
+    fn strict_directory_lint_fails_on_warning() {
+        let dir = build_recursive_aggregate_dir("cbork_strict_dir_lint");
+        std::fs::write(
+            dir.join("warning.cddl"),
+            ";@ CBORK: Library\nwidget = external-value\n",
+        )
+        .expect("write");
+
+        let aggregate = lint_dir(
+            &dir,
+            &LintRunOptions::from_flags_and_doc(
+                FLAG_FAIL_ON_WARNINGS,
+                DocLintOptions::default_off(),
+            ),
+        );
+
+        assert_eq!(aggregate.files, 1);
+        assert_eq!(
+            aggregate.failed_files, 1,
+            "a warning-only file under --strict must be counted as failed"
+        );
+        assert_eq!(aggregate.clean_files(), 0);
+        assert!(
+            !aggregate.ok(),
+            "the --strict flag must propagate to the aggregate ok() result"
+        );
+    }
+
+    // CLI integration: a recursive `--doc --summary` run must
+    //   * print exactly one final summary line (the "Recursive lint summary:")
+    //   * print zero per-file `Summary:` lines for the items inside the directory
+    //   * preserve exit code semantics that fail on errors / --strict warnings
+    //
+    // The test drives the actual `cbork` binary through `cargo run`, the
+    // same pattern the existing `cli_doc_lint_*` tests use, so it sees
+    // the real stdout without any test-only stdout capture shim.
+
+    fn run_lint_cli(
+        rel: &str,
+        extra_args: &[&str],
+    ) -> (i32, String) {
+        let path = repo_root().join(rel);
+        let mut command = std::process::Command::new(env!("CARGO"));
+        command
+            .arg("run")
+            .arg("--quiet")
+            .arg("--bin")
+            .arg("cbork")
+            .arg("lint")
+            .args(extra_args)
+            .arg("--no-banner")
+            .arg(&path);
+        let output = command.output().expect("run cbork lint");
+        let exit_code = output.status.code().unwrap_or(-1);
+        let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        (exit_code, combined)
+    }
+
+    #[test]
+    fn cli_recursive_lint_summary_is_single_line() {
+        let (code, output) = run_lint_cli("cddl/vectors/project/semantic-errors", &[
+            "--recursive",
+            "--summary",
+        ]);
+        assert_eq!(
+            code, 1,
+            "semantic-errors fixtures contain errors, exit must be 1, got {code}:\n{output}"
+        );
+        let summary_lines: Vec<_> = output
+            .lines()
+            .filter(|line| line.starts_with("Summary:"))
+            .collect();
+        assert_eq!(
+            summary_lines.len(),
+            0,
+            "recursive --summary must not emit any per-file Summary: lines, got:\n{output}"
+        );
+        let recursive_count = output
+            .lines()
+            .filter(|line| line.contains("Recursive lint summary:"))
+            .count();
+        assert_eq!(
+            recursive_count, 1,
+            "exactly one final Recursive lint summary: line is required, got {recursive_count}:\n{output}"
+        );
+    }
+
+    #[test]
+    fn cli_recursive_doc_lint_summary_is_single_line() {
+        let (code, output) = run_lint_cli("cddl/vectors/project/positive/doc_lint", &[
+            "--recursive",
+            "--doc",
+            "--summary",
+        ]);
+        assert_eq!(
+            code, 0,
+            "positive doc_lint fixtures pass under --doc, exit must be 0, got {code}:\n{output}"
+        );
+        let per_file_count = output
+            .lines()
+            .filter(|line| line.starts_with("Summary:"))
+            .count();
+        assert_eq!(
+            per_file_count, 0,
+            "recursive --doc --summary must not emit any per-file Summary: lines, got:\n{output}"
+        );
+        let recursive_count = output
+            .lines()
+            .filter(|line| line.contains("Recursive lint summary:"))
+            .count();
+        assert_eq!(
+            recursive_count, 1,
+            "exactly one final Recursive lint summary: line is required, got {recursive_count}:\n{output}"
         );
     }
 }
