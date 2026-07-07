@@ -656,6 +656,14 @@ struct Validate {
     /// Path to the CBOR input file, or standard input if omitted.
     #[bpaf(positional("PATH"))]
     path: Option<PathBuf>,
+
+    /// Override the validation root to a top-level rule declared in the
+    /// schema file. Must name a concrete, non-generic rule; the rule
+    /// must originate from the schema file passed to `validate` and may
+    /// not come from `include`, `import`, the standard postlude, or a
+    /// generic template.
+    #[bpaf(long("type"), argument("TYPE"))]
+    type_name: Option<String>,
 }
 
 impl Validate {
@@ -669,6 +677,7 @@ impl Validate {
             self.path.as_deref(),
             self.warn,
             self.detailed,
+            self.type_name.as_deref(),
             force_no_color,
         )
     }
@@ -829,6 +838,39 @@ mod tests {
                 assert!(!args.warn);
                 assert_eq!(args.schema, PathBuf::from("schema.cddl"));
                 assert_eq!(args.path, Some(PathBuf::from("input.cbor")));
+                assert_eq!(args.type_name, None);
+            },
+            _ => panic!("expected validate command"),
+        }
+    }
+
+    #[test]
+    fn parses_validate_with_type_override() {
+        // --type selects a validation root and accepts stdin input.
+        let validate_with_type = cli()
+            .run_inner(&["validate", "--type=payload", "schema.cddl"])
+            .expect("validate --type should parse");
+        match validate_with_type.command {
+            Command::Validate(args) => {
+                assert_eq!(args.type_name.as_deref(), Some("payload"));
+                assert_eq!(args.path, None);
+            },
+            _ => panic!("expected validate command"),
+        }
+
+        let validate_with_type_and_path = cli()
+            .run_inner(&[
+                "validate",
+                "--type=signed-message",
+                "schema.cddl",
+                "vector.cbor",
+            ])
+            .expect("validate --type with path should parse");
+        match validate_with_type_and_path.command {
+            Command::Validate(args) => {
+                assert_eq!(args.type_name.as_deref(), Some("signed-message"));
+                assert_eq!(args.schema, PathBuf::from("schema.cddl"));
+                assert_eq!(args.path, Some(PathBuf::from("vector.cbor")));
             },
             _ => panic!("expected validate command"),
         }

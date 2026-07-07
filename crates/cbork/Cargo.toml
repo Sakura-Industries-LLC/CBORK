@@ -1,6 +1,6 @@
 [package]
 name = "cbork"
-version = "0.0.9"
+version = "0.0.10"
 edition.workspace = true
 rust-version.workspace = true
 license = "AGPL-3.0-only"

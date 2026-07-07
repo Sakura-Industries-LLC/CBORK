@@ -24,9 +24,30 @@ cbork render path/to/schema.cddl
 
 # Validate raw CBOR against a compiled CDDL schema.
 cbork validate --schema path/to/schema.cddl path/to/data.cbor
+
+# Validate against a specific top-level rule declared in the schema.
+cbork validate --type payload path/to/schema.cddl path/to/data.cbor
 ```
 
 `cbork --help` lists every subcommand and option.
+
+### Selecting a validation root with `--type`
+
+`cbork validate` defaults to the first top-level rule in the schema file as the validation root.
+The `--type=<TYPE>` flag overrides that choice with a different top-level rule from the same file:
+
+```shell
+cbork validate --type=payload schema.cddl vector.cbor
+cbork validate --type=signed-message schema.cddl signed-message.cbor
+```
+
+The selected type must be a concrete, non-generic rule declared directly in the schema file passed to `validate`.
+Rules that arrive only through `;# include`, `;# import`, the standard postlude,
+or generic templates (`wrapper<t>`) cannot be selected.
+If a matching rule only exists via include / import / postlude, `cbork validate` exits non-zero and reports the conflicting origin.
+Including `cbork --type` does not change how the schema is compiled, how includes and imports are resolved,
+how warnings are emitted, or how the decoded CBOR is printed; it only changes the root rule the validator starts from.
+Detailed dumps (`--detailed`) annotate the selected root type.
 
 ### Advisory / CI runs with `--no-fail`
 

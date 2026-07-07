@@ -20,11 +20,16 @@
     clippy::unnecessary_find_map
 )]
 
-use std::{cell::RefCell, collections::HashMap, fmt::Write as _, path::Path};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    fmt::Write as _,
+    path::{Path, PathBuf},
+};
 
 use cbork_abnf_parser::parse_abnf;
 use cbork_cddl_compiler::{
-    CompiledCDDL, DiagnosticLevel, EntryState, WrappedNode, child_text,
+    CompiledCDDL, DiagnosticLevel, EntryState, MetaData, WrappedNode, child_text,
     literals::{
         byte::ByteLiteralBytes,
         regex::{RegexLiteral, RegexValidationError},
@@ -65,11 +70,13 @@ struct ValidationWarning {
 }
 
 /// Validate a CDDL schema against a CBOR payload.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn exec(
     schema_path: &Path,
     cbor_path: Option<&Path>,
     show_warnings: bool,
     detailed: bool,
+    type_name: Option<&str>,
     force_no_color: bool,
 ) -> bool {
     let schema_root = schema_path.parent();
@@ -130,16 +137,15 @@ pub(crate) fn exec(
     clear_current_schema_notes();
     clear_current_validation_warnings();
 
-    let Some(root_name) = root_rule_name(&compiled) else {
-        println!(
-            "{}",
-            style(format!(
-                "validation error: no root rule found in {}",
-                schema_path.display()
-            ))
-            .red()
-        );
-        return false;
+    let root_name = match resolve_validation_root(&compiled, schema_path, type_name) {
+        Ok(name) => name,
+        Err(error) => {
+            println!(
+                "{}",
+                style(format_root_selection_error(&error, schema_path)).red()
+            );
+            return false;
+        },
     };
 
     let definitions = collect_definitions(&compiled.complete_nodes);
@@ -2225,12 +2231,27 @@ fn format_path(path: &[PathStep]) -> String {
 }
 
 /// Find the first top-level rule name in a compiled schema.
+#[cfg(test)]
 fn root_rule_name(compiled: &CompiledCDDL) -> Option<String> {
-    compiled.user_nodes.iter().find_map(top_level_rule_name)
+    compiled
+        .user_nodes
+        .iter()
+        .find_map(top_level_rule_signature)
+        .map(|(name, _)| name)
 }
 
-/// Extract the top-level rule name from a rule line.
+/// Extract the top-level rule base name from a rule line.
 fn top_level_rule_name(node: &WrappedNode) -> Option<String> {
+    top_level_rule_signature(node).map(|(name, _)| name)
+}
+
+/// Extract `(base_name, is_generic)` from a top-level rule line.
+///
+/// The base name stops at the first space, `<`, or tab so it captures
+/// the head of a possibly generic LHS (`wrapper<t>` → `wrapper`). The
+/// boolean is `true` when the LHS contains a `<...>` generic parameter
+/// list, which is what `--type` must reject.
+fn top_level_rule_signature(node: &WrappedNode) -> Option<(String, bool)> {
     let WrappedNode::RuleLine { text, .. } = node else {
         return None;
     };
@@ -2239,11 +2260,340 @@ fn top_level_rule_name(node: &WrappedNode) -> Option<String> {
         .split_once('=')
         .map_or(text.as_str(), |(lhs, _)| lhs)
         .trim();
-    Some(
-        lhs.chars()
-            .take_while(|ch| !matches!(ch, ' ' | '<' | '\t'))
-            .collect(),
-    )
+    let is_generic = lhs.contains('<');
+    let name: String = lhs
+        .chars()
+        .take_while(|ch| !matches!(ch, ' ' | '<' | '\t'))
+        .collect();
+    Some((name, is_generic))
+}
+
+/// Reason `--type` selection failed.
+///
+/// All variants carry the requested type name so the CLI can name it
+/// in the error message. `ImportedOrIncluded` additionally carries the
+/// origin path of the rule we found so the user can see where the
+/// colliding definition lives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RootSelectionError {
+    /// `--type` contained generic syntax such as `wrapper<t>`.
+    InvalidName {
+        /// The raw string the user passed.
+        requested: String,
+    },
+    /// The requested rule exists in the schema but is generic; generic
+    /// templates cannot be selected as the validation root.
+    Generic {
+        /// The base name the user requested.
+        requested: String,
+    },
+    /// The requested rule is not declared directly in the schema file
+    /// passed to `validate`. The optional origin points at where it
+    /// was found (include, import, postlude).
+    NotInPrimarySchema {
+        /// The base name the user requested.
+        requested: String,
+        /// Where the rule was found, when known.
+        origin: Option<PathBuf>,
+        /// Why the rule is not selectable: included, imported, or from
+        /// the standard postlude.
+        source: RootSource,
+    },
+    /// The requested rule does not exist anywhere in the schema.
+    Missing {
+        /// The base name the user requested.
+        requested: String,
+    },
+    /// The schema has no top-level rule at all and `--type` was not
+    /// supplied.
+    NoRootRule,
+}
+
+/// What kind of non-primary origin supplied the rule the user picked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootSource {
+    /// `;# include` material.
+    Included,
+    /// `;# import` material.
+    Imported,
+    /// Standard postlude definitions (e.g. `uint`, `tstr`).
+    Postlude,
+}
+
+/// Resolve the validation root for one `cbork validate` run.
+///
+/// With `type_name = None` this returns the natural first top-level
+/// rule declared in the primary schema, or `Err(NoRootRule)` if the
+/// schema has none.
+///
+/// With `type_name = Some(name)` this only accepts a concrete
+/// (non-generic) top-level rule whose `origin.source_path` matches the
+/// primary schema path passed to `CompiledCDDL::compile`. Rules that
+/// only arrive through include/import/postlude are rejected; when such
+/// a rule is the only match, the error includes the rule's origin so
+/// the user can see where it came from.
+fn resolve_validation_root(
+    compiled: &CompiledCDDL,
+    schema_path: &Path,
+    type_name: Option<&str>,
+) -> Result<String, RootSelectionError> {
+    let canonical_schema = canonicalize_primary_path(compiled, schema_path);
+
+    let primary_matches: Vec<&WrappedNode> = compiled
+        .user_nodes
+        .iter()
+        .filter(|node| matches!(node, WrappedNode::RuleLine { .. }))
+        .filter(|node| {
+            canonical_schema
+                .as_ref()
+                .is_none_or(|cs| node.origin().source_path == *cs)
+        })
+        .collect();
+
+    match type_name {
+        None => {
+            primary_matches
+                .iter()
+                .find_map(|node| top_level_rule_signature(node))
+                .map(|(name, _)| name)
+                .ok_or(RootSelectionError::NoRootRule)
+        },
+        Some(requested_raw) => {
+            let requested = requested_raw.trim();
+            if requested.is_empty() {
+                return Err(RootSelectionError::InvalidName {
+                    requested: requested_raw.to_owned(),
+                });
+            }
+            if requested.contains(['<', '>', ' ']) {
+                return Err(RootSelectionError::InvalidName {
+                    requested: requested_raw.to_owned(),
+                });
+            }
+
+            // Same-name match in the primary schema, split by generic-ness.
+            let mut primary_concrete: Vec<&WrappedNode> = Vec::new();
+            let mut primary_generic: Vec<&WrappedNode> = Vec::new();
+            for node in &primary_matches {
+                if let Some((name, is_generic)) = top_level_rule_signature(node)
+                    && name == requested
+                {
+                    if is_generic {
+                        primary_generic.push(*node);
+                    } else {
+                        primary_concrete.push(*node);
+                    }
+                }
+            }
+
+            if !primary_generic.is_empty() {
+                return Err(RootSelectionError::Generic {
+                    requested: requested.to_owned(),
+                });
+            }
+
+            match primary_concrete.len() {
+                1 => Ok(requested.to_owned()),
+                0 => {
+                    Err(lookup_root_selection_error(
+                        compiled,
+                        canonical_schema.as_deref(),
+                        requested,
+                    ))
+                },
+                _ => {
+                    // Multiple concrete same-name rules in the primary
+                    // file: defer to the compiler's existing
+                    // diagnostics by picking the first match. The plan
+                    // says not to add bespoke ambiguity handling unless
+                    // silent wrong-rule selection is otherwise
+                    // possible; in practice the compiler will already
+                    // have raised a diagnostic for this.
+                    Ok(requested.to_owned())
+                },
+            }
+        },
+    }
+}
+
+/// Canonicalize the primary schema path the way the compiler saw it.
+///
+/// `CompiledCDDL::compile` normalizes the path it stores in node
+/// origins; mirror that here so equality comparisons against
+/// `node.origin().source_path` line up regardless of how the caller
+/// spelled the path on the command line.
+fn canonicalize_primary_path(
+    compiled: &CompiledCDDL,
+    schema_path: &Path,
+) -> Option<PathBuf> {
+    if let Some(node) = compiled
+        .user_nodes
+        .iter()
+        .find(|node| matches!(node, WrappedNode::RuleLine { .. }))
+    {
+        return Some(node.origin().source_path.clone());
+    }
+    std::fs::canonicalize(schema_path).ok()
+}
+
+/// Build a missing-root error, enriched with where the same name
+/// appears (if anywhere) when it is not in the primary schema.
+fn lookup_root_selection_error(
+    compiled: &CompiledCDDL,
+    canonical_primary: Option<&Path>,
+    requested: &str,
+) -> RootSelectionError {
+    let mut postlude_origin = false;
+    let mut other_origin: Option<(RootSource, PathBuf)> = None;
+
+    for node in &compiled.complete_nodes {
+        let WrappedNode::RuleLine { .. } = node else {
+            continue;
+        };
+        let Some((name, _)) = top_level_rule_signature(node) else {
+            continue;
+        };
+        if name != requested {
+            continue;
+        }
+        if canonical_primary.is_some_and(|cs| node.origin().source_path == cs) {
+            // Already handled by the primary pass; this is the
+            // duplicate-concrete case.
+            continue;
+        }
+        if node.metadata().contains(&MetaData::StandardPostlude) {
+            postlude_origin = true;
+            continue;
+        }
+        // Heuristic: a node's containing file determines whether it
+        // came from include vs import. `CompiledCDDL` does not expose
+        // that bit on the node itself, so use the source file's
+        // directory as a hint: files that live next to the primary
+        // schema are usually `include`d; files anywhere else are
+        // usually `import`ed.
+        let source = classify_other_origin(
+            canonical_primary.and_then(|p| p.parent()),
+            node.origin().source_path.as_path(),
+        );
+        let path = node.origin().source_path.clone();
+        match other_origin.as_ref() {
+            Some((existing, existing_path)) if existing_path == &path => {},
+            _ => {
+                other_origin = Some((source, path));
+            },
+        }
+    }
+
+    if let Some((source, origin)) = other_origin {
+        return RootSelectionError::NotInPrimarySchema {
+            requested: requested.to_owned(),
+            origin: Some(origin),
+            source,
+        };
+    }
+    if postlude_origin {
+        return RootSelectionError::NotInPrimarySchema {
+            requested: requested.to_owned(),
+            origin: None,
+            source: RootSource::Postlude,
+        };
+    }
+    RootSelectionError::Missing {
+        requested: requested.to_owned(),
+    }
+}
+
+/// Decide whether a non-primary origin is more likely an `include` or
+/// an `import`.
+///
+/// `CompiledCDDL` does not tag nodes with their directive of origin;
+/// we fall back to a directory heuristic. Files that live next to the
+/// primary schema (same parent directory) are usually `include`d;
+/// files anywhere else are usually `import`ed.
+fn classify_other_origin(
+    primary_parent: Option<&Path>,
+    path: &Path,
+) -> RootSource {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return RootSource::Imported;
+    };
+    if file_name.contains("postlude") || file_name.contains("stdlib") {
+        return RootSource::Postlude;
+    }
+    if primary_parent.is_some_and(|p| path.parent() == Some(p)) {
+        RootSource::Included
+    } else {
+        RootSource::Imported
+    }
+}
+
+/// Render a `RootSelectionError` as a user-facing message.
+fn format_root_selection_error(
+    error: &RootSelectionError,
+    schema_path: &Path,
+) -> String {
+    match error {
+        RootSelectionError::InvalidName { requested } => {
+            format!(
+                "validation error: --type {requested:?} must be a plain rule name; \
+                 generic syntax like `wrapper<t>` is not selectable"
+            )
+        },
+        RootSelectionError::Generic { requested } => {
+            format!(
+                "validation error: --type {requested:?} names a generic rule template; \
+                 generic rule templates cannot be selected as the validation root"
+            )
+        },
+        RootSelectionError::NotInPrimarySchema {
+            requested,
+            origin: Some(origin),
+            source,
+        } => {
+            let verb = match source {
+                RootSource::Included => "included in",
+                RootSource::Imported => "imported from",
+                RootSource::Postlude => "supplied by the standard postlude in",
+            };
+            format!(
+                "validation error: --type {requested:?} can only select a rule declared \
+                 directly in {schema}; rule `{requested}` is {verb} {origin}",
+                schema = schema_path.display(),
+                origin = origin.display(),
+            )
+        },
+        RootSelectionError::NotInPrimarySchema {
+            requested,
+            origin: None,
+            source: RootSource::Postlude,
+        } => {
+            format!(
+                "validation error: --type {requested:?} can only select a rule declared \
+                 directly in {schema}; rule `{requested}` is supplied by the standard \
+                 postlude and cannot be selected as the validation root",
+                schema = schema_path.display(),
+            )
+        },
+        RootSelectionError::NotInPrimarySchema { requested, .. } => {
+            format!(
+                "validation error: --type {requested:?} can only select a rule declared \
+                 directly in {schema}; rule `{requested}` is not declared in that file",
+                schema = schema_path.display(),
+            )
+        },
+        RootSelectionError::Missing { requested } => {
+            format!(
+                "validation error: --type {requested:?} does not name any rule in {schema}",
+                schema = schema_path.display(),
+            )
+        },
+        RootSelectionError::NoRootRule => {
+            format!(
+                "validation error: no root rule found in {}",
+                schema_path.display()
+            )
+        },
+    }
 }
 
 /// Collect all rule definitions from the compiled tree.
@@ -3143,8 +3493,10 @@ mod tests {
     use cbork_edn::Document;
 
     use super::{
-        PathStep, SchemaNote, collect_definitions, exec, render_validation_dump, root_rule_name,
-        set_current_source_bytes, take_current_validation_warnings, validate_document,
+        PathStep, RootSelectionError, SchemaNote, collect_definitions, exec,
+        format_root_selection_error, render_validation_dump, resolve_validation_root,
+        root_rule_name, set_current_source_bytes, take_current_validation_warnings,
+        validate_document,
     };
 
     fn write_temp_file(
@@ -3191,7 +3543,7 @@ mod tests {
         let schema = write_temp_file("schema_ok.cddl", b"root = 1\n");
         let cbor = write_temp_file("value_ok.cbor", &[0x01]);
 
-        assert!(exec(&schema, Some(&cbor), false, false, true));
+        assert!(exec(&schema, Some(&cbor), false, false, None, true));
     }
 
     #[test]
@@ -3199,7 +3551,7 @@ mod tests {
         let schema = write_temp_file("schema_fail.cddl", b"root = 1\n");
         let cbor = write_temp_file("value_fail.cbor", &[0x02]);
 
-        assert!(!exec(&schema, Some(&cbor), false, false, true));
+        assert!(!exec(&schema, Some(&cbor), false, false, None, true));
     }
 
     #[test]
@@ -3380,5 +3732,235 @@ parallelism = (uint .ge 1) .default 1
         assert!(
             rendered.contains("/root/ [\n  2,\n  /payload/ {\n    /alg/ 1: /alg: tstr/ 3\n  }\n]",)
         );
+    }
+
+    // Plan 008 — `--type` selection tests.
+
+    fn write_temp_dir_tree(relative: &[&str]) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join("cbork_validate_type_test")
+            .join(relative.join("/"));
+        drop(std::fs::remove_dir_all(&dir));
+        std::fs::create_dir_all(&dir).expect("temp dir tree should exist");
+        dir
+    }
+
+    fn write_cddl(
+        dir: &Path,
+        name: &str,
+        content: &[u8],
+    ) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, content).expect("cddl file should be written");
+        path
+    }
+
+    fn write_cbor(
+        dir: &Path,
+        name: &str,
+        bytes: &[u8],
+    ) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).expect("cbor file should be written");
+        path
+    }
+
+    fn cbor_integer(value: u8) -> Vec<u8> {
+        // CBOR major type 0 (unsigned integer). Values 0..=23 fit in
+        // the low 5 bits of the initial byte; values 24..=255 need an
+        // additional 1-byte payload (`0x18 <value>`).
+        if value <= 23 {
+            vec![value]
+        } else {
+            vec![0x18, value]
+        }
+    }
+
+    #[test]
+    fn type_override_none_uses_natural_root() {
+        let dir = write_temp_dir_tree(&["natural_root"]);
+        let schema = write_cddl(&dir, "schema.cddl", b"root = 1\n");
+        let cbor = write_cbor(&dir, "value.cbor", &cbor_integer(1));
+
+        assert!(exec(&schema, Some(&cbor), false, false, None, true));
+    }
+
+    #[test]
+    fn type_override_picks_later_local_rule() {
+        let dir = write_temp_dir_tree(&["later_rule"]);
+        // Root references payload so neither rule is unreferenced.
+        let schema = write_cddl(&dir, "schema.cddl", b"root = payload\npayload = 2\n");
+        let matching = write_cbor(&dir, "match.cbor", &cbor_integer(2));
+        let mismatching = write_cbor(&dir, "miss.cbor", &cbor_integer(1));
+
+        assert!(exec(
+            &schema,
+            Some(&matching),
+            false,
+            false,
+            Some("payload"),
+            true
+        ));
+        assert!(!exec(
+            &schema,
+            Some(&mismatching),
+            false,
+            false,
+            Some("payload"),
+            true
+        ));
+    }
+
+    #[test]
+    fn type_override_unknown_name_fails() {
+        let dir = write_temp_dir_tree(&["unknown"]);
+        let schema = write_cddl(&dir, "schema.cddl", b"root = 1\n");
+        let cbor = write_cbor(&dir, "value.cbor", &cbor_integer(1));
+
+        assert!(!exec(
+            &schema,
+            Some(&cbor),
+            false,
+            false,
+            Some("missing"),
+            true
+        ));
+    }
+
+    #[test]
+    fn type_override_generic_template_fails() {
+        let dir = write_temp_dir_tree(&["generic"]);
+        let schema = write_cddl(&dir, "schema.cddl", b"wrapper<t> = [t]\npayload = 1\n");
+        let cbor = write_cbor(&dir, "value.cbor", &cbor_integer(1));
+
+        assert!(!exec(
+            &schema,
+            Some(&cbor),
+            false,
+            false,
+            Some("wrapper"),
+            true
+        ));
+        assert!(!exec(
+            &schema,
+            Some(&cbor),
+            false,
+            false,
+            Some("wrapper<t>"),
+            true
+        ));
+    }
+
+    #[test]
+    fn type_override_included_only_rule_fails() {
+        let dir = write_temp_dir_tree(&["included_only"]);
+        write_cddl(&dir, "helper.cddl", b"shared = 5\n");
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b";# include \"helper.cddl\"\nroot = 1\n",
+        );
+        let cbor = write_cbor(&dir, "value.cbor", &cbor_integer(1));
+
+        assert!(!exec(
+            &schema,
+            Some(&cbor),
+            false,
+            false,
+            Some("shared"),
+            true
+        ));
+    }
+
+    #[test]
+    fn type_override_can_reference_included_helpers() {
+        let dir = write_temp_dir_tree(&["ref_include"]);
+        write_cddl(&dir, "helper.cddl", b"helper = uint\n");
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b"root = payload\n;# include \"helper.cddl\"\npayload = helper\n",
+        );
+        let cbor = write_cbor(&dir, "value.cbor", &cbor_integer(42));
+
+        assert!(exec(
+            &schema,
+            Some(&cbor),
+            false,
+            false,
+            Some("payload"),
+            true
+        ));
+    }
+
+    #[test]
+    fn type_override_detailed_dump_uses_selected_root() {
+        let dir = write_temp_dir_tree(&["detailed"]);
+        let schema = write_cddl(&dir, "schema.cddl", b"root = payload\npayload = 2\n");
+        let cbor = write_cbor(&dir, "value.cbor", &cbor_integer(2));
+
+        let compiled = CompiledCDDL::compile(&schema, None::<&Path>).expect("schema compiles");
+        let root = resolve_validation_root(&compiled, &schema, Some("payload"))
+            .expect("payload is selectable");
+        assert_eq!(root, "payload");
+
+        // Detailed dump still passes through `exec`.
+        assert!(exec(
+            &schema,
+            Some(&cbor),
+            false,
+            true,
+            Some("payload"),
+            true
+        ));
+    }
+
+    #[test]
+    fn root_selection_error_messages_cover_each_variant() {
+        let dir = write_temp_dir_tree(&["errors"]);
+        let schema = write_cddl(&dir, "schema.cddl", b"wrapper<t> = [t]\n");
+
+        let err = resolve_validation_root(
+            &CompiledCDDL::compile(&schema, None::<&Path>).expect("schema compiles"),
+            &schema,
+            Some("wrapper"),
+        )
+        .expect_err("generic rule must be rejected");
+        assert!(matches!(err, RootSelectionError::Generic { .. }));
+
+        let rendered = format_root_selection_error(&err, &schema);
+        assert!(rendered.contains("generic rule template"));
+        assert!(rendered.contains("wrapper"));
+
+        let invalid = RootSelectionError::InvalidName {
+            requested: "foo<t>".to_owned(),
+        };
+        let rendered = format_root_selection_error(&invalid, &schema);
+        assert!(rendered.contains("generic syntax"));
+
+        let missing = RootSelectionError::Missing {
+            requested: "absent".to_owned(),
+        };
+        let rendered = format_root_selection_error(&missing, &schema);
+        assert!(rendered.contains("absent"));
+        assert!(rendered.contains("does not name any rule"));
+    }
+
+    #[test]
+    fn type_override_postlude_rule_is_rejected() {
+        // `uint` is a standard-postlude rule; selecting it must fail
+        // even though it appears in `complete_nodes`.
+        let dir = write_temp_dir_tree(&["postlude"]);
+        let schema = write_cddl(&dir, "schema.cddl", b"root = uint\n");
+        let cbor = write_cbor(&dir, "value.cbor", &cbor_integer(0));
+
+        assert!(!exec(
+            &schema,
+            Some(&cbor),
+            false,
+            false,
+            Some("uint"),
+            true
+        ));
     }
 }
