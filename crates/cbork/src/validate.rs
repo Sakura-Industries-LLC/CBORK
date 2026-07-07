@@ -1079,9 +1079,14 @@ fn validate_ctlop_value(
         ".lt" | ".le" | ".gt" | ".ge" => {
             validate_ordering_rhs(compiled, rhs, op, value, path, issues);
         },
-        ".default" => {
-            // Defaults affect omitted values. If a value is present and the
-            // LHS matched, there is nothing else to validate at this layer.
+        ".eq" | ".ne" => {
+            validate_equality_rhs(compiled, rhs, op, value, path, issues);
+        },
+        ".default" | ".within" | ".feature" => {
+            // Defaults affect omitted values, and `.within` is a compile-time
+            // subtype constraint. `.feature` is advisory in cbork because
+            // validation has no feature selection context. If the LHS matched,
+            // runtime validation has nothing else to check for these operators.
         },
         ".x-enc" | ".x-hash" => {
             // Plain `.x-enc` and `.x-hash` are annotations on the carrier bytes here.
@@ -1520,6 +1525,44 @@ fn validate_ordering_rhs(
             format!("number {op} {expected}"),
             actual.to_string(),
             Some("ordering constraint failed".to_owned()),
+        ));
+    }
+    ok
+}
+
+/// Validate equality control operators such as `.eq` and `.ne`.
+fn validate_equality_rhs(
+    compiled: &CompiledCDDL,
+    rhs: &WrappedNode,
+    op: &str,
+    value: &Value,
+    path: &mut Vec<PathStep>,
+    issues: &mut Vec<ValidationIssue>,
+) -> bool {
+    let expected = resolve_value_rhs(compiled, rhs).or_else(|| parse_value_from_node(rhs));
+    let Some(expected) = expected else {
+        issues.push(ValidationIssue::new(
+            path.clone(),
+            "a literal equality operand",
+            format!("{value}"),
+            Some(format!("{op} RHS did not resolve to a literal value")),
+        ));
+        return false;
+    };
+
+    let equal = values_equal(value, &expected);
+    let ok = match op {
+        ".eq" => equal,
+        ".ne" => !equal,
+        _ => false,
+    };
+
+    if !ok {
+        issues.push(ValidationIssue::new(
+            path.clone(),
+            format!("value {op} {expected}"),
+            format!("{value}"),
+            Some("equality constraint failed".to_owned()),
         ));
     }
     ok
@@ -3268,12 +3311,27 @@ fn resolve_number_rhs(
     }
 }
 
+/// Resolve the RHS of an equality control operator to a value if possible.
+fn resolve_value_rhs(
+    compiled: &CompiledCDDL,
+    node: &WrappedNode,
+) -> Option<Value> {
+    let state = resolve_type2_leaf(node, &compiled.resolved_types)?;
+    entry_state_to_value(&state)
+}
+
 /// Parse an integer literal from a node.
 fn parse_integer_from_node(node: &WrappedNode) -> Option<i128> {
     match parse_value_literal(node)? {
         EntryState::Integer(value) => Some(value),
         _ => None,
     }
+}
+
+/// Parse a literal value from a node.
+fn parse_value_from_node(node: &WrappedNode) -> Option<Value> {
+    let state = parse_value_literal(node)?;
+    entry_state_to_value(&state)
 }
 
 /// Parse a numeric literal from a node.
@@ -3291,6 +3349,21 @@ fn parse_text_from_node(node: &WrappedNode) -> Option<String> {
         return None;
     };
     String::from_utf8(text.as_ref().to_vec()).ok()
+}
+
+/// Convert a resolved entry state into a CBOR value for equality comparison.
+fn entry_state_to_value(state: &EntryState) -> Option<Value> {
+    match state {
+        EntryState::Integer(value) => (*value).try_into().ok().map(Value::Integer),
+        EntryState::Float(value) => Some(Value::Float(Float::F64(*value))),
+        EntryState::Text(value) => {
+            String::from_utf8(value.as_ref().to_vec())
+                .ok()
+                .map(Value::Text)
+        },
+        EntryState::Bytes(value) => Some(Value::Bytes(value.as_ref().to_vec())),
+        _ => None,
+    }
 }
 
 /// Convert a CBOR value to an integer if possible.
@@ -3363,6 +3436,28 @@ fn numeric_ge(
     match (lhs, rhs) {
         (NumericValue::Integer(lhs), NumericValue::Integer(rhs)) => lhs >= rhs,
         (lhs, rhs) => numeric_as_f64(lhs) >= numeric_as_f64(rhs),
+    }
+}
+
+/// Compare CBOR values for equality-control validation.
+fn values_equal(
+    lhs: &Value,
+    rhs: &Value,
+) -> bool {
+    match (value_to_number(lhs), value_to_number(rhs)) {
+        (Some(lhs), Some(rhs)) => numeric_eq(lhs, rhs),
+        _ => lhs == rhs,
+    }
+}
+
+/// Compare two numeric values for equality.
+fn numeric_eq(
+    lhs: NumericValue,
+    rhs: NumericValue,
+) -> bool {
+    match (lhs, rhs) {
+        (NumericValue::Integer(lhs), NumericValue::Integer(rhs)) => lhs == rhs,
+        (lhs, rhs) => numeric_as_f64(lhs) == numeric_as_f64(rhs),
     }
 }
 
@@ -3666,6 +3761,38 @@ parallelism = (uint .ge 1) .default 1
             validate_schema_bytes("x_enc_annotation.cddl", b"root = bstr .x-enc any\n", &[
                 0x43, b'a', b'b', b'c',
             ]);
+
+        assert!(issues.is_empty(), "{issues:#?}");
+    }
+
+    #[test]
+    fn validate_checks_eq_and_ne_control_operators() {
+        let eq_issues = validate_schema_bytes("eq_operator.cddl", b"root = int .eq 2\n", &[0x02]);
+        let ne_issues = validate_schema_bytes("ne_operator.cddl", b"root = int .ne 2\n", &[0x03]);
+
+        assert!(eq_issues.is_empty(), "{eq_issues:#?}");
+        assert!(ne_issues.is_empty(), "{ne_issues:#?}");
+    }
+
+    #[test]
+    fn validate_rejects_failed_eq_control_operator() {
+        let issues = validate_schema_bytes("eq_operator_fail.cddl", b"root = int .eq 2\n", &[0x03]);
+
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.message.as_deref() == Some("equality constraint failed")),
+            "{issues:#?}"
+        );
+    }
+
+    #[test]
+    fn validate_treats_feature_as_advisory() {
+        let issues = validate_schema_bytes(
+            "feature_operator.cddl",
+            b"root = 1 .feature \"draft\"\n",
+            &[0x01],
+        );
 
         assert!(issues.is_empty(), "{issues:#?}");
     }
