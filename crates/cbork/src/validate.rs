@@ -170,7 +170,7 @@ pub(crate) fn exec(
             }
         } else {
             println!(
-                "{} {} == {} : OK",
+                "{} {} {} : OK",
                 schema_path.display(),
                 style("==").dim(),
                 input_path,
