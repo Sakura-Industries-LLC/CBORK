@@ -1,6 +1,6 @@
 [package]
 name = "cbork"
-version = "0.0.12"
+version = "0.0.13"
 edition.workspace = true
 rust-version.workspace = true
 license = "AGPL-3.0-only"
@@ -23,7 +23,7 @@ cbork-cddl-compiler = { path = "../cbork-cddl-compiler", version = "0.0.5" }
 cbork-edn = { path = "../cbork-edn", version = "0.0.1" }
 anyhow = "1.0"
 build-info = "0.0.45"
-console = "0.16.3"
+console = "0.16.4"
 bpaf = { version = "0.9.26", features = ["derive"] }
 ignore = "0.4.27"
 

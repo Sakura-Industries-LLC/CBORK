@@ -168,9 +168,15 @@ pub(crate) fn exec(
             } else {
                 println!("{}", style(dump).dim());
             }
+        } else {
+            println!(
+                "{} {} == {} : OK",
+                schema_path.display(),
+                style("==").dim(),
+                input_path,
+            );
         }
         print_validation_warnings(&validation_warnings);
-        println!("OK");
         return true;
     }
 
