@@ -2748,6 +2748,24 @@ fn map_entry_matches(
     re_entry: &MapEntry,
     defs: &DefinitionMap,
 ) -> bool {
+    if let ResolvedType::Socket { name } = &le_entry.key {
+        let lhs_entries = socket_choice_entries(name, defs);
+        if !lhs_entries.is_empty() {
+            return lhs_entries
+                .iter()
+                .all(|lhs_entry| map_entry_matches(lhs_entry, re_entry, defs));
+        }
+    }
+
+    if let ResolvedType::Socket { name } = &re_entry.key {
+        let rhs_entries = socket_choice_entries(name, defs);
+        if !rhs_entries.is_empty() {
+            return rhs_entries
+                .iter()
+                .any(|rhs_entry| map_entry_matches(le_entry, rhs_entry, defs));
+        }
+    }
+
     subtype_conflicts(&le_entry.key, &re_entry.key, defs).is_empty()
         && subtype_conflicts(&le_entry.value, &re_entry.value, defs).is_empty()
 }
@@ -2902,9 +2920,9 @@ fn unwrap_single_array(ty: &ResolvedType) -> &ResolvedType {
     }
 }
 
-/// Expand socket-keyed entries in a map to their concrete representative
-/// choice (first variant).  Socket plugs in maps are choices, not unions,
-/// so only one variant is needed for structural checking.
+/// Expand resolvable named map entries while preserving socket-keyed
+/// entries as choices. Socket plugs in maps are alternatives; selecting
+/// only the first arm would make later concrete arms fail `.within`.
 fn expand_map_sockets(
     entries: &[MapEntry],
     defs: &DefinitionMap,
@@ -2912,29 +2930,8 @@ fn expand_map_sockets(
     let mut expanded: Vec<MapEntry> = Vec::new();
     for entry in entries {
         if let ResolvedType::Socket { name } = &entry.key {
-            // Try //= socket plug expansion first
-            if let Some(choices) = defs.socket_choices_for(name)
-                && let Some(choice) = choices.first()
-            {
-                let inner = unwrap_single_array(choice);
-                if let ResolvedType::Map {
-                    entries: choice_entries,
-                } = inner
-                {
-                    for ce in choice_entries {
-                        let mut flat_entry = ce.clone();
-                        if flat_entry.occurrence == Occurrence::One {
-                            flat_entry.occurrence = entry.occurrence;
-                        }
-                        expanded.push(flat_entry);
-                    }
-                } else {
-                    expanded.push(MapEntry {
-                        key: entry.key.clone(),
-                        value: inner.clone(),
-                        occurrence: entry.occurrence,
-                    });
-                }
+            if defs.socket_choices_for(name).is_some() {
+                expanded.push(entry.clone());
                 continue;
             }
             // Fallback: resolve via deep named resolution
@@ -2950,6 +2947,50 @@ fn expand_map_sockets(
         expanded.push(entry.clone());
     }
     expanded
+}
+
+/// Return all concrete map entries exposed by a group socket's plug choices.
+fn socket_choice_entries(
+    name: &str,
+    defs: &DefinitionMap,
+) -> Vec<MapEntry> {
+    let mut entries = Vec::new();
+    let Some(choices) = defs.socket_choices_for(name) else {
+        return entries;
+    };
+
+    for choice in choices {
+        collect_choice_map_entries(choice, &Occurrence::One, &mut entries);
+    }
+
+    entries
+}
+
+/// Collect concrete entries from a resolved group/socket choice arm.
+fn collect_choice_map_entries(
+    ty: &ResolvedType,
+    parent_occ: &Occurrence,
+    entries: &mut Vec<MapEntry>,
+) {
+    match unwrap_single_array(ty) {
+        ResolvedType::Map {
+            entries: choice_entries,
+        } => {
+            for entry in choice_entries {
+                let mut flat_entry = entry.clone();
+                if flat_entry.occurrence == Occurrence::One {
+                    flat_entry.occurrence = *parent_occ;
+                }
+                entries.push(flat_entry);
+            }
+        },
+        ResolvedType::Choice(alts) => {
+            for alt in alts {
+                collect_choice_map_entries(alt, parent_occ, entries);
+            }
+        },
+        _ => {},
+    }
 }
 
 /// Render a [`ResolvedType`] as a human-readable CDDL-like string.
@@ -4371,6 +4412,35 @@ mod tests {
             },
             other => panic!("ed25519_sig should be a Control .size 64, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn map_socket_choice_accepts_later_plug_arm_within() {
+        let source = concat!(
+            "root = lhs .within rhs\n",
+            "lhs = { ed25519 => ed25519_sig, ml-dsa-65 => ml-dsa-65_sig }\n",
+            "rhs = { ed25519 => ed25519_sig, one-pq-signature }\n",
+            "one-pq-signature //= (ml-dsa-44 => ml-dsa-44_sig)\n",
+            "one-pq-signature //= (ml-dsa-65 => ml-dsa-65_sig)\n",
+            "one-pq-signature //= (ml-dsa-87 => ml-dsa-87_sig)\n",
+            "ed25519 = -19\n",
+            "ml-dsa-44 = -48\n",
+            "ml-dsa-65 = -49\n",
+            "ml-dsa-87 = -50\n",
+            "ed25519_sig = bstr .size 64\n",
+            "ml-dsa-44_sig = bstr .size 2420\n",
+            "ml-dsa-65_sig = bstr .size 3309\n",
+            "ml-dsa-87_sig = bstr .size 4627\n",
+        );
+        let nodes = parse_snippet(source);
+        let defs = DefinitionMap::from_nodes(&nodes);
+        let lhs = resolve_definition("lhs", &defs).expect("lhs should resolve");
+        let rhs = resolve_definition("rhs", &defs).expect("rhs should resolve");
+
+        assert!(
+            is_subtype(&lhs, &rhs, &defs).is_ok(),
+            "concrete -49 map entry should match the second socket plug arm"
+        );
     }
 
     // ------------------------------------------------------------------

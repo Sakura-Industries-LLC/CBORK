@@ -4168,7 +4168,7 @@ mod tests {
 
     #[test]
     fn validate_map_group_socket_entry_matches_whole_entry() {
-        let schema = br#"
+        let schema = br"
 root = {
   -19 => bstr .size 32
   one-pq-private-key
@@ -4176,7 +4176,7 @@ root = {
 one-pq-private-key //= (-48 => bstr .size 32)
 one-pq-private-key //= (-49 => bstr .size 32)
 one-pq-private-key //= (-50 => bstr .size 32)
-"#;
+";
         let mut cbor = vec![0xA2, 0x32, 0x58, 0x20];
         cbor.extend([0x61; 32]);
         cbor.extend([0x38, 0x30, 0x58, 0x20]);
@@ -4189,13 +4189,13 @@ one-pq-private-key //= (-50 => bstr .size 32)
 
     #[test]
     fn validation_dump_discards_failed_alternative_labels() {
-        let schema = br#"
+        let schema = br"
 root = [ signature, { bad => bstr .size 2 } ] / [ private_key, { ml-dsa-65 => bstr .size 1 } ]
 signature = 2
 private_key = 2
 bad = -48
 ml-dsa-65 = -49
-"#;
+";
         let cbor = [0x82, 0x02, 0xA1, 0x38, 0x30, 0x41, 0xAA];
 
         let (issues, dump) =
