@@ -24,3 +24,4 @@ cbork-edn = { path = "../cbork-edn", version = "0.0.1" }
 anyhow = "1.0"
 console = "0.16.3"
 bpaf = { version = "0.9.26", features = ["derive"] }
+ignore = "0.4.27"

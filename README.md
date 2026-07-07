@@ -81,6 +81,12 @@ Parse/usage errors that occur before a subcommand runs
 ## Features
 
 * **CDDL linting** — `cbork lint` checks CDDL documents for parse errors, semantic errors, and warnings.
+  Recursive directory scans honor `.gitignore`
+  (including nested files),
+  `.ignore`, Git global excludes, and Git exclude files, skip hidden entries by default, and always skip `.git/`.
+  `--hidden` re-includes hidden entries; `--no-ignore` disables ignore-file filtering for the scan
+  (hidden entries and `.git/` are still honored).
+  Explicit file paths are always linted, even when they would be ignored during a recursive scan.
 * **Effective rendering** — `cbork render` expands named rules, generics, sockets, plug choices,
   and nested control operators into a readable concrete view; the same renderer drives `.within` and `.and` diagnostics.
 * **Custom control operators** — support for the full RFC 8610 / RFC 9165 operator set plus an unofficial CBOR-ecosystem annotation

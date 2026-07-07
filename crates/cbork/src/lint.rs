@@ -4,10 +4,7 @@
 
 //! Lint command execution helpers for the `cbork` CLI.
 
-use std::{
-    fs::DirEntry,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use cbork_cddl_compiler::{
     CompiledCDDL, Diagnostic, DiagnosticLevel, DocInternalPolicy, EntryState, MetaData,
@@ -82,11 +79,45 @@ pub(crate) struct LintRunOptions {
     pub(crate) print: PrintOptions,
     /// Documentation linting options.
     pub(crate) doc: DocLintOptions,
+    /// Recursive directory scan options.
+    pub(crate) scan: RecursiveScanOptions,
+}
+
+/// Options controlling how recursive directory scans discover CDDL files.
+///
+/// `respect_ignore_files` enables `.gitignore`, `.ignore`, Git global
+/// excludes, Git exclude files, and parent-directory ignore discovery.
+/// `include_hidden` controls whether hidden entries (dotfiles and
+/// dot-directories) are surfaced. `.git` directories are always
+/// skipped regardless of these settings.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RecursiveScanOptions {
+    /// Apply ignore-file filtering during recursive scans.
+    pub(crate) respect_ignore_files: bool,
+    /// Include hidden entries during recursive scans.
+    pub(crate) include_hidden: bool,
+}
+
+impl RecursiveScanOptions {
+    /// Defaults match the recursive lint CLI: respect ignore files,
+    /// skip hidden entries.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn default_off() -> Self {
+        Self {
+            respect_ignore_files: true,
+            include_hidden: false,
+        }
+    }
 }
 
 impl LintRunOptions {
     /// Build a `LintRunOptions` from the bitmask form used by the
     /// existing test surface plus a `DocLintOptions`.
+    ///
+    /// Scan options default to respecting ignore files and skipping
+    /// hidden entries.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn from_flags_and_doc(
         flags: u8,
@@ -95,6 +126,25 @@ impl LintRunOptions {
         Self {
             print: PrintOptions { flags },
             doc,
+            scan: RecursiveScanOptions {
+                respect_ignore_files: true,
+                include_hidden: false,
+            },
+        }
+    }
+
+    /// Build a `LintRunOptions` from the bitmask form, a
+    /// `DocLintOptions`, and explicit `RecursiveScanOptions`.
+    #[must_use]
+    pub(crate) fn from_flags_doc_and_scan(
+        flags: u8,
+        doc: DocLintOptions,
+        scan: RecursiveScanOptions,
+    ) -> Self {
+        Self {
+            print: PrintOptions { flags },
+            doc,
+            scan,
         }
     }
 }
@@ -651,11 +701,49 @@ fn spacing_diagnostics(
 /// the CDDL files.
 const CDDL_FILE_EXTENSION: &str = "cddl";
 
-/// Returns directory entries sorted by path for deterministic processing.
-fn sorted_dir_entries(dir_path: &Path) -> anyhow::Result<Vec<DirEntry>> {
-    let mut entries = std::fs::read_dir(dir_path)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(std::fs::DirEntry::path);
-    Ok(entries)
+/// Discover CDDL files under `root` using the `ignore` crate.
+///
+/// Honors `.gitignore`, nested `.gitignore`, `.ignore`, Git global
+/// excludes, Git exclude files, and parent-directory ignore discovery
+/// when `scan.respect_ignore_files` is `true`. Hidden entries are
+/// skipped unless `scan.include_hidden` is `true`. `.git` directories
+/// are always filtered out. The result is deterministically ordered.
+fn discover_cddl_files(
+    root: &Path,
+    scan: RecursiveScanOptions,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        .hidden(!scan.include_hidden)
+        .ignore(scan.respect_ignore_files)
+        .git_ignore(scan.respect_ignore_files)
+        .git_global(scan.respect_ignore_files)
+        .git_exclude(scan.respect_ignore_files)
+        .parents(scan.respect_ignore_files)
+        .sort_by_file_path(std::cmp::Ord::cmp)
+        .filter_entry(|entry| !is_git_dir(entry.path()));
+
+    let mut files = Vec::new();
+    for entry in builder.build() {
+        let entry = entry?;
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let path = entry.into_path();
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq(CDDL_FILE_EXTENSION))
+        {
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
+/// Returns `true` when `path` is (or is contained in) a `.git` directory.
+fn is_git_dir(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == ".git")
 }
 
 /// Check the directory tree (compatibility wrapper).
@@ -682,16 +770,28 @@ pub(crate) fn lint_dir(
     opts: &LintRunOptions,
 ) -> LintAggregateResult {
     let mut aggregate = LintAggregateResult::default();
-    if let Err(e) = lint_dir_inner(dir_path, opts, &mut aggregate) {
-        println!(
-            "{} {}:
+    match discover_cddl_files(dir_path, opts.scan) {
+        Ok(files) => {
+            for path in files {
+                let result = lint_file(&path, opts, FilePrintMode::RecursiveItem);
+                aggregate.files = aggregate.files.saturating_add(1);
+                if !result.ok {
+                    aggregate.failed_files = aggregate.failed_files.saturating_add(1);
+                }
+                aggregate.counts = aggregate.counts.combined_with(result.counts);
+            }
+        },
+        Err(e) => {
+            println!(
+                "{} {}:
 {}",
-            Emoji::new("🚨", "Errors"),
-            dir_path.display(),
-            style(&e).red()
-        );
-        aggregate.failed_files = aggregate.failed_files.saturating_add(1);
-        aggregate.counts.errors = aggregate.counts.errors.saturating_add(1);
+                Emoji::new("🚨", "Errors"),
+                dir_path.display(),
+                style(&e).red()
+            );
+            aggregate.failed_files = aggregate.failed_files.saturating_add(1);
+            aggregate.counts.errors = aggregate.counts.errors.saturating_add(1);
+        },
     }
     if opts.print.print_summary() {
         println!(
@@ -708,31 +808,6 @@ pub(crate) fn lint_dir(
         );
     }
     aggregate
-}
-
-/// Walk one level of `dir_path`, linting each `.cddl` file in
-/// `RecursiveItem` mode and accumulating counts into `aggregate`.
-///
-/// Subdirectories are recursed into; non-CDDL files are skipped.
-fn lint_dir_inner(
-    dir_path: &Path,
-    opts: &LintRunOptions,
-    aggregate: &mut LintAggregateResult,
-) -> anyhow::Result<()> {
-    for entry in sorted_dir_entries(dir_path)? {
-        let path = entry.path();
-        if path.is_file() && path.extension().is_some_and(|e| e.eq(CDDL_FILE_EXTENSION)) {
-            let result = lint_file(&path, opts, FilePrintMode::RecursiveItem);
-            aggregate.files = aggregate.files.saturating_add(1);
-            if !result.ok {
-                aggregate.failed_files = aggregate.failed_files.saturating_add(1);
-            }
-            aggregate.counts = aggregate.counts.combined_with(result.counts);
-        } else if path.is_dir() {
-            lint_dir_inner(&path, opts, aggregate)?;
-        }
-    }
-    Ok(())
 }
 /// Summary statistics emitted for a lint run.
 #[derive(Debug, Default)]
@@ -1008,8 +1083,8 @@ mod tests {
 
     use super::{
         DocLintOptions, FLAG_FAIL_ON_WARNINGS, FLAG_STATS, FLAG_SUMMARY, FilePrintMode,
-        LintAggregateResult, LintRunOptions, check_dir_with_print, check_file,
-        check_file_with_print, lint_dir, lint_file, sorted_dir_entries,
+        LintAggregateResult, LintRunOptions, RecursiveScanOptions, check_dir_with_print,
+        check_file, check_file_with_print, discover_cddl_files, lint_dir, lint_file,
     };
     use crate::diagnostics::has_error_diagnostics;
 
@@ -1406,20 +1481,31 @@ mod tests {
     }
 
     #[test]
-    fn sorted_dir_entries_are_stable() {
-        let dir = std::env::temp_dir().join("cbork_lint_sorted_entries");
+    fn discover_cddl_files_keeps_deterministic_order() {
+        let dir = std::env::temp_dir().join("cbork_lint_discovery_order");
+        drop(std::fs::remove_dir_all(&dir));
         std::fs::create_dir_all(&dir).expect("temp dir should exist");
         std::fs::write(dir.join("z-last.cddl"), "z = int\n").expect("file should be written");
         std::fs::write(dir.join("a-first.cddl"), "a = int\n").expect("file should be written");
         std::fs::write(dir.join("m-middle.cddl"), "m = int\n").expect("file should be written");
 
-        let entries = sorted_dir_entries(&dir).expect("directory entries should load");
-        let names = entries
-            .into_iter()
-            .map(|entry| entry.file_name().into_string().expect("utf-8 filename"))
+        let files = discover_cddl_files(&dir, RecursiveScanOptions::default_off())
+            .expect("discovery should succeed");
+        let names = files
+            .iter()
+            .map(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+                    .expect("utf-8 filename")
+            })
             .collect::<Vec<_>>();
 
-        assert_eq!(names, vec!["a-first.cddl", "m-middle.cddl", "z-last.cddl"]);
+        assert_eq!(names, vec![
+            "a-first.cddl".to_owned(),
+            "m-middle.cddl".to_owned(),
+            "z-last.cddl".to_owned()
+        ]);
     }
 
     // Step 2 (Optional documentation linting): marker-misuse warnings.
@@ -3120,6 +3206,268 @@ rule = 1
         assert_ne!(
             code, 0,
             "why for an unknown code without --no-fail must be non-zero, got {code}:\n{output}"
+        );
+    }
+
+    // Plan 002 — recursive discovery honors ignore files.
+    //
+    // These tests build a temp tree that mirrors the fixture layout in
+    // `plans/plan-002-recursive-exclusion.md`:
+    //
+    //     temp/
+    //       .gitignore       -> ignores `generated/`
+    //       .ignore          -> ignores `ignored-by-nested.cddl`
+    //       included.cddl
+    //       generated/ignored.cddl
+    //       nested/.gitignore
+    //       nested/ignored-by-nested.cddl
+    //       nested/included-nested.cddl
+    //       .hidden/hidden.cddl
+    //       .git/must-never-lint.cddl
+    //
+    // Default discovery should return `included.cddl` and
+    // `nested/included-nested.cddl` and nothing else.
+
+    fn build_discovery_fixture(root: &Path) {
+        std::fs::create_dir_all(root).expect("discovery root should exist");
+        std::fs::write(root.join(".gitignore"), "generated/\n")
+            .expect(".gitignore should be written");
+        std::fs::write(root.join(".ignore"), "ignored-by-nested.cddl\n")
+            .expect(".ignore should be written");
+        std::fs::write(root.join("included.cddl"), "included = uint\n")
+            .expect("included.cddl should be written");
+
+        std::fs::create_dir_all(root.join("generated")).expect("generated/ should exist");
+        std::fs::write(
+            root.join("generated").join("ignored.cddl"),
+            "broken ) = cddl\n",
+        )
+        .expect("generated/ignored.cddl should be written");
+
+        std::fs::create_dir_all(root.join("nested")).expect("nested/ should exist");
+        std::fs::write(
+            root.join("nested").join(".gitignore"),
+            "ignored-by-nested.cddl\n",
+        )
+        .expect("nested/.gitignore should be written");
+        std::fs::write(
+            root.join("nested").join("ignored-by-nested.cddl"),
+            "broken ) = cddl\n",
+        )
+        .expect("nested/ignored-by-nested.cddl should be written");
+        std::fs::write(
+            root.join("nested").join("included-nested.cddl"),
+            "included-nested = uint\n",
+        )
+        .expect("nested/included-nested.cddl should be written");
+
+        std::fs::create_dir_all(root.join(".hidden")).expect(".hidden/ should exist");
+        std::fs::write(
+            root.join(".hidden").join("hidden.cddl"),
+            "broken ) = cddl\n",
+        )
+        .expect(".hidden/hidden.cddl should be written");
+
+        std::fs::create_dir_all(root.join(".git")).expect(".git/ should exist");
+        std::fs::write(
+            root.join(".git").join("must-never-lint.cddl"),
+            "broken ) = cddl\n",
+        )
+        .expect(".git/must-never-lint.cddl should be written");
+    }
+
+    fn fresh_discovery_root(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cbork_recursive_discovery_{label}"));
+        drop(std::fs::remove_dir_all(&dir));
+        dir
+    }
+
+    #[test]
+    fn recursive_discovery_respects_gitignore_by_default() {
+        let root = fresh_discovery_root("gitignore_default");
+        build_discovery_fixture(&root);
+
+        let files =
+            discover_cddl_files(&root, RecursiveScanOptions::default_off()).expect("discovery");
+
+        let relative: Vec<String> = files
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&root)
+                    .map_or_else(|_| path.display().to_string(), |p| p.display().to_string())
+            })
+            .collect();
+
+        assert!(
+            relative.iter().all(|name| !name.contains("generated")),
+            "default discovery must skip generated/ via .gitignore, got {relative:?}"
+        );
+        assert!(
+            !relative.iter().any(|name| name.ends_with("ignored.cddl")),
+            "default discovery must skip generated/ignored.cddl via .gitignore, got {relative:?}"
+        );
+    }
+
+    #[test]
+    fn recursive_discovery_respects_ignore_files_by_default() {
+        let root = fresh_discovery_root("ignore_default");
+        build_discovery_fixture(&root);
+
+        let files =
+            discover_cddl_files(&root, RecursiveScanOptions::default_off()).expect("discovery");
+
+        let relative: Vec<String> = files
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&root)
+                    .map_or_else(|_| path.display().to_string(), |p| p.display().to_string())
+            })
+            .collect();
+
+        assert!(
+            !relative
+                .iter()
+                .any(|name| name.ends_with("ignored-by-nested.cddl")),
+            "default discovery must skip nested/ignored-by-nested.cddl via .ignore, got {relative:?}"
+        );
+    }
+
+    #[test]
+    fn recursive_discovery_no_ignore_includes_ignore_matches() {
+        let root = fresh_discovery_root("no_ignore");
+        build_discovery_fixture(&root);
+
+        let opts = RecursiveScanOptions {
+            respect_ignore_files: false,
+            include_hidden: false,
+        };
+        let aggregate = lint_dir(
+            &root,
+            &LintRunOptions::from_flags_doc_and_scan(0, DocLintOptions::default_off(), opts),
+        );
+
+        assert!(
+            !aggregate.ok(),
+            "expected lint to fail once ignored files are re-included, got aggregate {aggregate:?}"
+        );
+        assert!(
+            aggregate.failed_files >= 2,
+            "expected generated/ignored.cddl and nested/ignored-by-nested.cddl to fail, got {aggregate:?}"
+        );
+    }
+
+    #[test]
+    fn recursive_discovery_respects_nested_gitignore() {
+        // Place the fixture inside the workspace under a gitignored
+        // target subdirectory so the `ignore` crate walker walks up and
+        // loads the workspace's own `.gitignore` and `.git` context.
+        // The nested `.gitignore` inside the fixture then excludes
+        // `nested/ignored.cddl` while `nested/included-nested.cddl`
+        // remains visible.
+        let root = repo_root()
+            .join("target")
+            .join("cbork_recursive_discovery_nested_gitignore");
+        drop(std::fs::remove_dir_all(&root));
+        std::fs::create_dir_all(root.join("nested")).expect("nested/ should exist");
+        std::fs::write(root.join("nested").join(".gitignore"), "ignored.cddl\n")
+            .expect("nested/.gitignore should be written");
+        std::fs::write(
+            root.join("nested").join("ignored.cddl"),
+            "broken ) = cddl\n",
+        )
+        .expect("nested/ignored.cddl should be written");
+        std::fs::write(
+            root.join("nested").join("included-nested.cddl"),
+            "included-nested = uint\n",
+        )
+        .expect("nested/included-nested.cddl should be written");
+
+        let files =
+            discover_cddl_files(&root, RecursiveScanOptions::default_off()).expect("discovery");
+        let names: Vec<String> = files
+            .iter()
+            .map(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+                    .expect("utf-8 filename")
+            })
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["included-nested.cddl".to_owned()],
+            "nested .gitignore must exclude ignored.cddl, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn recursive_discovery_hidden_flag_includes_hidden_entries() {
+        let root = fresh_discovery_root("hidden");
+        build_discovery_fixture(&root);
+
+        let default_files =
+            discover_cddl_files(&root, RecursiveScanOptions::default_off()).expect("discovery");
+        assert!(
+            !default_files
+                .iter()
+                .any(|path| path.ends_with(".hidden/hidden.cddl")),
+            "default discovery must skip .hidden/, got {default_files:?}"
+        );
+
+        let hidden_opts = RecursiveScanOptions {
+            respect_ignore_files: true,
+            include_hidden: true,
+        };
+        let hidden_files = discover_cddl_files(&root, hidden_opts).expect("discovery");
+        assert!(
+            hidden_files
+                .iter()
+                .any(|path| path.ends_with(".hidden/hidden.cddl")),
+            "--hidden must include .hidden/hidden.cddl, got {hidden_files:?}"
+        );
+    }
+
+    #[test]
+    fn recursive_discovery_always_skips_git_directory() {
+        let root = fresh_discovery_root("always_skip_git");
+        build_discovery_fixture(&root);
+
+        // Even with --hidden and --no-ignore combined, the .git/ directory
+        // must remain excluded by the entry filter.
+        let opts = RecursiveScanOptions {
+            respect_ignore_files: false,
+            include_hidden: true,
+        };
+        let files = discover_cddl_files(&root, opts).expect("discovery");
+
+        assert!(
+            !files.iter().any(|path| path.starts_with(root.join(".git"))),
+            ".git/ must never be traversed, got {files:?}"
+        );
+        assert!(
+            !files
+                .iter()
+                .any(|path| path.ends_with("must-never-lint.cddl")),
+            ".git/must-never-lint.cddl must never be discovered, got {files:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_ignored_file_still_lints() {
+        // Lint an explicit file path even when it would be skipped during
+        // recursive discovery because it is matched by .ignore.
+        let root = fresh_discovery_root("explicit_ignored");
+        build_discovery_fixture(&root);
+        let target = root.join("nested").join("ignored-by-nested.cddl");
+
+        let ok = check_file_with_print(
+            &target,
+            &LintRunOptions::from_flags_and_doc(0, DocLintOptions::default_off()),
+        );
+        assert!(
+            !ok,
+            "explicit ignored file should still be linted and report its parse error"
         );
     }
 }

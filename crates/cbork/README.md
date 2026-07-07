@@ -44,6 +44,28 @@ Note: parse/usage errors that occur before a subcommand runs
 (for example, an unknown flag rejected by the argument parser) still produce a non-zero exit.
 `--no-fail` only overrides the command-result exit code.
 
+### Recursive `lint` discovery rules
+
+Recursive directory scans honor ignore-file filtering by default:
+
+* `.gitignore` files (including nested ones) are honored.
+* `.ignore` files, Git global excludes, and Git exclude files are honored.
+* Hidden entries (dotfiles and dot-directories) are skipped.
+* `.git` directories are always skipped, even when ignore-file filtering is disabled.
+
+Use these flags to override the defaults:
+
+```shell
+# Include hidden entries that would otherwise be skipped.
+cbork lint --recursive --hidden path/
+
+# Disable ignore-file filtering entirely (hidden entries and .git/ are still honored).
+cbork lint --recursive --no-ignore path/
+```
+
+An explicit file path passed to `cbork lint` is always linted,
+even if it would be skipped by an ignore rule during a recursive scan.
+
 ## License
 
 `cbork` is licensed under `AGPL-3.0-only`.

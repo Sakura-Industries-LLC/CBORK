@@ -288,6 +288,14 @@ struct Lint {
     /// Path to a CDDL file or directory.
     #[bpaf(positional("PATH"))]
     path: PathBuf,
+
+    /// Include hidden entries during recursive directory scans.
+    #[bpaf(long)]
+    hidden: bool,
+
+    /// Do not apply ignore-file rules during recursive directory scans.
+    #[bpaf(long)]
+    no_ignore: bool,
 }
 
 /// Policy for documentation of internal (non-exported) definitions,
@@ -338,6 +346,8 @@ impl Lint {
             || self.why
             || self.library
             || self.doc
+            || self.hidden
+            || self.no_ignore
             || !self.warn.is_empty()
             || !self.deny.is_empty()
             || !self.allow.is_empty();
@@ -359,7 +369,11 @@ impl Lint {
             apply_fixes: self.doc && self.fix,
             doc_internal: self.doc_internal.into(),
         };
-        let opts = lint::LintRunOptions::from_flags_and_doc(flags, doc);
+        let scan = lint::RecursiveScanOptions {
+            respect_ignore_files: !self.no_ignore,
+            include_hidden: self.hidden,
+        };
+        let opts = lint::LintRunOptions::from_flags_doc_and_scan(flags, doc, scan);
         if self.path.is_file() {
             lint::check_file_with_print(&self.path, &opts)
         } else {
