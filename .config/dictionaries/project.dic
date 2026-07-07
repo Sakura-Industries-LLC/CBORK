@@ -170,6 +170,7 @@ formedness
 Formedness
 Fossati
 FOURHEX
+frontmatter
 frsyuki
 fullyear
 Furuhashi
@@ -343,6 +344,7 @@ nodenum
 NONASCII
 no-fail
 nonfin
+nonneg
 NOPAD
 normalised
 noscheme
@@ -374,6 +376,7 @@ pcre
 PCRE
 PCREs
 peekable
+plugname
 Penango
 penintime
 pericarpoidal
@@ -480,7 +483,9 @@ significands
 SIGPLAN
 sint
 SIPHASH
+SPKI
 solidungular
+socketname
 somedir
 sometype
 specms
@@ -511,6 +516,7 @@ Suignard
 superlinear
 supertypes
 summarised
+summarises
 svcrec
 swid
 Takayama

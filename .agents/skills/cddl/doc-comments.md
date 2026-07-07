@@ -1,3 +1,13 @@
+---
+name: cddl-doc-comments
+description: |
+  Use this skill when writing or revising `;!` documentation comments
+  in `.cddl` files that are checked by `cbork lint --doc`. Covers the
+  required file shape (one L1 heading, L2 sections, L3 per definition),
+  definition comments, generic parameter documentation, list
+  indentation, section sizing, and common mistakes.
+---
+
 # CDDL Documentation With cbork
 
 Use this skill when writing or revising documentation comments in `.cddl` files that are checked by `cbork lint --doc`.
