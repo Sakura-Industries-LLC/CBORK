@@ -24,3 +24,26 @@ tasks:
       - "/crates/cbork-utils/**/Cargo.toml"
       - "/Cargo.toml"
       - "/Cargo.lock"
+
+  # Smoke test: ensure `cbork --help` does not panic. bpaf validates the
+  # struct ordering of flags vs positionals at parser-construction time,
+  # which only happens for a real argv parse (not for `bpaf::run_inner`
+  # in the unit tests). Driving the binary here catches the
+  # "all positional and command items must be placed in the right most
+  # position" class of regressions before they reach a user.
+  help-smoke:
+    deps:
+      - "build"
+    command: "bash"
+    args:
+      - "-lc"
+      - "target/release/cbork --help"
+    options:
+      runFromWorkspaceRoot: true
+      runInCI: true
+      outputStyle: "stream"
+    inputs:
+      - "/crates/cbork/**/*.rs"
+      - "/crates/cbork/**/Cargo.toml"
+      - "/Cargo.toml"
+      - "/Cargo.lock"

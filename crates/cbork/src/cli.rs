@@ -285,10 +285,6 @@ struct Lint {
     #[bpaf(long, argument("no|warn|yes"), fallback(DocLintPolicy::No))]
     doc_internal: DocLintPolicy,
 
-    /// Path to a CDDL file or directory.
-    #[bpaf(positional("PATH"))]
-    path: PathBuf,
-
     /// Include hidden entries during recursive directory scans.
     #[bpaf(long)]
     hidden: bool,
@@ -296,6 +292,10 @@ struct Lint {
     /// Do not apply ignore-file rules during recursive directory scans.
     #[bpaf(long)]
     no_ignore: bool,
+
+    /// Path to a CDDL file or directory.
+    #[bpaf(positional("PATH"))]
+    path: PathBuf,
 }
 
 /// Policy for documentation of internal (non-exported) definitions,
@@ -649,14 +649,6 @@ struct Validate {
     #[bpaf(long)]
     detailed: bool,
 
-    /// Path to the CDDL schema file.
-    #[bpaf(positional("SCHEMA"))]
-    schema: PathBuf,
-
-    /// Path to the CBOR input file, or standard input if omitted.
-    #[bpaf(positional("PATH"))]
-    path: Option<PathBuf>,
-
     /// Override the validation root to a top-level rule declared in the
     /// schema file. Must name a concrete, non-generic rule; the rule
     /// must originate from the schema file passed to `validate` and may
@@ -664,6 +656,14 @@ struct Validate {
     /// generic template.
     #[bpaf(long("type"), argument("TYPE"))]
     type_name: Option<String>,
+
+    /// Path to the CDDL schema file.
+    #[bpaf(positional("SCHEMA"))]
+    schema: PathBuf,
+
+    /// Path to the CBOR input file, or standard input if omitted.
+    #[bpaf(positional("PATH"))]
+    path: Option<PathBuf>,
 }
 
 impl Validate {

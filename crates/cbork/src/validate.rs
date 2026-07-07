@@ -29,7 +29,7 @@ use std::{
 
 use cbork_abnf_parser::parse_abnf;
 use cbork_cddl_compiler::{
-    CompiledCDDL, DiagnosticLevel, EntryState, MetaData, WrappedNode, child_text,
+    CompiledCDDL, DiagnosticLevel, EntryState, MetaData, WrappedNode, build_resolution, child_text,
     literals::{
         byte::ByteLiteralBytes,
         regex::{RegexLiteral, RegexValidationError},
@@ -531,11 +531,13 @@ fn validate_type_choice(
             saw_branch = true;
             let mut local_issues = Vec::new();
             let warning_len = validation_warning_count();
+            let note_len = schema_note_count();
             validate_schema_node(compiled, definitions, child, value, path, &mut local_issues);
             if local_issues.is_empty() {
                 return;
             }
             truncate_validation_warnings(warning_len);
+            truncate_current_schema_notes(note_len);
             branch_issues.push(local_issues);
         }
     }
@@ -730,6 +732,7 @@ fn validate_group(
     for grpchoice in group_children(group, "grpchoice") {
         let mut local_issues = Vec::new();
         let warning_len = validation_warning_count();
+        let note_len = schema_note_count();
         if validate_grpchoice_array(
             compiled,
             definitions,
@@ -741,6 +744,7 @@ fn validate_group(
             return;
         }
         truncate_validation_warnings(warning_len);
+        truncate_current_schema_notes(note_len);
         branch_issues.push(local_issues);
     }
 
@@ -953,6 +957,7 @@ fn validate_map_group(
         let mut used = vec![false; entries.len()];
         let mut local_issues = Vec::new();
         let warning_len = validation_warning_count();
+        let note_len = schema_note_count();
         if validate_grpchoice_map(
             compiled,
             definitions,
@@ -961,10 +966,12 @@ fn validate_map_group(
             &mut used,
             path,
             &mut local_issues,
+            true,
         ) {
             return;
         }
         truncate_validation_warnings(warning_len);
+        truncate_current_schema_notes(note_len);
         branch_issues.push(local_issues);
     }
 
@@ -2135,6 +2142,16 @@ fn clear_current_schema_notes() {
     CURRENT_SCHEMA_NOTES.with(|slot| slot.borrow_mut().clear());
 }
 
+/// Count recorded schema notes.
+fn schema_note_count() -> usize {
+    CURRENT_SCHEMA_NOTES.with(|slot| slot.borrow().len())
+}
+
+/// Truncate recorded schema notes after a failed speculative branch.
+fn truncate_current_schema_notes(len: usize) {
+    CURRENT_SCHEMA_NOTES.with(|slot| slot.borrow_mut().truncate(len));
+}
+
 /// Record a validation warning for a path if the same warning is not already present.
 fn record_validation_warning_once(
     path: &[PathStep],
@@ -2303,6 +2320,10 @@ fn top_level_rule_signature(node: &WrappedNode) -> Option<(String, bool)> {
         .split_once('=')
         .map_or(text.as_str(), |(lhs, _)| lhs)
         .trim();
+    if lhs.ends_with('/') {
+        return None;
+    }
+    let lhs = lhs.strip_suffix(':').map_or(lhs, str::trim);
     let is_generic = lhs.contains('<');
     let name: String = lhs
         .chars()
@@ -2886,6 +2907,7 @@ fn validate_grpchoice_map(
     used: &mut [bool],
     path: &[PathStep],
     issues: &mut Vec<ValidationIssue>,
+    require_all_used: bool,
 ) -> bool {
     let Some(grpent_nodes) = extract_grpent_nodes(grpchoice) else {
         issues.push(ValidationIssue::new(
@@ -2909,6 +2931,22 @@ fn validate_grpchoice_map(
         };
         let memberkey = find_memberkey(grpent);
         let occur = grpent_occurrence(grpent);
+
+        if memberkey.is_none() {
+            if !validate_nested_map_group_entry(
+                compiled,
+                definitions,
+                body,
+                occur,
+                entries,
+                used,
+                path,
+                issues,
+            ) {
+                return false;
+            }
+            continue;
+        }
 
         let Some((entry_index, entry)) =
             find_matching_map_entry(compiled, definitions, memberkey, entries, used)
@@ -2954,7 +2992,7 @@ fn validate_grpchoice_map(
         }
     }
 
-    if used.iter().any(|used| !*used) {
+    if require_all_used && used.iter().any(|used| !*used) {
         issues.push(ValidationIssue::new(
             path.to_owned(),
             "no trailing map entries",
@@ -2965,6 +3003,444 @@ fn validate_grpchoice_map(
     }
 
     issues.is_empty()
+}
+
+/// Validate a no-memberkey map `grpent` as a nested group entry.
+fn validate_nested_map_group_entry(
+    compiled: &CompiledCDDL,
+    definitions: &HashMap<String, &WrappedNode>,
+    body: &WrappedNode,
+    occur: &str,
+    entries: &[MapEntry],
+    used: &mut [bool],
+    path: &[PathStep],
+    issues: &mut Vec<ValidationIssue>,
+) -> bool {
+    match occur {
+        "?" => {
+            let _ = try_validate_map_group_body(
+                compiled,
+                definitions,
+                body,
+                entries,
+                used,
+                path,
+                issues,
+            );
+            true
+        },
+        "+" | "*" => {
+            let mut count = 0usize;
+            while try_validate_map_group_body(
+                compiled,
+                definitions,
+                body,
+                entries,
+                used,
+                path,
+                issues,
+            ) {
+                count = count.saturating_add(1);
+            }
+
+            if occur == "+" && count == 0 {
+                issues.push(ValidationIssue::new(
+                    path.to_owned(),
+                    "one or more matching map group entries",
+                    "no match",
+                    Some("required repeated map group entry was missing".to_owned()),
+                ));
+                return false;
+            }
+
+            true
+        },
+        _ => {
+            if try_validate_map_group_body(compiled, definitions, body, entries, used, path, issues)
+            {
+                true
+            } else {
+                issues.push(ValidationIssue::new(
+                    path.to_owned(),
+                    "a matching map group entry",
+                    "no match",
+                    Some("required map group entry was missing".to_owned()),
+                ));
+                false
+            }
+        },
+    }
+}
+
+/// Try a nested map group body, rolling back speculative state on failure.
+fn try_validate_map_group_body(
+    compiled: &CompiledCDDL,
+    definitions: &HashMap<String, &WrappedNode>,
+    body: &WrappedNode,
+    entries: &[MapEntry],
+    used: &mut [bool],
+    path: &[PathStep],
+    issues: &mut Vec<ValidationIssue>,
+) -> bool {
+    let used_before = used.to_vec();
+    let issue_len = issues.len();
+    let warning_len = validation_warning_count();
+    let note_len = schema_note_count();
+
+    if validate_map_group_body(compiled, definitions, body, entries, used, path, issues)
+        && used != used_before.as_slice()
+    {
+        return true;
+    }
+
+    used.copy_from_slice(&used_before);
+    issues.truncate(issue_len);
+    truncate_validation_warnings(warning_len);
+    truncate_current_schema_notes(note_len);
+    false
+}
+
+/// Validate a schema node that appears where CDDL expects a map group entry.
+fn validate_map_group_body(
+    compiled: &CompiledCDDL,
+    definitions: &HashMap<String, &WrappedNode>,
+    body: &WrappedNode,
+    entries: &[MapEntry],
+    used: &mut [bool],
+    path: &[PathStep],
+    issues: &mut Vec<ValidationIssue>,
+) -> bool {
+    match body {
+        WrappedNode::RuleLine { children, .. } => {
+            if let Some(rhs) = find_rhs_node(children) {
+                return validate_map_group_body(
+                    compiled,
+                    definitions,
+                    rhs,
+                    entries,
+                    used,
+                    path,
+                    issues,
+                );
+            }
+            if let Some(group) = node_children_find(body, "group") {
+                return validate_map_group_body(
+                    compiled,
+                    definitions,
+                    group,
+                    entries,
+                    used,
+                    path,
+                    issues,
+                );
+            }
+        },
+        WrappedNode::Syntax {
+            rule,
+            children,
+            text,
+            ..
+        } => {
+            return match rule.as_str() {
+                "grpent" => {
+                    if let Some(group) = node_children_find(body, "group") {
+                        validate_map_group_body(
+                            compiled,
+                            definitions,
+                            group,
+                            entries,
+                            used,
+                            path,
+                            issues,
+                        )
+                    } else {
+                        false
+                    }
+                },
+                "group" => {
+                    validate_map_group_node(
+                        compiled,
+                        definitions,
+                        body,
+                        entries,
+                        used,
+                        path,
+                        issues,
+                    )
+                },
+                "type" => {
+                    validate_map_type_choice(
+                        compiled,
+                        definitions,
+                        children,
+                        entries,
+                        used,
+                        path,
+                        issues,
+                    )
+                },
+                "type1" => {
+                    validate_map_type1(compiled, definitions, children, entries, used, path, issues)
+                },
+                "type2" => {
+                    validate_map_type2(
+                        compiled,
+                        definitions,
+                        body,
+                        children,
+                        entries,
+                        used,
+                        path,
+                        issues,
+                    )
+                },
+                "typename" | "groupname" => {
+                    validate_named_map_group(
+                        compiled,
+                        definitions,
+                        text.trim(),
+                        entries,
+                        used,
+                        path,
+                        issues,
+                    )
+                },
+                _ => false,
+            };
+        },
+        _ => {},
+    }
+
+    false
+}
+
+/// Validate a concrete `group` node in map-entry context.
+fn validate_map_group_node(
+    compiled: &CompiledCDDL,
+    definitions: &HashMap<String, &WrappedNode>,
+    group: &WrappedNode,
+    entries: &[MapEntry],
+    used: &mut [bool],
+    path: &[PathStep],
+    issues: &mut Vec<ValidationIssue>,
+) -> bool {
+    let mut branch_issues = Vec::new();
+    for grpchoice in group_children(group, "grpchoice") {
+        let mut local_used = used.to_vec();
+        let mut local_issues = Vec::new();
+        let warning_len = validation_warning_count();
+        let note_len = schema_note_count();
+        if validate_grpchoice_map(
+            compiled,
+            definitions,
+            grpchoice,
+            entries,
+            &mut local_used,
+            path,
+            &mut local_issues,
+            false,
+        ) && local_used != *used
+        {
+            used.copy_from_slice(&local_used);
+            return true;
+        }
+        truncate_validation_warnings(warning_len);
+        truncate_current_schema_notes(note_len);
+        branch_issues.push(local_issues);
+    }
+
+    if let Some(best) = best_issue_branch(branch_issues) {
+        issues.extend(best);
+    }
+    false
+}
+
+/// Validate map group alternatives.
+fn validate_map_type_choice(
+    compiled: &CompiledCDDL,
+    definitions: &HashMap<String, &WrappedNode>,
+    children: &[WrappedNode],
+    entries: &[MapEntry],
+    used: &mut [bool],
+    path: &[PathStep],
+    issues: &mut Vec<ValidationIssue>,
+) -> bool {
+    let mut saw_branch = false;
+    let mut branch_issues = Vec::new();
+    for child in children {
+        if let WrappedNode::Syntax { rule, .. } = child
+            && rule == "type1"
+        {
+            saw_branch = true;
+            let mut local_used = used.to_vec();
+            let mut local_issues = Vec::new();
+            let warning_len = validation_warning_count();
+            let note_len = schema_note_count();
+            if validate_map_group_body(
+                compiled,
+                definitions,
+                child,
+                entries,
+                &mut local_used,
+                path,
+                &mut local_issues,
+            ) && local_used != *used
+            {
+                used.copy_from_slice(&local_used);
+                return true;
+            }
+            truncate_validation_warnings(warning_len);
+            truncate_current_schema_notes(note_len);
+            branch_issues.push(local_issues);
+        }
+    }
+
+    if !saw_branch {
+        issues.push(ValidationIssue::new(
+            path.to_owned(),
+            "a map group alternative",
+            "empty type",
+            Some("empty map group type choice".to_owned()),
+        ));
+    } else if let Some(best) = best_issue_branch(branch_issues) {
+        issues.extend(best);
+    }
+    false
+}
+
+/// Validate a `type1` node in map-entry context.
+fn validate_map_type1(
+    compiled: &CompiledCDDL,
+    definitions: &HashMap<String, &WrappedNode>,
+    children: &[WrappedNode],
+    entries: &[MapEntry],
+    used: &mut [bool],
+    path: &[PathStep],
+    issues: &mut Vec<ValidationIssue>,
+) -> bool {
+    let mut lhs: Option<&WrappedNode> = None;
+    let mut has_ctlop = false;
+
+    for child in children {
+        if let WrappedNode::Syntax { rule, .. } = child {
+            match rule.as_str() {
+                "type2" if lhs.is_none() => lhs = Some(child),
+                "ctlop" => has_ctlop = true,
+                _ => {},
+            }
+        }
+    }
+
+    if has_ctlop {
+        return false;
+    }
+
+    if let Some(lhs) = lhs {
+        return validate_map_group_body(compiled, definitions, lhs, entries, used, path, issues);
+    }
+
+    false
+}
+
+/// Validate a `type2` node in map-entry context.
+fn validate_map_type2(
+    compiled: &CompiledCDDL,
+    definitions: &HashMap<String, &WrappedNode>,
+    node: &WrappedNode,
+    children: &[WrappedNode],
+    entries: &[MapEntry],
+    used: &mut [bool],
+    path: &[PathStep],
+    issues: &mut Vec<ValidationIssue>,
+) -> bool {
+    if let Some(group) = children
+        .iter()
+        .find(|child| matches!(child, WrappedNode::Syntax { rule, .. } if rule == "group"))
+    {
+        return validate_map_group_body(compiled, definitions, group, entries, used, path, issues);
+    }
+
+    if let Some(name) = children.iter().find_map(|child| {
+        match child {
+            WrappedNode::Syntax { rule, text, .. } if rule == "typename" || rule == "groupname" => {
+                Some(text.trim().to_owned())
+            },
+            _ => None,
+        }
+    }) {
+        return validate_named_map_group(compiled, definitions, &name, entries, used, path, issues);
+    }
+
+    if let Some(group) = node_children_find(node, "group") {
+        return validate_map_group_body(compiled, definitions, group, entries, used, path, issues);
+    }
+
+    false
+}
+
+/// Validate a named rule as a map group entry.
+fn validate_named_map_group(
+    compiled: &CompiledCDDL,
+    definitions: &HashMap<String, &WrappedNode>,
+    name: &str,
+    entries: &[MapEntry],
+    used: &mut [bool],
+    path: &[PathStep],
+    issues: &mut Vec<ValidationIssue>,
+) -> bool {
+    if let Some(node) = definitions.get(name) {
+        return validate_map_group_body(compiled, definitions, node, entries, used, path, issues);
+    }
+
+    let resolution = build_resolution(&compiled.complete_nodes);
+    let plugs = resolution.plugs_for(name);
+    if !plugs.is_empty() {
+        let mut branch_issues = Vec::new();
+        for plug in plugs {
+            let mut local_used = used.to_vec();
+            let mut local_issues = Vec::new();
+            let warning_len = validation_warning_count();
+            let note_len = schema_note_count();
+            if validate_map_group_body(
+                compiled,
+                definitions,
+                plug,
+                entries,
+                &mut local_used,
+                path,
+                &mut local_issues,
+            ) && local_used != *used
+            {
+                used.copy_from_slice(&local_used);
+                return true;
+            }
+            truncate_validation_warnings(warning_len);
+            truncate_current_schema_notes(note_len);
+            branch_issues.push(local_issues);
+        }
+
+        if let Some(best) = best_issue_branch(branch_issues) {
+            issues.extend(best);
+        }
+        return false;
+    }
+
+    if is_socket_name(name) {
+        issues.push(ValidationIssue::new(
+            path.to_owned(),
+            format!("a map entry accepted by socket `{name}`"),
+            "no match",
+            Some("socket has no plugged definitions".to_owned()),
+        ));
+    } else {
+        issues.push(ValidationIssue::new(
+            path.to_owned(),
+            format!("definition `{name}`"),
+            "no match",
+            Some("undefined rule reference".to_owned()),
+        ));
+    }
+    false
 }
 
 /// Find the first map entry that matches a member key.
@@ -3588,10 +4064,10 @@ mod tests {
     use cbork_edn::Document;
 
     use super::{
-        PathStep, RootSelectionError, SchemaNote, collect_definitions, exec,
-        format_root_selection_error, render_validation_dump, resolve_validation_root,
-        root_rule_name, set_current_source_bytes, take_current_validation_warnings,
-        validate_document,
+        PathStep, RootSelectionError, SchemaNote, clear_current_schema_notes, collect_definitions,
+        exec, format_root_selection_error, render_validation_dump, resolve_validation_root,
+        root_rule_name, set_current_source_bytes, take_current_schema_notes,
+        take_current_validation_warnings, validate_document,
     };
 
     fn write_temp_file(
@@ -3627,10 +4103,31 @@ mod tests {
         let definitions = collect_definitions(&compiled.complete_nodes);
         let document = Document::parse(cbor).expect("CBOR should parse");
         set_current_source_bytes(cbor);
+        clear_current_schema_notes();
         super::clear_current_validation_warnings();
         let issues = validate_document(&compiled, &definitions, &root, &document);
         let warnings = take_current_validation_warnings();
         (issues, warnings)
+    }
+
+    fn validate_schema_bytes_with_dump(
+        schema_name: &str,
+        schema: &[u8],
+        cbor: &[u8],
+    ) -> (Vec<super::ValidationIssue>, String) {
+        let schema = write_temp_file(schema_name, schema);
+        let compiled =
+            CompiledCDDL::compile(&schema, None::<&Path>).expect("schema should compile");
+        let root = root_rule_name(&compiled).expect("schema should have root rule");
+        let definitions = collect_definitions(&compiled.complete_nodes);
+        let document = Document::parse(cbor).expect("CBOR should parse");
+        set_current_source_bytes(cbor);
+        clear_current_schema_notes();
+        super::clear_current_validation_warnings();
+        let issues = validate_document(&compiled, &definitions, &root, &document);
+        let notes = take_current_schema_notes();
+        let dump = render_validation_dump(&schema, "input.cbor", &document, &notes, None, false);
+        (issues, dump)
     }
 
     #[test]
@@ -3667,6 +4164,47 @@ mod tests {
         ]);
 
         assert!(issues.is_empty(), "{issues:#?}");
+    }
+
+    #[test]
+    fn validate_map_group_socket_entry_matches_whole_entry() {
+        let schema = br#"
+root = {
+  -19 => bstr .size 32
+  one-pq-private-key
+}
+one-pq-private-key //= (-48 => bstr .size 32)
+one-pq-private-key //= (-49 => bstr .size 32)
+one-pq-private-key //= (-50 => bstr .size 32)
+"#;
+        let mut cbor = vec![0xA2, 0x32, 0x58, 0x20];
+        cbor.extend([0x61; 32]);
+        cbor.extend([0x38, 0x30, 0x58, 0x20]);
+        cbor.extend([0x62; 32]);
+
+        let issues = validate_schema_bytes("map_group_socket_entry.cddl", schema, &cbor);
+
+        assert!(issues.is_empty(), "{issues:#?}");
+    }
+
+    #[test]
+    fn validation_dump_discards_failed_alternative_labels() {
+        let schema = br#"
+root = [ signature, { bad => bstr .size 2 } ] / [ private_key, { ml-dsa-65 => bstr .size 1 } ]
+signature = 2
+private_key = 2
+bad = -48
+ml-dsa-65 = -49
+"#;
+        let cbor = [0x82, 0x02, 0xA1, 0x38, 0x30, 0x41, 0xAA];
+
+        let (issues, dump) =
+            validate_schema_bytes_with_dump("failed_alternative_labels.cddl", schema, &cbor);
+
+        assert!(issues.is_empty(), "{issues:#?}");
+        assert!(dump.contains("/private_key/ 2"), "{dump}");
+        assert!(dump.contains("/ml-dsa-65/ -49"), "{dump}");
+        assert!(!dump.contains("/signature/ 2"), "{dump}");
     }
 
     #[test]
