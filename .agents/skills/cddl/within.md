@@ -102,7 +102,7 @@ and `.within` emits `E030`.
 <!-- rumdl-disable MD040 -->
 
 ```cddl
-; #@ CBORK: Export
+;@ CBORK: Export
 narrow-signed = COSE_Sign<envelope-headers, message-payload-narrow>
                  .within COSE_Sign<envelope-headers, message-payload-wide>
 ```
@@ -114,7 +114,7 @@ narrow-signed = COSE_Sign<envelope-headers, message-payload-narrow>
 <!-- rumdl-disable MD040 -->
 
 ```cddl
-; #@ CBORK: Export
+;@ CBORK: Export
 brotli-only = bstr .x-brotli payload
               .within bstr .x-compressed payload
 ```

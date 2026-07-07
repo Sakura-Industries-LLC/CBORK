@@ -111,7 +111,7 @@ signed-envelope<signatures> = {
 }
 ```
 
-<!-- rumdl-disable MD040 -->
+<!-- rumdl-enable MD040 -->
 
 When you instantiate the generic with a concrete type, the renderer shows the substituted shape,
 which is the easiest way to check that you filled every socket.
@@ -127,7 +127,7 @@ port = uint .le 65535
 nonneg = int .ge 0
 ```
 
-<!-- rumdl-disable MD040 -->
+<!-- rumdl-enable MD040 -->
 
 Do not write `uint .lt 65536` when you mean "16-bit unsigned"
 if the consumer of the schema does not care about the upper bound exactly.
@@ -146,7 +146,7 @@ sha256    = bstr .size 32
 flags     = uint .bits flags-bitmap
 ```
 
-<!-- rumdl-disable MD040 -->
+<!-- rumdl-enable MD040 -->
 
 `.size N` is exact.
 If you mean "up to N", prefer a separate length-bounded rule plus a CDDL-style socket;

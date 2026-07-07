@@ -19,7 +19,7 @@ directives from any other namespace are surfaced as warnings so users notice tha
 | Directive                     | Effect                                                                          |
 | ----------------------------- | ------------------------------------------------------------------------------- |
 | `;@ CBORK: Library`           | Marks this file as a reusable library module. Must appear before any non-comment content. |
-| `;@ CBORK: Export`            | Marks the **next rule** as part of the library's public export surface. The compiler tags the rule with `MetaData::Exported` and records the name in `CompiledCDDL::exported_names`. |
+| `;@ CBORK: Export`            | Marks the **next rule** as part of the library's public export surface. |
 | `;@ CBORK: Extern <name>,...` | Declares names that this library treats as external. Requires `;@ CBORK: Library` in the same file. |
 
 Minimal example:
@@ -107,8 +107,8 @@ that their tool annotation was ignored:
 <!-- rumdl-enable MD040 -->
 
 The recognised CBORK directive set is small and stable.
-If you need a new directive, that is a change in `crates/cbork-cddl-compiler/src/compiled.rs`
-(`parse_cbork_comment` and the `CborkDirective` enum) — not a content-only change to your schema.
+If a schema needs a directive cbork does not recognize,
+treat that as a cbork feature request or tool-version mismatch rather than a content-only schema change.
 
 ## The direct-use export contract
 

@@ -2,7 +2,8 @@
 name: cddl
 description: |
   Use this skill when authoring or revising CDDL (`.cddl`) files in a
-  project that uses cbork for linting, rendering, and validation.
+  project that uses cbork for linting, rendering,
+  validation, diagnostics, and standards lookup.
   This is the router for a focused set of sub-skills; load the
   sub-skill that matches the part of the task you are completing
   and stop there. Do not load every sub-skill for a single change.
@@ -10,7 +11,7 @@ description: |
 
 # CDDL Authoring With cbork
 
-This skill set is a starting point for projects that use cbork.
+This skill set is for projects that write CDDL and use cbork as a developer tool.
 Copy the whole `.agents/skills/cddl/` directory into your own repository,
 edit the `name` and `description` fields to match your project, and add or remove sub-skills as your schema grows.
 
@@ -25,6 +26,8 @@ Do not load more than one sub-skill per change unless the change spans two clear
 | Writing or revising `;!` documentation comments                                | `doc-comments.md`               |
 | Improving the overall style and shape of CDDL rules                            | `clean-cddl.md`                 |
 | Wiring `cbork lint`, `cbork render`, or `cbork validate` into your workflow    | `using-cbork.md`                |
+| Debugging cbork diagnostics or looking up standards rationale                  | `diagnostics-and-reference.md`  |
+| Building validation checks around CBOR test vectors or decoder output          | `validation-vectors.md`         |
 | Adding or changing `;# include` or `;# import` directives                      | `includes-and-imports.md`       |
 | Adding `;@ CBORK: Library`, `Export`, or `Extern`                             | `library-directives.md`         |
 | Writing `.within` subtype constraints                                          | `within.md`                     |
@@ -40,7 +43,9 @@ Each sub-skill is a self-contained reference; do not require the user to read th
 
 * `doc-comments.md` — required file shape, definition comments, generic parameter documentation, list indentation.
 * `clean-cddl.md` — general CDDL style and how cbork's render and lint audit it.
-* `using-cbork.md` — workflow for `cbork lint`, `cbork render`, and `cbork validate` in a real repository.
+* `using-cbork.md` — workflow for `cbork lint`, `cbork render`, and `cbork validate` in a repository.
+* `diagnostics-and-reference.md` — `cbork why`, `cbork xref`, `cbork rfc`, diagnostic triage, JSON output, and strict/advisory runs.
+* `validation-vectors.md` — `cbork validate`, `cbork decode`, stdin/file input, positive and negative vectors, and CI layout.
 * `includes-and-imports.md` — unquoted catalog base names, quoted relative paths, quoted absolute paths.
 * `library-directives.md` — `;@ CBORK: Library` / `Export` / `Extern` and the direct-use export contract.
 * `within.md` — `.within` as a subtyping predicate and the transform-family compatibility matrix.

@@ -4,30 +4,34 @@ description: |
   Use this skill when adding cbork to a project, wiring it into
   pre-commit or CI, or deciding which cbork subcommand (`lint`,
   `render`, `validate`, or `lint --doc`) to run for a given task.
-  Covers the meaning of each subcommand, the `--no-fail` advisory
-  switch, recursive directory mode, and the config-file lookup.
+  Covers the consumer workflow for each subcommand, the `--no-fail`
+  advisory switch, recursive directory mode, strict/advisory runs,
+  and documentation linting policy.
 ---
 
 # Using cbork Effectively
 
-This sub-skill covers the operational side of cbork: which subcommand to run when, how to wire it into CI or pre-commit,
-and how the advisory `--no-fail` mode fits in.
+This sub-skill covers the operational side of using cbork in a repository.
+It explains which subcommand to run when, how to wire cbork into CI or pre-commit, and how the advisory `--no-fail` mode fits in.
 
 ## Choose a subcommand
 
-| Subcommand         | Use it when…                                                                                                       |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------ |
-| `cbork lint FILE`  | You want parse errors, semantic errors, and lint warnings on one or more `.cddl` files.                            |
-| `cbork lint --doc` | You also want the documentation lint pass; required when the file uses `;!` doc comments and is meant to ship.    |
-| `cbork render FILE`| You want the effective CDDL that the compiler actually reasons about (named rules, generics, sockets, plug choices, nested control operators expanded). |
-| `cbork validate --schema FILE DATA` | You have raw CBOR bytes and want to check them against a compiled schema.                          |
+| Subcommand              | Use it when…                                                                                                       |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `cbork lint FILE`       | You want parse errors, semantic errors, and lint warnings on one or more `.cddl` files.                            |
+| `cbork lint --doc FILE` | You also want the documentation lint pass; required when the file uses `;!` doc comments and is meant to ship.     |
+| `cbork render FILE`     | You want the effective CDDL that the compiler actually reasons about (named rules, generics, sockets, plug choices, nested control operators expanded). |
+| `cbork validate SCHEMA DATA` | You have raw CBOR bytes and want to check them against a compiled schema.                                     |
+| `cbork decode DATA`     | You want to inspect raw CBOR in an EDN-like tree before or after validation.                                       |
+| `cbork why CODE`        | You want the standards rationale behind a diagnostic.                                                              |
+| `cbork xref TERM`       | You want to look up a CDDL term, operator, or standards concept.                                                   |
 
 When in doubt, run `cbork lint FILE` first.
 It catches the bulk of mistakes before you reach for `render` or `validate`.
 
 ## Lint modes
 
-`cbork lint` has two modes:
+`cbork lint` has two main modes:
 
 * **Default lint** — parse + semantic checks.
   Run this on every schema file in CI.
@@ -39,6 +43,19 @@ You can pass `--doc` alongside `--recursive` to lint a whole directory's documen
 
 `--recursive` walks a directory and lints every `.cddl` file under it.
 Use this in CI rather than maintaining a hand-written file list.
+
+Use `--strict` when warnings should fail the build.
+Use `--summary` when CI logs should show counts rather than full per-file output.
+Use `--why` when local debugging should include standards rationale blocks inline with diagnostics.
+
+For documentation linting, `--doc-internal no|warn|yes` controls whether private helper rules must have `;!` comments:
+
+* `no` keeps documentation requirements focused on exported or public rules.
+* `warn` reports undocumented private helpers without failing non-strict runs.
+* `yes` treats undocumented private helpers as documentation errors.
+
+Start new projects with `cbork lint --doc --doc-internal warn FILE`.
+Move to `--doc-internal yes` only when the schema is intended to be fully documented as public reference material.
 
 ## Render mode
 
@@ -57,19 +74,22 @@ so a clean render and a clean lint are closely related.
 
 ## Validate mode
 
-`cbork validate --schema FILE DATA` compiles the schema and checks the CBOR bytes in `DATA` against it.
+`cbork validate SCHEMA DATA` compiles the schema and checks the CBOR bytes in `DATA` against it.
 Use it for round-trip tests in CI:
 
 <!-- rumdl-disable MD040 -->
 
 ```shell
-cbork validate --schema schemas/person.cddl test/vectors/person.cbor
+cbork validate schemas/person.cddl test/vectors/person.cbor
 ```
 
 <!-- rumdl-enable MD040 -->
 
 `validate` is the closest thing cbork has to a "did the encoder do its job" check.
 Keep at least one validate run per wire format in your test suite.
+Use `cbork validate --detailed SCHEMA DATA` when the failure is not obvious;
+it prints the decoded CBOR tree so you can compare the value path with the schema path.
+Use `cbork validate --warn SCHEMA DATA` when compiler warnings matter during vector validation and should not be summarized away.
 
 ## CI integration
 
@@ -82,7 +102,7 @@ Two patterns work well:
 ```shell
 cbork lint --recursive schemas/
 cbork lint --doc --recursive schemas/
-cbork render --recursive schemas/ > /dev/null   # exits non-zero on render errors
+find schemas -name '*.cddl' -print -exec cbork render {} \; > /dev/null
 ```
 
 <!-- rumdl-enable MD040 -->
@@ -95,6 +115,7 @@ Use this while you adopt new lint rules across a large schema.
 ```shell
 cbork --no-fail lint --recursive schemas/
 cbork --no-fail lint --doc --recursive schemas/
+cbork --no-fail lint --summary --recursive schemas/
 ```
 
 <!-- rumdl-enable MD040 -->

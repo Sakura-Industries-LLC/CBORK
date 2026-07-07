@@ -19,7 +19,7 @@ and the classification decides how cbork resolves it.
 ### Unquoted base names
 
 A bare identifier (for example `rfc9052`, `rfc8610`) is a *default standard CDDL document*
-and resolves through the compile-time catalog (`cddl/rfc-std/` in the cbork source tree, or its equivalent in your installation).
+and resolves through cbork's bundled standards catalog.
 
 <!-- rumdl-disable MD040 -->
 
