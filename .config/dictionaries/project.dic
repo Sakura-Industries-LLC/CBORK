@@ -303,6 +303,7 @@ mday
 Melnikov
 memberkey
 memchr
+memcost
 Merat
 Mikolai
 mini-cbor
@@ -528,6 +529,7 @@ tdate
 thermonatrite
 thiserror
 Tiloca
+timecost
 tinymist
 tlsv
 Toid

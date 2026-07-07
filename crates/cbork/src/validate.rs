@@ -43,6 +43,7 @@ use crate::{
 thread_local! {
     static CURRENT_SOURCE_BYTES: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     static CURRENT_SCHEMA_NOTES: RefCell<Vec<SchemaNote>> = const { RefCell::new(Vec::new()) };
+    static CURRENT_VALIDATION_WARNINGS: RefCell<Vec<ValidationWarning>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Schema annotation captured during validation for later rendering.
@@ -51,6 +52,15 @@ struct SchemaNote {
     /// Validation path where the note applies.
     path: Vec<PathStep>,
     /// Human-readable annotation text.
+    text: String,
+}
+
+/// Non-failing validation warning captured during traversal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidationWarning {
+    /// Validation path where the warning applies.
+    path: Vec<PathStep>,
+    /// Human-readable warning text.
     text: String,
 }
 
@@ -118,6 +128,7 @@ pub(crate) fn exec(
 
     set_current_source_bytes(&input);
     clear_current_schema_notes();
+    clear_current_validation_warnings();
 
     let Some(root_name) = root_rule_name(&compiled) else {
         println!(
@@ -134,6 +145,7 @@ pub(crate) fn exec(
     let definitions = collect_definitions(&compiled.complete_nodes);
     let issues = validate_document(&compiled, &definitions, &root_name, &document);
     let schema_notes = take_current_schema_notes();
+    let validation_warnings = take_current_validation_warnings();
 
     if issues.is_empty() {
         if detailed {
@@ -151,6 +163,7 @@ pub(crate) fn exec(
                 println!("{}", style(dump).dim());
             }
         }
+        print_validation_warnings(&validation_warnings);
         println!("OK");
         return true;
     }
@@ -174,6 +187,7 @@ pub(crate) fn exec(
         !force_no_color,
     );
     print!("{dump}");
+    print_validation_warnings(&validation_warnings);
 
     for issue in &issues {
         println!(
@@ -237,6 +251,27 @@ enum PathStep {
     MapValue(usize),
     /// Tag payload.
     TagInner,
+}
+
+/// Numeric value used by ordering control-operator validation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum NumericValue {
+    /// Integer value.
+    Integer(i128),
+    /// Floating-point value.
+    Float(f64),
+}
+
+impl std::fmt::Display for NumericValue {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        match self {
+            Self::Integer(value) => write!(f, "{value}"),
+            Self::Float(value) => write!(f, "{value}"),
+        }
+    }
 }
 
 /// Validate the whole parsed document against the root schema rule.
@@ -489,10 +524,12 @@ fn validate_type_choice(
         {
             saw_branch = true;
             let mut local_issues = Vec::new();
+            let warning_len = validation_warning_count();
             validate_schema_node(compiled, definitions, child, value, path, &mut local_issues);
             if local_issues.is_empty() {
                 return;
             }
+            truncate_validation_warnings(warning_len);
             branch_issues.push(local_issues);
         }
     }
@@ -506,7 +543,9 @@ fn validate_type_choice(
             found,
             Some("none of the `type` alternatives matched".to_owned()),
         ));
-        issues.extend(branch_issues.into_iter().flatten());
+        if let Some(best) = best_issue_branch(branch_issues) {
+            issues.extend(best);
+        }
         return;
     }
 
@@ -684,6 +723,7 @@ fn validate_group(
     let mut branch_issues = Vec::new();
     for grpchoice in group_children(group, "grpchoice") {
         let mut local_issues = Vec::new();
+        let warning_len = validation_warning_count();
         if validate_grpchoice_array(
             compiled,
             definitions,
@@ -694,6 +734,7 @@ fn validate_group(
         ) {
             return;
         }
+        truncate_validation_warnings(warning_len);
         branch_issues.push(local_issues);
     }
 
@@ -703,7 +744,9 @@ fn validate_group(
         format!("{value}"),
         Some("none of the group alternatives matched".to_owned()),
     ));
-    issues.extend(branch_issues.into_iter().flatten());
+    if let Some(best) = best_issue_branch(branch_issues) {
+        issues.extend(best);
+    }
 }
 
 /// Validate a `grpent` node.
@@ -841,6 +884,7 @@ fn validate_array_group(
     let mut branch_issues = Vec::new();
     for grpchoice in group_children(group, "grpchoice") {
         let mut local_issues = Vec::new();
+        let warning_len = validation_warning_count();
         if validate_grpchoice_array(
             compiled,
             definitions,
@@ -851,6 +895,7 @@ fn validate_array_group(
         ) {
             return;
         }
+        truncate_validation_warnings(warning_len);
         branch_issues.push(local_issues);
     }
 
@@ -860,7 +905,9 @@ fn validate_array_group(
         format!("{value}"),
         Some("none of the array alternatives matched".to_owned()),
     ));
-    issues.extend(branch_issues.into_iter().flatten());
+    if let Some(best) = best_issue_branch(branch_issues) {
+        issues.extend(best);
+    }
 }
 
 /// Validate a map group against a CBOR map.
@@ -899,6 +946,7 @@ fn validate_map_group(
     for grpchoice in group_children(group, "grpchoice") {
         let mut used = vec![false; entries.len()];
         let mut local_issues = Vec::new();
+        let warning_len = validation_warning_count();
         if validate_grpchoice_map(
             compiled,
             definitions,
@@ -910,6 +958,7 @@ fn validate_map_group(
         ) {
             return;
         }
+        truncate_validation_warnings(warning_len);
         branch_issues.push(local_issues);
     }
 
@@ -919,7 +968,9 @@ fn validate_map_group(
         format!("{value}"),
         Some("no map alternative matched".to_owned()),
     ));
-    issues.extend(branch_issues.into_iter().flatten());
+    if let Some(best) = best_issue_branch(branch_issues) {
+        issues.extend(best);
+    }
 }
 
 /// Validate a `type1` control-operator expression.
@@ -988,6 +1039,12 @@ fn validate_ctlop_value(
         ".regexp" => {
             let _ = validate_regex_rhs(compiled, rhs, value, path, issues);
         },
+        op if is_compression_ctlop(op) => {
+            record_validation_warning_once(
+                path,
+                format!("compression operator `{op}` is not checked during validation yet"),
+            );
+        },
         ".abnf" | ".abnfb" | ".x-enc.abnf" | ".x-enc.abnfb" | ".x-hash.abnf" | ".x-hash.abnfb" => {
             let _ = validate_abnf_rhs(compiled, rhs, value, path, issues);
         },
@@ -1012,6 +1069,19 @@ fn validate_ctlop_value(
                     Some("value is not text".to_owned()),
                 ));
             }
+        },
+        ".lt" | ".le" | ".gt" | ".ge" => {
+            validate_ordering_rhs(compiled, rhs, op, value, path, issues);
+        },
+        ".default" => {
+            // Defaults affect omitted values. If a value is present and the
+            // LHS matched, there is nothing else to validate at this layer.
+        },
+        ".x-enc" | ".x-hash" => {
+            // Plain `.x-enc` and `.x-hash` are annotations on the carrier bytes here.
+            // The LHS validation above already proved the value is acceptable
+            // as a byte string; checking the wrapped value requires algorithm/key
+            // context that CDDL does not carry.
         },
         ".cbor" => {
             let _ = validate_embedded_cbor(compiled, definitions, rhs, value, path, issues, false);
@@ -1398,6 +1468,55 @@ fn validate_abnf_rhs(
             false
         },
     }
+}
+
+/// Validate numeric ordering control operators such as `.ge`.
+fn validate_ordering_rhs(
+    compiled: &CompiledCDDL,
+    rhs: &WrappedNode,
+    op: &str,
+    value: &Value,
+    path: &mut Vec<PathStep>,
+    issues: &mut Vec<ValidationIssue>,
+) -> bool {
+    let expected = resolve_number_rhs(compiled, rhs).or_else(|| parse_number_from_node(rhs));
+    let Some(expected) = expected else {
+        issues.push(ValidationIssue::new(
+            path.clone(),
+            "a numeric comparison bound",
+            format!("{value}"),
+            Some(format!("{op} RHS did not resolve to a number")),
+        ));
+        return false;
+    };
+
+    let Some(actual) = value_to_number(value) else {
+        issues.push(ValidationIssue::new(
+            path.clone(),
+            format!("number {op} {expected}"),
+            format!("{value}"),
+            Some("ordering validation requires a numeric value".to_owned()),
+        ));
+        return false;
+    };
+
+    let ok = match op {
+        ".lt" => numeric_lt(actual, expected),
+        ".le" => numeric_le(actual, expected),
+        ".gt" => numeric_gt(actual, expected),
+        ".ge" => numeric_ge(actual, expected),
+        _ => false,
+    };
+
+    if !ok {
+        issues.push(ValidationIssue::new(
+            path.clone(),
+            format!("number {op} {expected}"),
+            actual.to_string(),
+            Some("ordering constraint failed".to_owned()),
+        ));
+    }
+    ok
 }
 
 /// Validate a resolved semantic state against a CBOR value.
@@ -1967,6 +2086,65 @@ fn clear_current_schema_notes() {
     CURRENT_SCHEMA_NOTES.with(|slot| slot.borrow_mut().clear());
 }
 
+/// Record a validation warning for a path if the same warning is not already present.
+fn record_validation_warning_once(
+    path: &[PathStep],
+    text: String,
+) {
+    if text.trim().is_empty() {
+        return;
+    }
+
+    CURRENT_VALIDATION_WARNINGS.with(|slot| {
+        let mut warnings = slot.borrow_mut();
+        if warnings
+            .iter()
+            .any(|warning| warning.path == path && warning.text == text)
+        {
+            return;
+        }
+        warnings.push(ValidationWarning {
+            path: path.to_vec(),
+            text,
+        });
+    });
+}
+
+/// Print non-failing validation warnings.
+fn print_validation_warnings(warnings: &[ValidationWarning]) {
+    for warning in warnings {
+        println!(
+            "{}",
+            style(format!(
+                "warning: at {}: {}",
+                format_path(&warning.path),
+                warning.text
+            ))
+            .yellow()
+        );
+    }
+}
+
+/// Take all recorded validation warnings.
+fn take_current_validation_warnings() -> Vec<ValidationWarning> {
+    CURRENT_VALIDATION_WARNINGS.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+}
+
+/// Clear the recorded validation warnings.
+fn clear_current_validation_warnings() {
+    CURRENT_VALIDATION_WARNINGS.with(|slot| slot.borrow_mut().clear());
+}
+
+/// Current number of recorded validation warnings.
+fn validation_warning_count() -> usize {
+    CURRENT_VALIDATION_WARNINGS.with(|slot| slot.borrow().len())
+}
+
+/// Truncate validation warnings back to a previous count.
+fn truncate_validation_warnings(len: usize) {
+    CURRENT_VALIDATION_WARNINGS.with(|slot| slot.borrow_mut().truncate(len));
+}
+
 /// Get a note for a particular path.
 fn schema_note_for_path(
     notes: &[SchemaNote],
@@ -2212,21 +2390,28 @@ fn validate_grpchoice_array(
 
         match occur {
             "?" => {
-                if item_index < items.len() {
-                    if let Some(item) = items.get(item_index) {
-                        let mut child_path = path.to_owned();
-                        child_path.push(PathStep::ArrayItem(item_index));
-                        record_schema_note_once(&child_path, schema_summary(body));
-                        validate_schema_node(
-                            compiled,
-                            definitions,
-                            body,
-                            item,
-                            &mut child_path,
-                            issues,
-                        );
+                if item_index < items.len()
+                    && let Some(item) = items.get(item_index)
+                {
+                    let mut child_path = path.to_owned();
+                    child_path.push(PathStep::ArrayItem(item_index));
+                    record_schema_note_once(&child_path, schema_summary(body));
+                    let before = issues.len();
+                    let warning_len = validation_warning_count();
+                    validate_schema_node(
+                        compiled,
+                        definitions,
+                        body,
+                        item,
+                        &mut child_path,
+                        issues,
+                    );
+                    if issues.len() == before {
+                        item_index = item_index.saturating_add(1);
+                    } else {
+                        issues.truncate(before);
+                        truncate_validation_warnings(warning_len);
                     }
-                    item_index = item_index.saturating_add(1);
                 }
             },
             "+" | "*" => {
@@ -2476,6 +2661,47 @@ fn extract_grpent_nodes(node: &WrappedNode) -> Option<Vec<&WrappedNode>> {
     )
 }
 
+/// Pick the most useful failed branch to display after an alternative summary.
+fn best_issue_branch(branches: Vec<Vec<ValidationIssue>>) -> Option<Vec<ValidationIssue>> {
+    branches
+        .into_iter()
+        .filter(|branch| !branch.is_empty())
+        .min_by_key(|branch| {
+            let unsupported = branch
+                .iter()
+                .filter(|issue| {
+                    issue
+                        .message
+                        .as_deref()
+                        .is_some_and(|message| message.contains("not implemented"))
+                })
+                .count();
+            (unsupported, branch.len())
+        })
+}
+
+/// Whether a control operator belongs to the deferred compression-validation family.
+fn is_compression_ctlop(op: &str) -> bool {
+    matches!(
+        op,
+        ".x-compressed"
+            | ".x-compressed.abnf"
+            | ".x-compressed.abnfb"
+            | ".x-brotli"
+            | ".x-brotli.abnf"
+            | ".x-brotli.abnfb"
+            | ".x-zstd"
+            | ".x-zstd.abnf"
+            | ".x-zstd.abnfb"
+            | ".x-gzip"
+            | ".x-gzip.abnf"
+            | ".x-gzip.abnfb"
+            | ".x-deflate"
+            | ".x-deflate.abnf"
+            | ".x-deflate.abnfb"
+    )
+}
+
 /// Parse a simple-value marker such as `null` or `true`.
 fn parse_simple_marker(text: &str) -> Option<&str> {
     match text.trim() {
@@ -2679,10 +2905,32 @@ fn resolve_integer_rhs(
     }
 }
 
+/// Resolve the RHS of a control operator to a number if possible.
+fn resolve_number_rhs(
+    compiled: &CompiledCDDL,
+    node: &WrappedNode,
+) -> Option<NumericValue> {
+    let state = resolve_type2_leaf(node, &compiled.resolved_types)?;
+    match state {
+        EntryState::Integer(value) => Some(NumericValue::Integer(value)),
+        EntryState::Float(value) => Some(NumericValue::Float(value)),
+        _ => None,
+    }
+}
+
 /// Parse an integer literal from a node.
 fn parse_integer_from_node(node: &WrappedNode) -> Option<i128> {
     match parse_value_literal(node)? {
         EntryState::Integer(value) => Some(value),
+        _ => None,
+    }
+}
+
+/// Parse a numeric literal from a node.
+fn parse_number_from_node(node: &WrappedNode) -> Option<NumericValue> {
+    match parse_value_literal(node)? {
+        EntryState::Integer(value) => Some(NumericValue::Integer(value)),
+        EntryState::Float(value) => Some(NumericValue::Float(value)),
         _ => None,
     }
 }
@@ -2709,6 +2957,71 @@ fn value_to_f64(value: &Value) -> Option<f64> {
         Value::Float(Float::F16(value) | Float::F32(value)) => Some(f64::from(*value)),
         Value::Float(Float::F64(value)) => Some(*value),
         _ => None,
+    }
+}
+
+/// Convert a CBOR value to a numeric comparison value if possible.
+fn value_to_number(value: &Value) -> Option<NumericValue> {
+    match value {
+        Value::Integer(int) => Some(NumericValue::Integer(i128::from(*int))),
+        Value::Float(Float::F16(value) | Float::F32(value)) => {
+            Some(NumericValue::Float(f64::from(*value)))
+        },
+        Value::Float(Float::F64(value)) => Some(NumericValue::Float(*value)),
+        _ => None,
+    }
+}
+
+/// Compare two numeric values using CDDL ordering semantics.
+fn numeric_lt(
+    lhs: NumericValue,
+    rhs: NumericValue,
+) -> bool {
+    match (lhs, rhs) {
+        (NumericValue::Integer(lhs), NumericValue::Integer(rhs)) => lhs < rhs,
+        (lhs, rhs) => numeric_as_f64(lhs) < numeric_as_f64(rhs),
+    }
+}
+
+/// Compare two numeric values using CDDL ordering semantics.
+fn numeric_le(
+    lhs: NumericValue,
+    rhs: NumericValue,
+) -> bool {
+    match (lhs, rhs) {
+        (NumericValue::Integer(lhs), NumericValue::Integer(rhs)) => lhs <= rhs,
+        (lhs, rhs) => numeric_as_f64(lhs) <= numeric_as_f64(rhs),
+    }
+}
+
+/// Compare two numeric values using CDDL ordering semantics.
+fn numeric_gt(
+    lhs: NumericValue,
+    rhs: NumericValue,
+) -> bool {
+    match (lhs, rhs) {
+        (NumericValue::Integer(lhs), NumericValue::Integer(rhs)) => lhs > rhs,
+        (lhs, rhs) => numeric_as_f64(lhs) > numeric_as_f64(rhs),
+    }
+}
+
+/// Compare two numeric values using CDDL ordering semantics.
+fn numeric_ge(
+    lhs: NumericValue,
+    rhs: NumericValue,
+) -> bool {
+    match (lhs, rhs) {
+        (NumericValue::Integer(lhs), NumericValue::Integer(rhs)) => lhs >= rhs,
+        (lhs, rhs) => numeric_as_f64(lhs) >= numeric_as_f64(rhs),
+    }
+}
+
+/// Convert a numeric value for mixed integer/float comparisons.
+#[allow(clippy::cast_precision_loss)]
+fn numeric_as_f64(value: NumericValue) -> f64 {
+    match value {
+        NumericValue::Integer(value) => value as f64,
+        NumericValue::Float(value) => value,
     }
 }
 
@@ -2831,7 +3144,7 @@ mod tests {
 
     use super::{
         PathStep, SchemaNote, collect_definitions, exec, render_validation_dump, root_rule_name,
-        validate_document,
+        set_current_source_bytes, take_current_validation_warnings, validate_document,
     };
 
     fn write_temp_file(
@@ -2852,13 +3165,25 @@ mod tests {
         schema: &[u8],
         cbor: &[u8],
     ) -> Vec<super::ValidationIssue> {
+        validate_schema_bytes_with_warnings(schema_name, schema, cbor).0
+    }
+
+    fn validate_schema_bytes_with_warnings(
+        schema_name: &str,
+        schema: &[u8],
+        cbor: &[u8],
+    ) -> (Vec<super::ValidationIssue>, Vec<super::ValidationWarning>) {
         let schema = write_temp_file(schema_name, schema);
         let compiled =
             CompiledCDDL::compile(&schema, None::<&Path>).expect("schema should compile");
         let root = root_rule_name(&compiled).expect("schema should have root rule");
         let definitions = collect_definitions(&compiled.complete_nodes);
         let document = Document::parse(cbor).expect("CBOR should parse");
-        validate_document(&compiled, &definitions, &root, &document)
+        set_current_source_bytes(cbor);
+        super::clear_current_validation_warnings();
+        let issues = validate_document(&compiled, &definitions, &root, &document);
+        let warnings = take_current_validation_warnings();
+        (issues, warnings)
     }
 
     #[test]
@@ -2927,6 +3252,88 @@ mod tests {
                 .iter()
                 .any(|issue| issue.message.as_deref() == Some("undefined rule reference")),
             "{issues:#?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_argon2id_style_hash_and_ordering_ctlops() {
+        let schema = br"
+root = any .dtrm (tagged / untagged)
+tagged = #6.33001(untagged)
+untagged = ([tag] / [tag, options])
+tag = (bstr .x-hash any) .size 32
+options = {
+  ? 1 => memcost,
+  ? 2 => timecost,
+  ? 3 => parallelism,
+  ? 4 => bstr .size 16,
+}
+memcost = (uint .ge 8192) .default 8192
+timecost = (uint .ge 1) .default 1
+parallelism = (uint .ge 1) .default 1
+";
+        let cbor = [
+            0x82, 0x58, 0x20, 0x84, 0x02, 0x3C, 0x41, 0x9A, 0x7D, 0x47, 0xE5, 0x35, 0xF1, 0x6D,
+            0xA0, 0x33, 0x78, 0xD9, 0x5D, 0xE4, 0xA2, 0xDD, 0xBB, 0x37, 0xF8, 0x5D, 0x2A, 0xCB,
+            0xAA, 0x21, 0xEA, 0xD6, 0xED, 0x88, 0x9C, 0xA4, 0x01, 0x1A, 0x00, 0x01, 0x00, 0x00,
+            0x02, 0x03, 0x03, 0x04, 0x04, 0x50, 0xAD, 0x2B, 0xC5, 0xDF, 0x31, 0xAF, 0xDC, 0xB8,
+            0x58, 0xBE, 0x98, 0x15, 0x4B, 0xC0, 0xFF, 0x38,
+        ];
+
+        let issues = validate_schema_bytes("argon2id_style.cddl", schema, &cbor);
+
+        assert!(issues.is_empty(), "{issues:#?}");
+    }
+
+    #[test]
+    fn validate_optional_array_element_does_not_consume_mismatch() {
+        let issues =
+            validate_schema_bytes("optional_array_backtracks.cddl", b"root = [ ? 1, 2 ]\n", &[
+                0x81, 0x02,
+            ]);
+
+        assert!(issues.is_empty(), "{issues:#?}");
+    }
+
+    #[test]
+    fn validate_reports_only_best_failed_alternative_details() {
+        let issues = validate_schema_bytes("compact_type_choice.cddl", b"root = ([1] / [2])\n", &[
+            0x81, 0x03,
+        ]);
+        let integer_mismatches = issues
+            .iter()
+            .filter(|issue| issue.message.as_deref() == Some("integer value did not match"))
+            .count();
+
+        assert_eq!(integer_mismatches, 1, "{issues:#?}");
+    }
+
+    #[test]
+    fn validate_treats_x_enc_as_plain_annotation() {
+        let issues =
+            validate_schema_bytes("x_enc_annotation.cddl", b"root = bstr .x-enc any\n", &[
+                0x43, b'a', b'b', b'c',
+            ]);
+
+        assert!(issues.is_empty(), "{issues:#?}");
+    }
+
+    #[test]
+    fn validate_warns_but_does_not_fail_for_compression_operators() {
+        let (issues, warnings) = validate_schema_bytes_with_warnings(
+            "compression_deferred.cddl",
+            b"root = bstr .x-brotli.abnf \"abc\"\n",
+            &[0x43, b'a', b'b', b'c'],
+        );
+
+        assert!(issues.is_empty(), "{issues:#?}");
+        assert!(
+            warnings.iter().any(|warning| {
+                warning
+                    .text
+                    .contains("compression operator `.x-brotli.abnf`")
+            }),
+            "{warnings:#?}"
         );
     }
 

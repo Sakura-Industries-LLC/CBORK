@@ -8,6 +8,8 @@ use std::path::Path;
 
 use console::style;
 
+build_info::build_info!(fn build_metadata);
+
 /// FIGlet-style `cbork` banner lines printed above command output.
 const BANNER_LINES: [&str; 5] = [
     "        __               __",
@@ -22,6 +24,16 @@ const BANNER_COLORS: [u8; 5] = [33, 39, 63, 99, 129];
 
 /// Print the startup banner for `cbork`.
 pub(crate) fn print_banner() {
+    let build_metadata = build_metadata();
+    let git_hash = build_metadata
+        .version_control
+        .as_ref()
+        .map_or("unknown", |version_control| {
+            match version_control {
+                build_info::VersionControl::Git(git) => git.commit_short_id.as_str(),
+            }
+        });
+
     println!();
     for (line, color) in BANNER_LINES.iter().zip(BANNER_COLORS) {
         println!("{}", style(line).color256(color).bold());
@@ -29,6 +41,14 @@ pub(crate) fn print_banner() {
     println!(
         "{}",
         style("Modern CDDL tooling for documentation and validation").yellow()
+    );
+    println!(
+        "{}",
+        style(format!(
+            "v{} ({}) - Copyright (c) 2026, Sakura Industries LLC - AGPLv3 Only",
+            build_metadata.crate_info.version, git_hash
+        ))
+        .dim()
     );
     println!();
 }
