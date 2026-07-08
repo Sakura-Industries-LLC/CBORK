@@ -171,8 +171,9 @@ pub(crate) fn exec(
                 println!("{}", style(dump).dim());
             }
             println!(
-                "{} {} {} : NOT OK",
+                "{}:{} {} {} : NOT OK",
                 schema_path.display(),
+                root_name,
                 style("==").dim(),
                 input_path,
             );
@@ -196,8 +197,9 @@ pub(crate) fn exec(
             }
         } else {
             println!(
-                "{} {} {} : OK",
+                "{}:{} {} {} : OK",
                 schema_path.display(),
+                root_name,
                 style("==").dim(),
                 input_path,
             );
@@ -219,8 +221,9 @@ pub(crate) fn exec(
             );
         }
         println!(
-            "{} {} {} : OK",
+            "{}:{} {} {} : OK",
             schema_path.display(),
+            root_name,
             style("!=").dim(),
             input_path,
         );

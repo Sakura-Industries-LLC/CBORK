@@ -20,8 +20,7 @@ It applies to the entire repository unless a more specific `AGENTS.md` exists in
   crates without explicit direction.
 * Match the existing style and patterns.
   The workspace enforces a strict clippy/lints setup via `[workspace.lints]`; do not relax it locally.
-* For validation, run `just fix-ci` (containerized, recommended) or
-  `just local ci` / `just local fix` (host-side moon shortcuts).
+* For validation, run `just fix-ci` (containerized, recommended).
 
 ## CDDL Fixtures and RFC Reference Material
 
@@ -90,8 +89,6 @@ The minimum local tooling is:
   `cargo-nextest`, `rumdl`, and `cspell` (the `just` recipes build it on demand)
 
 Primary check (recommended): `just fix-ci` — containerized, runs via Podman, includes license checks via `cargo deny`.
-
-Local bypass (faster): `just local fix` / `just local ci`.
 
 For markdown and spell checks, use `just ci`.
 NEVER, run the underlying `moon run root:markdown-check root:spell-check`.
