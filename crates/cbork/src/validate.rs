@@ -140,7 +140,7 @@ pub(crate) fn exec(
     clear_current_validation_warnings();
 
     let root_name = match resolve_validation_root(&compiled, schema_path, type_name) {
-        Ok(name) => name,
+        Ok((name, _node)) => name,
         Err(error) => {
             println!(
                 "{}",
@@ -552,16 +552,14 @@ fn validate_schema_node(
                         )
                 )
             }) {
-                if let WrappedNode::Syntax { rule, text, .. } = inner {
+                if let WrappedNode::Syntax { rule, .. } = inner {
                     if rule == "bareword" {
-                        validate_named_rule(
-                            compiled,
-                            definitions,
-                            text.trim(),
-                            value,
-                            path,
-                            issues,
-                        );
+                        // A bareword member key (e.g. `foo` in
+                        // `{ foo: uint }`) names a literal text-string
+                        // key, not a schema. The match against the
+                        // CBOR map's key already happened in
+                        // `find_matching_map_entry`; do not re-validate
+                        // the key value against a rule with this name.
                     } else {
                         validate_schema_node(compiled, definitions, inner, value, path, issues);
                     }
@@ -2449,6 +2447,16 @@ enum RootSelectionError {
     /// The schema has no top-level rule at all and `--type` was not
     /// supplied.
     NoRootRule,
+    /// The selected rule denotes a CDDL group (or group entry), which is
+    /// indefinite and cannot be validated against a concrete CBOR item.
+    /// `explicit` is `true` when the user picked the rule via `--type`,
+    /// and `false` when it was resolved as the natural root.
+    IndefiniteRoot {
+        /// The base name of the selected rule.
+        name: String,
+        /// Whether the rule was explicitly selected via `--type`.
+        explicit: bool,
+    },
 }
 
 /// What kind of non-primary origin supplied the rule the user picked.
@@ -2474,11 +2482,11 @@ enum RootSource {
 /// only arrive through include/import/postlude are rejected; when such
 /// a rule is the only match, the error includes the rule's origin so
 /// the user can see where it came from.
-fn resolve_validation_root(
-    compiled: &CompiledCDDL,
+fn resolve_validation_root<'a>(
+    compiled: &'a CompiledCDDL,
     schema_path: &Path,
     type_name: Option<&str>,
-) -> Result<String, RootSelectionError> {
+) -> Result<(String, &'a WrappedNode), RootSelectionError> {
     let canonical_schema = canonicalize_primary_path(compiled, schema_path);
 
     let primary_matches: Vec<&WrappedNode> = compiled
@@ -2492,13 +2500,17 @@ fn resolve_validation_root(
         })
         .collect();
 
+    let explicit = type_name.is_some();
+    let check_indefinite =
+        |name: String, node: &'a WrappedNode| check_indefinite_root(name, node, explicit);
+
     match type_name {
         None => {
-            primary_matches
+            let (name, node) = primary_matches
                 .iter()
-                .find_map(|node| top_level_rule_signature(node))
-                .map(|(name, _)| name)
-                .ok_or(RootSelectionError::NoRootRule)
+                .find_map(|node| top_level_rule_signature(node).map(|(name, _)| (name, *node)))
+                .ok_or(RootSelectionError::NoRootRule)?;
+            check_indefinite(name, node)
         },
         Some(requested_raw) => {
             let requested = requested_raw.trim();
@@ -2534,25 +2546,27 @@ fn resolve_validation_root(
                 });
             }
 
-            match primary_concrete.len() {
-                1 => Ok(requested.to_owned()),
-                0 => {
-                    Err(lookup_root_selection_error(
-                        compiled,
-                        canonical_schema.as_deref(),
-                        requested,
-                    ))
-                },
-                _ => {
-                    // Multiple concrete same-name rules in the primary
-                    // file: defer to the compiler's existing
-                    // diagnostics by picking the first match. The plan
-                    // says not to add bespoke ambiguity handling unless
-                    // silent wrong-rule selection is otherwise
-                    // possible; in practice the compiler will already
-                    // have raised a diagnostic for this.
-                    Ok(requested.to_owned())
-                },
+            if primary_concrete.is_empty() {
+                return Err(lookup_root_selection_error(
+                    compiled,
+                    canonical_schema.as_deref(),
+                    requested,
+                ));
+            }
+
+            // Pick the first concrete same-name rule. When more than
+            // one exists in the primary file we defer to the compiler's
+            // existing diagnostics rather than introducing bespoke
+            // ambiguity handling; the compiler will already have raised
+            // a diagnostic for the duplicate.
+            if let Some((node, _rest)) = primary_concrete.split_first() {
+                check_indefinite(requested.to_owned(), node)
+            } else {
+                Err(lookup_root_selection_error(
+                    compiled,
+                    canonical_schema.as_deref(),
+                    requested,
+                ))
             }
         },
     }
@@ -2735,6 +2749,12 @@ fn format_root_selection_error(
                 schema_path.display()
             )
         },
+        RootSelectionError::IndefiniteRoot { name, .. } => {
+            format!(
+                "validation error: \"{name}\" names a CDDL group; \
+                 groups are indefinite and cannot be selected as the validation root"
+            )
+        },
     }
 }
 
@@ -2783,6 +2803,49 @@ fn find_rhs_node<'a>(children: &'a [WrappedNode]) -> Option<&'a WrappedNode> {
             _ => None,
         }
     })
+}
+
+/// Wrap a successfully-resolved root, rejecting it as an indefinite
+/// CDDL group when its top-level RHS is `group` or `grpent`.
+fn check_indefinite_root<'a>(
+    name: String,
+    node: &'a WrappedNode,
+    explicit: bool,
+) -> Result<(String, &'a WrappedNode), RootSelectionError> {
+    if selected_root_is_indefinite_group(node) {
+        Err(RootSelectionError::IndefiniteRoot { name, explicit })
+    } else {
+        Ok((name, node))
+    }
+}
+
+/// Return `true` if the top-level RHS of `node` is a CDDL group or
+/// group-entry rather than a concrete CBOR data item.
+///
+/// A rule whose RHS is a `group` (`foo = ( ... )`) or `grpent`
+/// (`foo = ( key: value )`) does not denote a single CBOR item and so
+/// cannot be selected as the validation root. The check inspects only
+/// the selected rule's top-level RHS shape; nested groups inside
+/// arrays, maps, choices, or member entries are valid CDDL and are
+/// not rejected here.
+fn selected_root_is_indefinite_group(node: &WrappedNode) -> bool {
+    let children: &[WrappedNode] = match node {
+        WrappedNode::RuleLine { children, .. }
+        | WrappedNode::Syntax { children, .. }
+        | WrappedNode::Directive { children, .. } => children,
+        WrappedNode::Comment { .. }
+        | WrappedNode::ModuleStart { .. }
+        | WrappedNode::ModuleEnd { .. } => {
+            return false;
+        },
+    };
+    let Some(rhs) = find_rhs_node(children) else {
+        return false;
+    };
+    matches!(
+        rhs,
+        WrappedNode::Syntax { rule, .. } if matches!(rule.as_str(), "group" | "grpent")
+    )
 }
 
 /// Find a child syntax node with the given rule.
@@ -4170,17 +4233,30 @@ fn find_matching_map_entry<'a>(
 
             match memberkey {
                 Some(key_schema) => {
-                    let mut temp_issues = Vec::new();
-                    let mut path = Vec::new();
-                    validate_schema_node(
-                        compiled,
-                        definitions,
-                        key_schema,
-                        &entry.key,
-                        &mut path,
-                        &mut temp_issues,
-                    );
-                    temp_issues.is_empty()
+                    // A bareword memberkey (e.g. `foo` in `{ foo: uint }`)
+                    // names a literal text-string key to match against
+                    // the CBOR map's key, not a schema to validate the
+                    // key value against. Routing barewords through
+                    // `validate_schema_node` would fall into its
+                    // `unsupported syntax rule` arm.
+                    if let Some(bareword) = memberkey_bareword_text(key_schema) {
+                        match &entry.key {
+                            Value::Text(actual) => actual == bareword,
+                            _ => false,
+                        }
+                    } else {
+                        let mut temp_issues = Vec::new();
+                        let mut path = Vec::new();
+                        validate_schema_node(
+                            compiled,
+                            definitions,
+                            key_schema,
+                            &entry.key,
+                            &mut path,
+                            &mut temp_issues,
+                        );
+                        temp_issues.is_empty()
+                    }
                 },
                 None => true,
             }
@@ -4200,6 +4276,25 @@ fn find_memberkey(node: &WrappedNode) -> Option<&WrappedNode> {
     children
         .iter()
         .find(|child| matches!(child, WrappedNode::Syntax { rule, .. } if rule == "memberkey"))
+}
+
+/// If `memberkey` is a bareword memberkey (e.g. `foo` in `{ foo: uint }`),
+/// return its text. Bareword member keys denote a literal text-string
+/// key to match against the CBOR map's key, not a schema to validate
+/// the key value against.
+fn memberkey_bareword_text(memberkey: &WrappedNode) -> Option<&str> {
+    let WrappedNode::Syntax { rule, children, .. } = memberkey else {
+        return None;
+    };
+    if rule != "memberkey" {
+        return None;
+    }
+    children.iter().find_map(|child| {
+        match child {
+            WrappedNode::Syntax { rule, text, .. } if rule == "bareword" => Some(text.trim()),
+            _ => None,
+        }
+    })
 }
 
 /// Extract a `grpent`'s occurrence modifier.
@@ -5349,7 +5444,7 @@ item = [ 1 ]
         let cbor = write_cbor(&dir, "value.cbor", &cbor_integer(2));
 
         let compiled = CompiledCDDL::compile(&schema, None::<&Path>).expect("schema compiles");
-        let root = resolve_validation_root(&compiled, &schema, Some("payload"))
+        let (root, _node) = resolve_validation_root(&compiled, &schema, Some("payload"))
             .expect("payload is selectable");
         assert_eq!(root, "payload");
 
@@ -5394,6 +5489,24 @@ item = [ 1 ]
         let rendered = format_root_selection_error(&missing, &schema);
         assert!(rendered.contains("absent"));
         assert!(rendered.contains("does not name any rule"));
+
+        let indefinite_explicit = RootSelectionError::IndefiniteRoot {
+            name: "member".to_owned(),
+            explicit: true,
+        };
+        let rendered = format_root_selection_error(&indefinite_explicit, &schema);
+        assert!(rendered.contains("CDDL group"));
+        assert!(rendered.contains("cannot be selected as the validation root"));
+        assert!(rendered.contains("member"));
+
+        let indefinite_natural = RootSelectionError::IndefiniteRoot {
+            name: "root".to_owned(),
+            explicit: false,
+        };
+        let rendered = format_root_selection_error(&indefinite_natural, &schema);
+        assert!(rendered.contains("CDDL group"));
+        assert!(rendered.contains("cannot be selected as the validation root"));
+        assert!(rendered.contains("root"));
     }
 
     #[test]
@@ -5413,5 +5526,117 @@ item = [ 1 ]
             Some("uint"),
             true
         ));
+    }
+
+    // Plan 014 — indefinite CDDL groups must be rejected as the
+    // validation root before data validation starts.
+
+    #[test]
+    fn natural_root_group_fails_before_data_validation() {
+        let dir = write_temp_dir_tree(&["natural_group_root"]);
+        let schema = write_cddl(&dir, "schema.cddl", b"root = ( key: uint )\n");
+        let cbor = write_cbor(&dir, "value.cbor", &cbor_integer(7));
+
+        assert!(!exec(&schema, Some(&cbor), false, false, false, None, true));
+
+        let err = resolve_validation_root(
+            &CompiledCDDL::compile(&schema, None::<&Path>).expect("schema compiles"),
+            &schema,
+            None,
+        )
+        .expect_err("group root must be rejected");
+        assert!(matches!(
+            err,
+            RootSelectionError::IndefiniteRoot {
+                ref name,
+                explicit: false
+            } if name == "root"
+        ));
+
+        let rendered = format_root_selection_error(&err, &schema);
+        assert!(rendered.contains("CDDL group"));
+        assert!(rendered.contains("cannot be selected as the validation root"));
+    }
+
+    #[test]
+    fn type_override_local_group_rule_fails() {
+        let dir = write_temp_dir_tree(&["type_override_group"]);
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b"root = [ member ]\nmember = ( key: uint )\n",
+        );
+        let cbor = write_cbor(&dir, "value.cbor", &[0x81, 0x01]);
+
+        assert!(!exec(
+            &schema,
+            Some(&cbor),
+            false,
+            false,
+            false,
+            Some("member"),
+            true
+        ));
+
+        let err = resolve_validation_root(
+            &CompiledCDDL::compile(&schema, None::<&Path>).expect("schema compiles"),
+            &schema,
+            Some("member"),
+        )
+        .expect_err("group selection via --type must be rejected");
+        assert!(matches!(
+            err,
+            RootSelectionError::IndefiniteRoot {
+                ref name,
+                explicit: true
+            } if name == "member"
+        ));
+    }
+
+    #[test]
+    fn concrete_array_root_still_validates() {
+        let dir = write_temp_dir_tree(&["concrete_array_root"]);
+        let schema = write_cddl(&dir, "schema.cddl", b"root = [ uint ]\n");
+        let cbor = write_cbor(&dir, "value.cbor", &[0x81, 0x01]);
+
+        assert!(exec(&schema, Some(&cbor), false, false, false, None, true));
+    }
+
+    #[test]
+    fn concrete_map_root_still_validates() {
+        let dir = write_temp_dir_tree(&["concrete_map_root"]);
+        let schema = write_cddl(&dir, "schema.cddl", b"root = { foo: uint }\n");
+        let cbor = write_cbor(&dir, "value.cbor", &[0xA1, 0x63, 0x66, 0x6F, 0x6F, 0x01]);
+
+        assert!(exec(&schema, Some(&cbor), false, false, false, None, true));
+    }
+
+    #[test]
+    fn nested_group_in_array_still_validates() {
+        let dir = write_temp_dir_tree(&["nested_group_in_array"]);
+        // Group splice inside an array: the validator must continue to
+        // expand the group into the surrounding array context, even
+        // though `member` itself is a CDDL group.
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b"root = [ member ]\nmember = ( 1*1 item )\nitem = [ 1 ]\n",
+        );
+        // CBOR: [ [1] ] — array containing one nested [1] matching item.
+        let cbor = write_cbor(&dir, "value.cbor", &[0x81, 0x81, 0x01]);
+
+        assert!(exec(&schema, Some(&cbor), false, false, false, None, true));
+    }
+
+    #[test]
+    fn fails_does_not_convert_indefinite_root_error() {
+        let dir = write_temp_dir_tree(&["fails_indefinite_root"]);
+        let schema = write_cddl(&dir, "schema.cddl", b"root = ( key: uint )\n");
+        let cbor = write_cbor(&dir, "value.cbor", &cbor_integer(7));
+
+        // `fails = true` must not turn the indefinite-root selection
+        // error into a pass: this is a schema/root-selection error,
+        // not a data validation mismatch.
+        assert!(!exec(&schema, Some(&cbor), false, false, true, None, true));
     }
 }
