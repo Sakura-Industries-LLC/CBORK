@@ -649,6 +649,10 @@ struct Validate {
     #[bpaf(long)]
     detailed: bool,
 
+    /// Expect validation to fail; a mismatch is reported as OK.
+    #[bpaf(long)]
+    fails: bool,
+
     /// Override the validation root to a top-level rule declared in the
     /// schema file. Must name a concrete, non-generic rule; the rule
     /// must originate from the schema file passed to `validate` and may
@@ -677,6 +681,7 @@ impl Validate {
             self.path.as_deref(),
             self.warn,
             self.detailed,
+            self.fails,
             self.type_name.as_deref(),
             force_no_color,
         )
@@ -835,10 +840,27 @@ mod tests {
         match validate.command {
             Command::Validate(args) => {
                 assert!(args.detailed);
+                assert!(!args.fails);
                 assert!(!args.warn);
                 assert_eq!(args.schema, PathBuf::from("schema.cddl"));
                 assert_eq!(args.path, Some(PathBuf::from("input.cbor")));
                 assert_eq!(args.type_name, None);
+            },
+            _ => panic!("expected validate command"),
+        }
+    }
+
+    #[test]
+    fn parses_validate_with_expected_failure() {
+        let validate = cli()
+            .run_inner(&["validate", "--fails", "schema.cddl", "input.cbor"])
+            .expect("validate --fails should parse");
+        match validate.command {
+            Command::Validate(args) => {
+                assert!(args.fails);
+                assert!(!args.detailed);
+                assert_eq!(args.schema, PathBuf::from("schema.cddl"));
+                assert_eq!(args.path, Some(PathBuf::from("input.cbor")));
             },
             _ => panic!("expected validate command"),
         }

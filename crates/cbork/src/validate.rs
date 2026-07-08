@@ -71,11 +71,13 @@ struct ValidationWarning {
 
 /// Validate a CDDL schema against a CBOR payload.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::fn_params_excessive_bools)]
 pub(crate) fn exec(
     schema_path: &Path,
     cbor_path: Option<&Path>,
     show_warnings: bool,
     detailed: bool,
+    fails: bool,
     type_name: Option<&str>,
     force_no_color: bool,
 ) -> bool {
@@ -154,6 +156,30 @@ pub(crate) fn exec(
     let validation_warnings = take_current_validation_warnings();
 
     if issues.is_empty() {
+        if fails {
+            let dump = render_validation_dump(
+                schema_path,
+                &input_path,
+                &document,
+                &schema_notes,
+                None,
+                !force_no_color,
+            );
+            if force_no_color {
+                println!("{dump}");
+            } else {
+                println!("{}", style(dump).dim());
+            }
+            println!(
+                "{} {} {} : NOT OK",
+                schema_path.display(),
+                style("==").dim(),
+                input_path,
+            );
+            print_validation_warnings(&validation_warnings);
+            return false;
+        }
+
         if detailed {
             let dump = render_validation_dump(
                 schema_path,
@@ -180,6 +206,52 @@ pub(crate) fn exec(
         return true;
     }
 
+    if fails {
+        if detailed {
+            print_validation_failure(
+                schema_path,
+                &input_path,
+                &document,
+                &schema_notes,
+                &issues,
+                &validation_warnings,
+                force_no_color,
+            );
+        }
+        println!(
+            "{} {} {} : OK",
+            schema_path.display(),
+            style("!=").dim(),
+            input_path,
+        );
+        if !detailed {
+            print_validation_warnings(&validation_warnings);
+        }
+        return true;
+    }
+
+    print_validation_failure(
+        schema_path,
+        &input_path,
+        &document,
+        &schema_notes,
+        &issues,
+        &validation_warnings,
+        force_no_color,
+    );
+    false
+}
+
+/// Print validation mismatch diagnostics.
+fn print_validation_failure(
+    schema_path: &Path,
+    input_path: &str,
+    document: &Document,
+    schema_notes: &[SchemaNote],
+    issues: &[ValidationIssue],
+    validation_warnings: &[ValidationWarning],
+    force_no_color: bool,
+) {
     println!(
         "{} {} -> {}",
         console::Emoji::new("🚨", "Errors"),
@@ -192,16 +264,16 @@ pub(crate) fn exec(
         .unwrap_or(&[]);
     let dump = render_validation_dump(
         schema_path,
-        &input_path,
-        &document,
-        &schema_notes,
+        input_path,
+        document,
+        schema_notes,
         Some(highlight),
         !force_no_color,
     );
     print!("{dump}");
-    print_validation_warnings(&validation_warnings);
+    print_validation_warnings(validation_warnings);
 
-    for issue in &issues {
+    for issue in issues {
         println!(
             "{}",
             style(format!(
@@ -216,8 +288,6 @@ pub(crate) fn exec(
             println!("{}", style(format!("  {message}")).red());
         }
     }
-
-    false
 }
 
 /// A validation mismatch collected during traversal.
@@ -2776,6 +2846,668 @@ fn find_grpent_body(node: &WrappedNode) -> Option<&WrappedNode> {
     }
 }
 
+/// Array occurrence constraint for a normalized group element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArrayOccurrence {
+    /// Exactly one occurrence.
+    One,
+    /// Zero or one occurrence.
+    Optional,
+    /// A bounded or unbounded numeric repetition range.
+    Range {
+        /// Minimum number of accepted items.
+        min: usize,
+        /// Maximum number of accepted items, or no upper bound.
+        max: Option<usize>,
+    },
+}
+
+/// A group element after pairing split numeric occurrences with their payload.
+struct ArrayGroupElement<'a> {
+    /// Element payload schema.
+    body: &'a WrappedNode,
+    /// Element occurrence constraint.
+    occurrence: ArrayOccurrence,
+}
+
+/// Normalize array group entries, pairing split numeric occurrences with their payload.
+fn extract_array_group_elements<'a>(
+    compiled: &CompiledCDDL,
+    grpchoice: &'a WrappedNode,
+) -> Result<Vec<ArrayGroupElement<'a>>, ()> {
+    let grpent_nodes = extract_grpent_nodes(grpchoice).ok_or(())?;
+    let mut elements = Vec::new();
+    let mut index = 0usize;
+
+    while let Some(grpent) = grpent_nodes.get(index).copied() {
+        if let Some((element, consumed)) =
+            extract_array_group_element_with_split_lower_bound(compiled, &grpent_nodes, index)?
+        {
+            elements.push(element);
+            index = index.saturating_add(consumed);
+            continue;
+        }
+
+        let Some((occurrence, max_from_body)) = array_occurrence(compiled, grpent)? else {
+            let body = find_grpent_body(grpent).ok_or(())?;
+            elements.push(ArrayGroupElement {
+                body,
+                occurrence: ArrayOccurrence::One,
+            });
+            index = index.saturating_add(1);
+            continue;
+        };
+
+        let (body, consumed_next) = if max_from_body || find_grpent_body(grpent).is_none() {
+            let next = grpent_nodes
+                .get(index.saturating_add(1))
+                .and_then(|next| find_grpent_body(next))
+                .ok_or(())?;
+            (next, true)
+        } else {
+            (find_grpent_body(grpent).ok_or(())?, false)
+        };
+
+        elements.push(ArrayGroupElement { body, occurrence });
+        index = index.saturating_add(if consumed_next { 2 } else { 1 });
+    }
+
+    Ok(elements)
+}
+
+/// Pair a split named/integer lower bound with the following `*...` occurrence.
+fn extract_array_group_element_with_split_lower_bound<'a>(
+    compiled: &CompiledCDDL,
+    grpent_nodes: &[&'a WrappedNode],
+    index: usize,
+) -> Result<Option<(ArrayGroupElement<'a>, usize)>, ()> {
+    let Some(lower_body) = grpent_nodes.get(index).and_then(|grpent| {
+        if find_occurrence(grpent).is_some() {
+            return None;
+        }
+        find_grpent_body(grpent)
+    }) else {
+        return Ok(None);
+    };
+    let Some(lower) = resolve_integer_bound(compiled, lower_body)
+        .map(usize_from_nonnegative)
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+    let Some(next) = grpent_nodes.get(index.saturating_add(1)).copied() else {
+        return Ok(None);
+    };
+    let Some(next_occur) = find_occurrence(next) else {
+        return Ok(None);
+    };
+    if !child_text(next_occur).trim_start().starts_with('*') {
+        return Ok(None);
+    }
+    let Some((ArrayOccurrence::Range { max, .. }, max_from_body)) =
+        array_occurrence(compiled, next)?
+    else {
+        return Ok(None);
+    };
+
+    let (body, consumed) = if max_from_body {
+        let body = grpent_nodes
+            .get(index.saturating_add(2))
+            .and_then(|grpent| find_grpent_body(grpent))
+            .ok_or(())?;
+        (body, 3)
+    } else {
+        (find_grpent_body(next).ok_or(())?, 2)
+    };
+
+    Ok(Some((
+        ArrayGroupElement {
+            body,
+            occurrence: ArrayOccurrence::Range { min: lower, max },
+        },
+        consumed,
+    )))
+}
+
+/// Extract the array occurrence attached to a group entry.
+fn array_occurrence(
+    compiled: &CompiledCDDL,
+    grpent: &WrappedNode,
+) -> Result<Option<(ArrayOccurrence, bool)>, ()> {
+    let Some(occur) = find_occurrence(grpent) else {
+        return Ok(None);
+    };
+    let occur_text = child_text(occur);
+    let occur_trimmed = occur_text.trim();
+    let uints = occurrence_uints(occur)?;
+
+    if occur_trimmed == "?" {
+        return Ok(Some((ArrayOccurrence::Optional, false)));
+    }
+    if occur_trimmed == "+" {
+        return Ok(Some((ArrayOccurrence::Range { min: 1, max: None }, false)));
+    }
+    if occur_trimmed == "*" {
+        return Ok(Some((ArrayOccurrence::Range { min: 0, max: None }, false)));
+    }
+
+    if !occur_trimmed.contains('*') {
+        let Some(count) = uints.first().copied() else {
+            return Ok(None);
+        };
+        return Ok(Some((
+            ArrayOccurrence::Range {
+                min: count,
+                max: Some(count),
+            },
+            false,
+        )));
+    }
+
+    if occur_trimmed.starts_with('*') {
+        let max = if let Some(max) = uints.first().copied() {
+            Some(max)
+        } else {
+            find_grpent_body(grpent)
+                .and_then(|body| resolve_integer_bound(compiled, body))
+                .map(usize_from_nonnegative)
+                .transpose()?
+        };
+        return Ok(Some((
+            ArrayOccurrence::Range { min: 0, max },
+            max.is_some() && uints.is_empty(),
+        )));
+    }
+
+    let min = uints.first().copied().unwrap_or(0);
+    if let Some(max) = uints.get(1).copied() {
+        return Ok(Some((
+            ArrayOccurrence::Range {
+                min,
+                max: Some(max),
+            },
+            false,
+        )));
+    }
+
+    let max_from_body = find_grpent_body(grpent)
+        .and_then(|body| resolve_integer_bound(compiled, body))
+        .map(usize_from_nonnegative)
+        .transpose()?;
+
+    Ok(Some((
+        ArrayOccurrence::Range {
+            min,
+            max: max_from_body,
+        },
+        max_from_body.is_some(),
+    )))
+}
+
+/// Resolve an integer bound from a syntax node that may wrap a `type2` leaf.
+fn resolve_integer_bound(
+    compiled: &CompiledCDDL,
+    node: &WrappedNode,
+) -> Option<i128> {
+    resolve_integer_rhs(compiled, node)
+        .or_else(|| parse_integer_from_node(node))
+        .or_else(|| {
+            node_children_find(node, "type2").and_then(|leaf| resolve_integer_rhs(compiled, leaf))
+        })
+        .or_else(|| node_children_find(node, "type2").and_then(parse_integer_from_node))
+}
+
+/// Find the occurrence node attached to a group entry.
+fn find_occurrence(node: &WrappedNode) -> Option<&WrappedNode> {
+    let WrappedNode::Syntax { rule, children, .. } = node else {
+        return None;
+    };
+    if rule != "grpent" {
+        return None;
+    }
+
+    children
+        .iter()
+        .find(|child| matches!(child, WrappedNode::Syntax { rule, .. } if rule == "occur"))
+}
+
+/// Extract numeric bounds from an occurrence node.
+fn occurrence_uints(occur: &WrappedNode) -> Result<Vec<usize>, ()> {
+    let WrappedNode::Syntax { children, .. } = occur else {
+        return Ok(Vec::new());
+    };
+
+    children
+        .iter()
+        .filter_map(|child| {
+            let WrappedNode::Syntax { rule, text, .. } = child else {
+                return None;
+            };
+            (rule == "uint").then(|| {
+                text.trim()
+                    .parse::<i128>()
+                    .ok()
+                    .and_then(|value| usize_from_nonnegative(value).ok())
+                    .ok_or(())
+            })
+        })
+        .collect()
+}
+
+/// Convert a non-negative CDDL integer bound to `usize`.
+fn usize_from_nonnegative(value: i128) -> Result<usize, ()> {
+    if value < 0 {
+        return Err(());
+    }
+    usize::try_from(value).map_err(|_| ())
+}
+
+/// Validate a repeated array body and update the consumed item index.
+fn validate_array_repetition(
+    compiled: &CompiledCDDL,
+    definitions: &HashMap<String, &WrappedNode>,
+    body: &WrappedNode,
+    min: usize,
+    max: Option<usize>,
+    items: &[Value],
+    item_index: &mut usize,
+    path: &[PathStep],
+    issues: &mut Vec<ValidationIssue>,
+    element_index: usize,
+) -> Option<()> {
+    let mut count = 0usize;
+
+    while count < min {
+        if items.get(*item_index).is_none() {
+            issues.push(ValidationIssue::new(
+                path.to_owned(),
+                format!("at least {min} array item(s)"),
+                "end of array",
+                Some(format!(
+                    "group element {element_index} required at least {min} item(s)"
+                )),
+            ));
+            return None;
+        }
+        let consumed = validate_array_element(
+            compiled,
+            definitions,
+            body,
+            items,
+            *item_index,
+            path,
+            issues,
+        )?;
+        *item_index = item_index.saturating_add(consumed);
+        count = count.saturating_add(1);
+    }
+
+    while max.is_none_or(|max| count < max) {
+        if items.get(*item_index).is_none() {
+            break;
+        }
+        let before = issues.len();
+        let warning_len = validation_warning_count();
+        if let Some(consumed) = validate_array_element(
+            compiled,
+            definitions,
+            body,
+            items,
+            *item_index,
+            path,
+            issues,
+        ) {
+            *item_index = item_index.saturating_add(consumed);
+            count = count.saturating_add(1);
+        } else {
+            issues.truncate(before);
+            truncate_validation_warnings(warning_len);
+            break;
+        }
+    }
+
+    Some(())
+}
+
+/// Validate one array element, or a group splice that consumes multiple items.
+fn validate_array_element(
+    compiled: &CompiledCDDL,
+    definitions: &HashMap<String, &WrappedNode>,
+    body: &WrappedNode,
+    items: &[Value],
+    item_index: usize,
+    path: &[PathStep],
+    issues: &mut Vec<ValidationIssue>,
+) -> Option<usize> {
+    match validate_array_group_splice(compiled, definitions, body, items, item_index, path, issues)
+    {
+        Ok(Some(consumed)) => return Some(consumed),
+        Ok(None) => {},
+        Err(()) => return None,
+    }
+
+    let item = items.get(item_index)?;
+    let before = issues.len();
+    let mut child_path = path.to_owned();
+    child_path.push(PathStep::ArrayItem(item_index));
+    record_schema_note_once(&child_path, schema_summary(body));
+    validate_schema_node(compiled, definitions, body, item, &mut child_path, issues);
+    (issues.len() == before).then_some(1)
+}
+
+/// Validate a group splice from the current array item index.
+fn validate_array_group_splice(
+    compiled: &CompiledCDDL,
+    definitions: &HashMap<String, &WrappedNode>,
+    node: &WrappedNode,
+    items: &[Value],
+    item_index: usize,
+    path: &[PathStep],
+    issues: &mut Vec<ValidationIssue>,
+) -> Result<Option<usize>, ()> {
+    let WrappedNode::Syntax {
+        rule,
+        children,
+        text,
+        ..
+    } = node
+    else {
+        return Ok(None);
+    };
+
+    match rule.as_str() {
+        "type" => {
+            validate_array_group_splice_type(
+                compiled,
+                definitions,
+                children,
+                items,
+                item_index,
+                path,
+                issues,
+            )
+        },
+        "type1" => {
+            children
+                .iter()
+                .find(|child| matches!(child, WrappedNode::Syntax { rule, .. } if rule == "type2"))
+                .map_or(Ok(None), |child| {
+                    validate_array_group_splice(
+                        compiled,
+                        definitions,
+                        child,
+                        items,
+                        item_index,
+                        path,
+                        issues,
+                    )
+                })
+        },
+        "group" => {
+            validate_array_group_splice_group(
+                compiled,
+                definitions,
+                node,
+                items,
+                item_index,
+                path,
+                issues,
+            )
+        },
+        "grpent" => {
+            children
+                .iter()
+                .find(|child| matches!(child, WrappedNode::Syntax { rule, .. } if rule == "group"))
+                .or_else(|| find_grpent_body(node))
+                .map_or(Ok(None), |child| {
+                    validate_array_group_splice(
+                        compiled,
+                        definitions,
+                        child,
+                        items,
+                        item_index,
+                        path,
+                        issues,
+                    )
+                })
+        },
+        "type2" if text.trim_start().starts_with('{') => {
+            if matches!(items.get(item_index), Some(Value::Map(_))) {
+                return Ok(None);
+            }
+            validate_array_group_splice_type2(
+                compiled,
+                definitions,
+                children,
+                items,
+                item_index,
+                path,
+                issues,
+            )
+        },
+        "type2" => {
+            children
+                .iter()
+                .find_map(|child| {
+                    match child {
+                        WrappedNode::Syntax { rule, text, .. }
+                            if rule == "typename" || rule == "groupname" =>
+                        {
+                            Some(text.trim())
+                        },
+                        _ => None,
+                    }
+                })
+                .map_or(Ok(None), |name| {
+                    validate_named_array_group_splice(
+                        compiled,
+                        definitions,
+                        name,
+                        items,
+                        item_index,
+                        path,
+                        issues,
+                    )
+                })
+        },
+        "typename" | "groupname" => {
+            validate_named_array_group_splice(
+                compiled,
+                definitions,
+                text.trim(),
+                items,
+                item_index,
+                path,
+                issues,
+            )
+        },
+        _ => Ok(None),
+    }
+}
+
+/// Validate a named local rule as an array group splice when it expands to one.
+fn validate_named_array_group_splice(
+    compiled: &CompiledCDDL,
+    definitions: &HashMap<String, &WrappedNode>,
+    name: &str,
+    items: &[Value],
+    item_index: usize,
+    path: &[PathStep],
+    issues: &mut Vec<ValidationIssue>,
+) -> Result<Option<usize>, ()> {
+    definitions
+        .get(name)
+        .and_then(|node| rule_rhs_or_self(node))
+        .map_or(Ok(None), |node| {
+            validate_array_group_splice(
+                compiled,
+                definitions,
+                node,
+                items,
+                item_index,
+                path,
+                issues,
+            )
+        })
+}
+
+/// Get a rule RHS when available, otherwise return the node itself.
+fn rule_rhs_or_self(node: &WrappedNode) -> Option<&WrappedNode> {
+    match node {
+        WrappedNode::RuleLine { children, .. } => find_rhs_node(children),
+        WrappedNode::Syntax { .. } => Some(node),
+        _ => None,
+    }
+}
+
+/// Validate a spliced group type choice.
+fn validate_array_group_splice_type(
+    compiled: &CompiledCDDL,
+    definitions: &HashMap<String, &WrappedNode>,
+    children: &[WrappedNode],
+    items: &[Value],
+    item_index: usize,
+    path: &[PathStep],
+    issues: &mut Vec<ValidationIssue>,
+) -> Result<Option<usize>, ()> {
+    let mut branch_issues = Vec::new();
+    let mut saw_splice_branch = false;
+    let mut best_success: Option<usize> = None;
+
+    for child in children {
+        if !matches!(child, WrappedNode::Syntax { rule, .. } if rule == "type1") {
+            continue;
+        }
+
+        let mut local_issues = Vec::new();
+        let warning_len = validation_warning_count();
+        let note_len = schema_note_count();
+        match validate_array_group_splice(
+            compiled,
+            definitions,
+            child,
+            items,
+            item_index,
+            path,
+            &mut local_issues,
+        ) {
+            Ok(Some(consumed)) => {
+                saw_splice_branch = true;
+                if local_issues.is_empty() {
+                    if best_success.is_none_or(|best| consumed > best) {
+                        best_success = Some(consumed);
+                    }
+                } else {
+                    branch_issues.push(local_issues);
+                }
+            },
+            Ok(None) => {},
+            Err(()) => {
+                saw_splice_branch = true;
+                branch_issues.push(local_issues);
+            },
+        }
+        truncate_validation_warnings(warning_len);
+        truncate_current_schema_notes(note_len);
+    }
+
+    if let Some(consumed) = best_success {
+        return Ok(Some(consumed));
+    }
+
+    if !saw_splice_branch {
+        return Ok(None);
+    }
+
+    issues.push(ValidationIssue::new(
+        path.to_owned(),
+        "one of the listed group alternatives",
+        "no matching array group",
+        Some("none of the spliced array group alternatives matched".to_owned()),
+    ));
+    if let Some(best) = best_issue_branch(branch_issues) {
+        issues.extend(best);
+    }
+    Err(())
+}
+
+/// Validate a `type2` group as a splice into the containing array.
+fn validate_array_group_splice_type2(
+    compiled: &CompiledCDDL,
+    definitions: &HashMap<String, &WrappedNode>,
+    children: &[WrappedNode],
+    items: &[Value],
+    item_index: usize,
+    path: &[PathStep],
+    issues: &mut Vec<ValidationIssue>,
+) -> Result<Option<usize>, ()> {
+    let Some(group) = children
+        .iter()
+        .find(|child| matches!(child, WrappedNode::Syntax { rule, .. } if rule == "group"))
+    else {
+        return Ok(None);
+    };
+
+    validate_array_group_splice_group(
+        compiled,
+        definitions,
+        group,
+        items,
+        item_index,
+        path,
+        issues,
+    )
+}
+
+/// Validate a concrete group as a splice into the containing array.
+fn validate_array_group_splice_group(
+    compiled: &CompiledCDDL,
+    definitions: &HashMap<String, &WrappedNode>,
+    group: &WrappedNode,
+    items: &[Value],
+    item_index: usize,
+    path: &[PathStep],
+    issues: &mut Vec<ValidationIssue>,
+) -> Result<Option<usize>, ()> {
+    let remaining = items.len().saturating_sub(item_index);
+    let mut branch_issues = Vec::new();
+    for prefix_len in (0..=remaining).rev() {
+        for grpchoice in group_children(group, "grpchoice") {
+            let mut local_issues = Vec::new();
+            let warning_len = validation_warning_count();
+            let note_len = schema_note_count();
+            #[allow(
+                clippy::indexing_slicing,
+                reason = "Safe as indexes are bounded to slice"
+            )]
+            if validate_grpchoice_array(
+                compiled,
+                definitions,
+                grpchoice,
+                &items[item_index..item_index.saturating_add(prefix_len)],
+                path,
+                &mut local_issues,
+            ) {
+                return Ok(Some(prefix_len));
+            }
+            truncate_validation_warnings(warning_len);
+            truncate_current_schema_notes(note_len);
+            branch_issues.push(local_issues);
+        }
+    }
+
+    issues.push(ValidationIssue::new(
+        path.to_owned(),
+        "a spliced array group",
+        "no matching item sequence",
+        Some("group did not match the array item sequence".to_owned()),
+    ));
+    if let Some(best) = best_issue_branch(branch_issues) {
+        issues.extend(best);
+    }
+    Err(())
+}
+
 /// Validate one array `grpchoice`.
 fn validate_grpchoice_array(
     compiled: &CompiledCDDL,
@@ -2786,7 +3518,7 @@ fn validate_grpchoice_array(
     issues: &mut Vec<ValidationIssue>,
 ) -> bool {
     let mut item_index = 0usize;
-    let Some(grpent_nodes) = extract_grpent_nodes(grpchoice) else {
+    let Ok(elements) = extract_array_group_elements(compiled, grpchoice) else {
         issues.push(ValidationIssue::new(
             path.to_owned(),
             "a group choice",
@@ -2796,75 +3528,21 @@ fn validate_grpchoice_array(
         return false;
     };
 
-    for (element_index, grpent) in grpent_nodes.iter().enumerate() {
-        let occur = grpent_occurrence(grpent);
-        let Some(body) = find_grpent_body(grpent) else {
-            issues.push(ValidationIssue::new(
-                path.to_owned(),
-                "a group element body",
-                "missing body",
-                Some("could not locate the group element payload".to_owned()),
-            ));
-            return false;
-        };
-
-        match occur {
-            "?" => {
-                if item_index < items.len()
-                    && let Some(item) = items.get(item_index)
-                {
-                    let mut child_path = path.to_owned();
-                    child_path.push(PathStep::ArrayItem(item_index));
-                    record_schema_note_once(&child_path, schema_summary(body));
-                    let before = issues.len();
-                    let warning_len = validation_warning_count();
-                    validate_schema_node(
-                        compiled,
-                        definitions,
-                        body,
-                        item,
-                        &mut child_path,
-                        issues,
-                    );
-                    if issues.len() == before {
-                        item_index = item_index.saturating_add(1);
-                    } else {
-                        issues.truncate(before);
-                        truncate_validation_warnings(warning_len);
+    for (element_index, element) in elements.iter().enumerate() {
+        match element.occurrence {
+            ArrayOccurrence::One => {
+                let Some(consumed) = validate_array_element(
+                    compiled,
+                    definitions,
+                    element.body,
+                    items,
+                    item_index,
+                    path,
+                    issues,
+                ) else {
+                    if item_index < items.len() {
+                        return false;
                     }
-                }
-            },
-            "+" | "*" => {
-                if occur == "+" && item_index >= items.len() {
-                    issues.push(ValidationIssue::new(
-                        path.to_owned(),
-                        "one or more array items",
-                        "empty array",
-                        Some(format!(
-                            "group element {element_index} required at least one item"
-                        )),
-                    ));
-                    return false;
-                }
-                while item_index < items.len() {
-                    if let Some(item) = items.get(item_index) {
-                        let mut child_path = path.to_owned();
-                        child_path.push(PathStep::ArrayItem(item_index));
-                        record_schema_note_once(&child_path, schema_summary(body));
-                        validate_schema_node(
-                            compiled,
-                            definitions,
-                            body,
-                            item,
-                            &mut child_path,
-                            issues,
-                        );
-                    }
-                    item_index = item_index.saturating_add(1);
-                }
-            },
-            _ => {
-                if item_index >= items.len() {
                     issues.push(ValidationIssue::new(
                         path.to_owned(),
                         "more array items",
@@ -2872,21 +3550,44 @@ fn validate_grpchoice_array(
                         Some(format!("missing array item for element {element_index}")),
                     ));
                     return false;
+                };
+                item_index = item_index.saturating_add(consumed);
+            },
+            ArrayOccurrence::Optional => {
+                if validate_array_repetition(
+                    compiled,
+                    definitions,
+                    element.body,
+                    0,
+                    Some(1),
+                    items,
+                    &mut item_index,
+                    path,
+                    issues,
+                    element_index,
+                )
+                .is_none()
+                {
+                    return false;
                 }
-                if let Some(item) = items.get(item_index) {
-                    let mut child_path = path.to_owned();
-                    child_path.push(PathStep::ArrayItem(item_index));
-                    record_schema_note_once(&child_path, schema_summary(body));
-                    validate_schema_node(
-                        compiled,
-                        definitions,
-                        body,
-                        item,
-                        &mut child_path,
-                        issues,
-                    );
+            },
+            ArrayOccurrence::Range { min, max } => {
+                if validate_array_repetition(
+                    compiled,
+                    definitions,
+                    element.body,
+                    min,
+                    max,
+                    items,
+                    &mut item_index,
+                    path,
+                    issues,
+                    element_index,
+                )
+                .is_none()
+                {
+                    return false;
                 }
-                item_index = item_index.saturating_add(1);
             },
         }
     }
@@ -4141,7 +4842,7 @@ mod tests {
         let schema = write_temp_file("schema_ok.cddl", b"root = 1\n");
         let cbor = write_temp_file("value_ok.cbor", &[0x01]);
 
-        assert!(exec(&schema, Some(&cbor), false, false, None, true));
+        assert!(exec(&schema, Some(&cbor), false, false, false, None, true));
     }
 
     #[test]
@@ -4149,7 +4850,23 @@ mod tests {
         let schema = write_temp_file("schema_fail.cddl", b"root = 1\n");
         let cbor = write_temp_file("value_fail.cbor", &[0x02]);
 
-        assert!(!exec(&schema, Some(&cbor), false, false, None, true));
+        assert!(!exec(&schema, Some(&cbor), false, false, false, None, true));
+    }
+
+    #[test]
+    fn validate_expected_failure_succeeds_for_mismatch() {
+        let schema = write_temp_file("schema_expected_fail.cddl", b"root = 1\n");
+        let cbor = write_temp_file("value_expected_fail.cbor", &[0x02]);
+
+        assert!(exec(&schema, Some(&cbor), false, false, true, None, true));
+    }
+
+    #[test]
+    fn validate_expected_failure_fails_for_match() {
+        let schema = write_temp_file("schema_unexpected_match.cddl", b"root = 1\n");
+        let cbor = write_temp_file("value_unexpected_match.cbor", &[0x01]);
+
+        assert!(!exec(&schema, Some(&cbor), false, false, true, None, true));
     }
 
     #[test]
@@ -4282,6 +4999,58 @@ parallelism = (uint .ge 1) .default 1
             validate_schema_bytes("optional_array_backtracks.cddl", b"root = [ ? 1, 2 ]\n", &[
                 0x81, 0x02,
             ]);
+
+        assert!(issues.is_empty(), "{issues:#?}");
+    }
+
+    #[test]
+    fn validate_accepts_array_occurrence_with_named_upper_bound() {
+        let schema = br"
+root = [ threshold: uint, 2*MAX item ]
+item = [ 1 ]
+MAX = 5
+";
+        let issues = validate_schema_bytes("array_named_range.cddl", schema, &[
+            0x83, 0x00, 0x81, 0x01, 0x81, 0x01,
+        ]);
+
+        assert!(issues.is_empty(), "{issues:#?}");
+    }
+
+    #[test]
+    fn validate_accepts_array_occurrence_with_named_lower_bound() {
+        let schema = br"
+root = [ threshold: uint, MIN*5 item ]
+item = [ 1 ]
+MIN = 2
+";
+        let issues = validate_schema_bytes("array_named_lower_range.cddl", schema, &[
+            0x83, 0x00, 0x81, 0x01, 0x81, 0x01,
+        ]);
+
+        assert!(issues.is_empty(), "{issues:#?}");
+    }
+
+    #[test]
+    fn validate_accepts_exact_numeric_array_occurrence() {
+        let issues = validate_schema_bytes("array_exact_range.cddl", b"root = [ 3*3 uint ]\n", &[
+            0x83, 0x01, 0x02, 0x03,
+        ]);
+
+        assert!(issues.is_empty(), "{issues:#?}");
+    }
+
+    #[test]
+    fn validate_splices_group_choice_into_array() {
+        let schema = br"
+root = [ threshold: uint, keyset-3 / keyset-5 ]
+keyset-3 = ( 3*3 item )
+keyset-5 = ( 5*5 item )
+item = [ 1 ]
+";
+        let issues = validate_schema_bytes("array_group_splice.cddl", schema, &[
+            0x84, 0x00, 0x81, 0x01, 0x81, 0x01, 0x81, 0x01,
+        ]);
 
         assert!(issues.is_empty(), "{issues:#?}");
     }
@@ -4453,7 +5222,7 @@ parallelism = (uint .ge 1) .default 1
         let schema = write_cddl(&dir, "schema.cddl", b"root = 1\n");
         let cbor = write_cbor(&dir, "value.cbor", &cbor_integer(1));
 
-        assert!(exec(&schema, Some(&cbor), false, false, None, true));
+        assert!(exec(&schema, Some(&cbor), false, false, false, None, true));
     }
 
     #[test]
@@ -4469,12 +5238,14 @@ parallelism = (uint .ge 1) .default 1
             Some(&matching),
             false,
             false,
+            false,
             Some("payload"),
             true
         ));
         assert!(!exec(
             &schema,
             Some(&mismatching),
+            false,
             false,
             false,
             Some("payload"),
@@ -4493,6 +5264,7 @@ parallelism = (uint .ge 1) .default 1
             Some(&cbor),
             false,
             false,
+            false,
             Some("missing"),
             true
         ));
@@ -4509,12 +5281,14 @@ parallelism = (uint .ge 1) .default 1
             Some(&cbor),
             false,
             false,
+            false,
             Some("wrapper"),
             true
         ));
         assert!(!exec(
             &schema,
             Some(&cbor),
+            false,
             false,
             false,
             Some("wrapper<t>"),
@@ -4538,6 +5312,7 @@ parallelism = (uint .ge 1) .default 1
             Some(&cbor),
             false,
             false,
+            false,
             Some("shared"),
             true
         ));
@@ -4557,6 +5332,7 @@ parallelism = (uint .ge 1) .default 1
         assert!(exec(
             &schema,
             Some(&cbor),
+            false,
             false,
             false,
             Some("payload"),
@@ -4581,6 +5357,7 @@ parallelism = (uint .ge 1) .default 1
             Some(&cbor),
             false,
             true,
+            false,
             Some("payload"),
             true
         ));
@@ -4628,6 +5405,7 @@ parallelism = (uint .ge 1) .default 1
         assert!(!exec(
             &schema,
             Some(&cbor),
+            false,
             false,
             false,
             Some("uint"),
