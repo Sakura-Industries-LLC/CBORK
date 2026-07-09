@@ -260,7 +260,8 @@ fn print_validation_failure(
         schema_path.display(),
         input_path
     );
-    let highlight = issues
+    let unique_issues = unique_validation_issues(issues);
+    let highlight = unique_issues
         .first()
         .map(|issue| issue.path.as_slice())
         .unwrap_or(&[]);
@@ -275,7 +276,7 @@ fn print_validation_failure(
     print!("{dump}");
     print_validation_warnings(validation_warnings);
 
-    for issue in issues {
+    for issue in unique_issues {
         println!(
             "{}",
             style(format!(
@@ -290,6 +291,18 @@ fn print_validation_failure(
             println!("{}", style(format!("  {message}")).red());
         }
     }
+}
+
+/// Keep validation output concise by removing exact duplicate issues.
+fn unique_validation_issues(issues: &[ValidationIssue]) -> Vec<&ValidationIssue> {
+    let mut unique = Vec::new();
+    for issue in issues {
+        if unique.contains(&issue) {
+            continue;
+        }
+        unique.push(issue);
+    }
+    unique
 }
 
 /// A validation mismatch collected during traversal.
@@ -367,6 +380,22 @@ fn validate_document(
 ) -> Vec<ValidationIssue> {
     let mut issues = Vec::new();
 
+    if let Some(rhs) = root_cbor_sequence_controller(definitions, root_name) {
+        let sequence = Value::Array(document.items().to_vec());
+        let mut path = vec![PathStep::DocItem(0)];
+        validate_schema_node(
+            compiled,
+            definitions,
+            rhs,
+            &sequence,
+            &mut path,
+            &mut issues,
+        );
+        rewrite_cbor_sequence_schema_notes(definitions, rhs);
+        normalize_cbor_sequence_issues(&mut issues, document);
+        return issues;
+    }
+
     if document.items().len() > 1 {
         issues.push(ValidationIssue::new(
             vec![PathStep::DocItem(1)],
@@ -398,6 +427,400 @@ fn validate_document(
     );
 
     issues
+}
+
+/// Rewrite synthetic array notes into top-level CBOR sequence notes.
+fn rewrite_cbor_sequence_schema_notes(
+    definitions: &HashMap<String, &WrappedNode>,
+    rhs: &WrappedNode,
+) {
+    let root_note = SchemaNote {
+        path: Vec::new(),
+        text: format!(
+            "CBOR sequence {}",
+            cbor_sequence_controller_summary(definitions, rhs)
+        ),
+    };
+    let labels = cbor_sequence_item_labels(definitions, rhs);
+
+    CURRENT_SCHEMA_NOTES.with(|slot| {
+        let original = std::mem::take(&mut *slot.borrow_mut());
+        let mut rewritten = Vec::with_capacity(original.len().saturating_add(labels.len() + 1));
+        rewritten.push(root_note);
+
+        for (index, label) in labels.into_iter().enumerate() {
+            rewritten.push(SchemaNote {
+                path: vec![PathStep::DocItem(index)],
+                text: label,
+            });
+        }
+
+        for mut note in original {
+            if note.path == [PathStep::DocItem(0)] {
+                continue;
+            }
+            if let [PathStep::DocItem(0), PathStep::ArrayItem(index), rest @ ..] =
+                note.path.as_slice()
+            {
+                let mut path = vec![PathStep::DocItem(*index)];
+                path.extend_from_slice(rest);
+                note.path = path;
+            }
+            if !rewritten.iter().any(|existing| existing.path == note.path) {
+                rewritten.push(note);
+            }
+        }
+
+        *slot.borrow_mut() = rewritten;
+    });
+}
+
+/// Summarize a CBOR sequence controller without exposing synthetic array syntax.
+fn cbor_sequence_controller_summary(
+    definitions: &HashMap<String, &WrappedNode>,
+    rhs: &WrappedNode,
+) -> String {
+    cbor_sequence_controller_reference(rhs)
+        .or_else(|| {
+            let labels = cbor_sequence_item_labels(definitions, rhs);
+            (!labels.is_empty()).then(|| labels.join(", "))
+        })
+        .unwrap_or_else(|| schema_summary(rhs))
+}
+
+/// Return the single named controller inside `[ name ]`, when present.
+fn cbor_sequence_controller_reference(node: &WrappedNode) -> Option<String> {
+    let WrappedNode::Syntax {
+        rule,
+        text,
+        children,
+        ..
+    } = node
+    else {
+        return None;
+    };
+    if rule == "type2" && text.trim_start().starts_with('[') {
+        let group = children
+            .iter()
+            .find(|child| matches!(child, WrappedNode::Syntax { rule, .. } if rule == "group"))?;
+        let grpchoice = group_children(group, "grpchoice").into_iter().next()?;
+        let grpent_nodes = extract_grpent_nodes(grpchoice)?;
+        if grpent_nodes.len() == 1 {
+            return grpent_nodes
+                .first()
+                .and_then(|grpent| find_grpent_body(grpent))
+                .and_then(named_reference);
+        }
+    }
+    None
+}
+
+/// Collect display labels for top-level CBOR sequence items.
+fn cbor_sequence_item_labels(
+    definitions: &HashMap<String, &WrappedNode>,
+    node: &WrappedNode,
+) -> Vec<String> {
+    cbor_sequence_item_labels_in_namespace(definitions, node, None)
+}
+
+/// Collect display labels for top-level CBOR sequence items.
+fn cbor_sequence_item_labels_in_namespace(
+    definitions: &HashMap<String, &WrappedNode>,
+    node: &WrappedNode,
+    namespace: Option<&str>,
+) -> Vec<String> {
+    match node {
+        WrappedNode::RuleLine { children, .. } => {
+            find_rhs_node(children).map_or_else(Vec::new, |rhs| {
+                cbor_sequence_item_labels_in_namespace(definitions, rhs, namespace)
+            })
+        },
+        WrappedNode::Syntax {
+            rule,
+            children,
+            text,
+            ..
+        } if rule == "type" => {
+            children
+                .iter()
+                .find(|child| matches!(child, WrappedNode::Syntax { rule, .. } if rule == "type1"))
+                .map_or_else(Vec::new, |child| {
+                    cbor_sequence_item_labels_in_namespace(definitions, child, namespace)
+                })
+        },
+        WrappedNode::Syntax { rule, children, .. } if rule == "type1" => {
+            if let Some((lhs, op, _rhs)) = control_operator_parts(children)
+                && op == ".within"
+            {
+                return cbor_sequence_item_labels_in_namespace(definitions, lhs, namespace);
+            }
+            children
+                .iter()
+                .find(|child| matches!(child, WrappedNode::Syntax { rule, .. } if rule == "type2"))
+                .map_or_else(Vec::new, |child| {
+                    cbor_sequence_item_labels_in_namespace(definitions, child, namespace)
+                })
+        },
+        WrappedNode::Syntax {
+            rule,
+            children,
+            text,
+            ..
+        } if rule == "type2" && text.trim_start().starts_with('[') => {
+            children
+                .iter()
+                .find(|child| matches!(child, WrappedNode::Syntax { rule, .. } if rule == "group"))
+                .map_or_else(Vec::new, |group| {
+                    cbor_sequence_item_labels_in_namespace(definitions, group, namespace)
+                })
+        },
+        WrappedNode::Syntax { rule, text, .. } if rule == "type2" => {
+            let name = text.trim();
+            resolve_definition_in_namespace(definitions, name, namespace).map_or_else(
+                Vec::new,
+                |(resolved_name, node)| {
+                    cbor_sequence_item_labels_in_namespace(
+                        definitions,
+                        node,
+                        definition_namespace(&resolved_name),
+                    )
+                },
+            )
+        },
+        WrappedNode::Syntax { rule, .. } if rule == "group" => {
+            let Some(grpchoice) = group_children(node, "grpchoice").into_iter().next() else {
+                return Vec::new();
+            };
+            collect_grpchoice_sequence_labels(definitions, grpchoice, namespace)
+        },
+        WrappedNode::Syntax { rule, .. } if rule == "grpent" => {
+            find_grpent_body(node).map_or_else(Vec::new, |body| {
+                cbor_sequence_item_labels_in_namespace(definitions, body, namespace)
+            })
+        },
+        WrappedNode::Syntax { rule, text, .. } if rule == "typename" || rule == "groupname" => {
+            let name = text.trim();
+            resolve_definition_in_namespace(definitions, name, namespace).map_or_else(
+                Vec::new,
+                |(resolved_name, node)| {
+                    cbor_sequence_item_labels_in_namespace(
+                        definitions,
+                        node,
+                        definition_namespace(&resolved_name),
+                    )
+                },
+            )
+        },
+        _ => {
+            named_reference(node)
+                .and_then(|name| resolve_definition_in_namespace(definitions, &name, namespace))
+                .map_or_else(Vec::new, |(resolved_name, node)| {
+                    cbor_sequence_item_labels_in_namespace(
+                        definitions,
+                        node,
+                        definition_namespace(&resolved_name),
+                    )
+                })
+        },
+    }
+}
+
+/// Collect display labels from one group choice.
+fn collect_grpchoice_sequence_labels(
+    definitions: &HashMap<String, &WrappedNode>,
+    grpchoice: &WrappedNode,
+    namespace: Option<&str>,
+) -> Vec<String> {
+    let Some(grpent_nodes) = extract_grpent_nodes(grpchoice) else {
+        return Vec::new();
+    };
+    let mut labels = Vec::new();
+    for grpent in grpent_nodes {
+        if let Some(memberkey) = find_memberkey(grpent) {
+            labels.push(memberkey_summary(child_text(memberkey)));
+            continue;
+        }
+        let Some(body) = find_grpent_body(grpent) else {
+            continue;
+        };
+        let nested = cbor_sequence_item_labels_in_namespace(definitions, body, namespace);
+        if nested.is_empty() {
+            labels.push(schema_summary(body));
+        } else {
+            labels.extend(nested);
+        }
+    }
+    labels
+}
+
+/// Resolve a CDDL rule name, preferring the current import namespace for bare references.
+fn resolve_definition_in_namespace<'a>(
+    definitions: &'a HashMap<String, &WrappedNode>,
+    name: &str,
+    namespace: Option<&str>,
+) -> Option<(String, &'a WrappedNode)> {
+    if let Some(namespace) = namespace
+        && !name.contains('.')
+    {
+        let qualified = format!("{namespace}.{name}");
+        if let Some(node) = definitions.get(qualified.as_str()) {
+            return Some((qualified, *node));
+        }
+    }
+
+    definitions.get(name).map(|node| (name.to_owned(), *node))
+}
+
+/// Return the namespace prefix for a qualified imported definition name.
+fn definition_namespace(name: &str) -> Option<&str> {
+    name.rsplit_once('.').map(|(namespace, _rule)| namespace)
+}
+
+/// Return the named reference held by a syntax subtree, if any.
+fn named_reference(node: &WrappedNode) -> Option<String> {
+    node_children_find(node, "typename")
+        .or_else(|| node_children_find(node, "groupname"))
+        .and_then(|node| {
+            match node {
+                WrappedNode::Syntax { text, .. } => Some(text.trim().to_owned()),
+                _ => None,
+            }
+        })
+}
+
+/// Split a `type1` control operator into `(lhs, op, rhs)`.
+fn control_operator_parts(children: &[WrappedNode]) -> Option<(&WrappedNode, &str, &WrappedNode)> {
+    let mut lhs: Option<&WrappedNode> = None;
+    let mut op: Option<&str> = None;
+    let mut rhs: Option<&WrappedNode> = None;
+
+    for child in children {
+        if let WrappedNode::Syntax { rule, .. } = child {
+            match rule.as_str() {
+                "type2" if lhs.is_none() => lhs = Some(child),
+                "ctlop" => op = Some(child_text(child).trim()),
+                "type2" => rhs = Some(child),
+                _ => {},
+            }
+        }
+    }
+
+    Some((lhs?, op?, rhs?))
+}
+
+/// Rewrite diagnostics from the internal sequence-as-array representation.
+fn normalize_cbor_sequence_issues(
+    issues: &mut [ValidationIssue],
+    document: &Document,
+) {
+    let sequence_found = cbor_sequence_found(document);
+    for issue in issues {
+        issue.expected = cbor_sequence_text(&issue.expected);
+        issue.found = match issue.found.as_str() {
+            found if found == format!("{}", Value::Array(document.items().to_vec())) => {
+                sequence_found.clone()
+            },
+            "end of array" => "end of CBOR sequence".to_owned(),
+            found => cbor_sequence_text(found),
+        };
+        if let Some(message) = &mut issue.message {
+            *message = cbor_sequence_text(message);
+        }
+    }
+}
+
+/// Render a concise description of the top-level CBOR sequence.
+fn cbor_sequence_found(document: &Document) -> String {
+    match document.items().len() {
+        0 => "empty CBOR sequence".to_owned(),
+        1 => {
+            document.items().first().map_or_else(
+                || "empty CBOR sequence".to_owned(),
+                |item| format!("1-item CBOR sequence: {item}"),
+            )
+        },
+        len => format!("{len}-item CBOR sequence"),
+    }
+}
+
+/// Convert internal array wording to user-facing CBOR sequence wording.
+fn cbor_sequence_text(text: &str) -> String {
+    text.replace(
+        "one of the listed group alternatives",
+        "one of the listed CBOR sequence group alternatives",
+    )
+    .replace(
+        "spliced array group alternatives",
+        "CBOR sequence group alternatives",
+    )
+    .replace("spliced array group", "CBOR sequence group")
+    .replace("array item sequence", "CBOR sequence")
+    .replace("array item(s)", "CBOR sequence item(s)")
+    .replace("array items", "CBOR sequence items")
+    .replace("array item", "CBOR sequence item")
+    .replace(
+        "an array matching the schema",
+        "a CBOR sequence matching the schema",
+    )
+    .replace("no matching item sequence", "no matching CBOR sequence")
+    .replace("array alternatives", "CBOR sequence alternatives")
+    .replace("array group", "CBOR sequence group")
+    .replace("end of array", "end of CBOR sequence")
+    .replace("trailing array", "trailing CBOR sequence")
+    .replace("empty array", "empty CBOR sequence")
+}
+
+/// Return the controller for a root-level `any .cborseq` or `any .dtrmseq`.
+fn root_cbor_sequence_controller<'a>(
+    definitions: &'a HashMap<String, &WrappedNode>,
+    root_name: &str,
+) -> Option<&'a WrappedNode> {
+    let root = definitions.get(root_name)?;
+    let rhs = rule_rhs_or_self(root)?;
+    sequence_controller_from_node(rhs)
+}
+
+/// Find a sequence controller only when the LHS is the permissive `any` carrier.
+fn sequence_controller_from_node(node: &WrappedNode) -> Option<&WrappedNode> {
+    match node {
+        WrappedNode::Syntax { rule, children, .. } if rule == "type" => {
+            children
+                .iter()
+                .find(|child| matches!(child, WrappedNode::Syntax { rule, .. } if rule == "type1"))
+                .and_then(sequence_controller_from_node)
+        },
+        WrappedNode::Syntax { rule, children, .. } if rule == "type1" => {
+            let mut lhs: Option<&WrappedNode> = None;
+            let mut op: Option<&str> = None;
+            let mut rhs: Option<&WrappedNode> = None;
+
+            for child in children {
+                if let WrappedNode::Syntax { rule, .. } = child {
+                    match rule.as_str() {
+                        "type2" if lhs.is_none() => lhs = Some(child),
+                        "ctlop" => op = Some(child_text(child).trim()),
+                        "type2" => rhs = Some(child),
+                        _ => {},
+                    }
+                }
+            }
+
+            if matches!(op, Some(".cborseq" | ".dtrmseq")) && lhs.is_some_and(is_any_type2) {
+                rhs
+            } else {
+                None
+            }
+        },
+        _ => None,
+    }
+}
+
+/// Return true when a `type2` node is the builtin `any` carrier.
+fn is_any_type2(node: &WrappedNode) -> bool {
+    let WrappedNode::Syntax { rule, text, .. } = node else {
+        return false;
+    };
+    rule == "type2" && text.trim() == "any"
 }
 
 /// Validate one rule by name.
@@ -1891,12 +2314,20 @@ fn render_validation_dump(
         let _ = writeln!(output, "{} -> {}", schema_path.display(), input_path);
     }
 
+    let sequence_note = cbor_sequence_note(notes);
+    if let Some(note) = sequence_note {
+        render_annotation_line(&mut output, note, color);
+        push_dim(&mut output, "\n", color);
+    }
+
     for (index, item) in document.items().iter().enumerate() {
         if index > 0 {
             output.push('\n');
         }
         let path = [PathStep::DocItem(index)];
-        render_value_with_highlight(item, &mut output, color, 0, &path, highlight, notes);
+        let indent = if sequence_note.is_some() { 2 } else { 0 };
+        push_indent(&mut output, indent);
+        render_value_with_highlight(item, &mut output, color, indent, &path, highlight, notes);
     }
 
     if !output.ends_with('\n') {
@@ -1918,7 +2349,11 @@ fn render_value_with_highlight(
 ) {
     let node_highlight = is_highlighted(path, highlight);
     if let Some(note) = schema_note_for_path(notes, path) {
-        render_annotation(output, &note, color, node_highlight);
+        if is_cbor_sequence_dump(notes) && matches!(path, [PathStep::DocItem(_)]) {
+            render_sequence_field_annotation(output, &note, color, node_highlight);
+        } else {
+            render_annotation(output, &note, color, node_highlight);
+        }
     }
 
     match value {
@@ -2187,6 +2622,34 @@ fn render_annotation(
     }
 }
 
+/// Render a standalone schema annotation line.
+fn render_annotation_line(
+    output: &mut String,
+    text: &str,
+    color: bool,
+) {
+    if color {
+        let _ = write!(output, "{}", style(format!("/{text}/")).dim());
+    } else {
+        let _ = write!(output, "/{text}/");
+    }
+}
+
+/// Render a CBOR sequence item label.
+fn render_sequence_field_annotation(
+    output: &mut String,
+    text: &str,
+    color: bool,
+    highlight: bool,
+) {
+    let label = format!("{text}: ");
+    if color && highlight {
+        let _ = write!(output, "{}", style(label).red().bold());
+    } else {
+        push_dim(output, &label, color);
+    }
+}
+
 /// Record a schema note for a path if there is no existing note.
 fn record_schema_note_once(
     path: &[PathStep],
@@ -2304,6 +2767,19 @@ fn schema_note_for_path(
     } else {
         Some(seen.join("; "))
     }
+}
+
+/// Return the root annotation for a CBOR sequence dump.
+fn cbor_sequence_note(notes: &[SchemaNote]) -> Option<&str> {
+    notes
+        .iter()
+        .find(|note| note.path.is_empty() && note.text.starts_with("CBOR sequence "))
+        .map(|note| note.text.as_str())
+}
+
+/// Return true when rendering a top-level raw CBOR sequence.
+fn is_cbor_sequence_dump(notes: &[SchemaNote]) -> bool {
+    cbor_sequence_note(notes).is_some()
 }
 
 /// Render a concise schema summary for a node.
@@ -4868,10 +5344,11 @@ mod tests {
     use cbork_edn::Document;
 
     use super::{
-        PathStep, RootSelectionError, SchemaNote, clear_current_schema_notes, collect_definitions,
-        exec, format_root_selection_error, render_validation_dump, resolve_validation_root,
-        root_rule_name, set_current_source_bytes, take_current_schema_notes,
-        take_current_validation_warnings, validate_document,
+        PathStep, RootSelectionError, SchemaNote, ValidationIssue, clear_current_schema_notes,
+        collect_definitions, exec, format_root_selection_error, render_validation_dump,
+        resolve_validation_root, root_rule_name, set_current_source_bytes,
+        take_current_schema_notes, take_current_validation_warnings, unique_validation_issues,
+        validate_document,
     };
 
     fn write_temp_file(
@@ -5150,6 +5627,105 @@ item = [ 1 ]
         ]);
 
         assert!(issues.is_empty(), "{issues:#?}");
+    }
+
+    #[test]
+    fn validate_any_cborseq_accepts_raw_top_level_sequence() {
+        let schema = br"
+root = any .cborseq [ headers ]
+headers = ( protected: bstr .size 0, unprotected: {} )
+";
+        let (issues, dump) =
+            validate_schema_bytes_with_dump("raw_cborseq.cddl", schema, &[0x40, 0xA0]);
+
+        assert!(issues.is_empty(), "{issues:#?}");
+        assert!(
+            dump.contains("/CBOR sequence headers/\n  protected: h''\n  unprotected: {}"),
+            "{dump}"
+        );
+        assert!(!dump.contains("/CBOR sequence ["), "{dump}");
+        assert!(!dump.contains("/[ headers ]/"), "{dump}");
+    }
+
+    #[test]
+    fn validate_any_cborseq_rejects_wrapped_array_item() {
+        let schema = br"
+root = any .cborseq [ headers ]
+headers = ( protected: bstr .size 0, unprotected: {} )
+";
+        let issues = validate_schema_bytes("wrapped_array_cborseq.cddl", schema, &[
+            0x43, 0x82, 0x40, 0xA0,
+        ]);
+
+        assert!(!issues.is_empty(), "wrapped array unexpectedly passed");
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.expected == "a CBOR sequence matching the schema"),
+            "{issues:#?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.found == "1-item CBOR sequence: h'82 40 a0'"),
+            "{issues:#?}"
+        );
+        assert!(
+            issues.iter().any(|issue| {
+                issue
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("CBOR sequence"))
+            }),
+            "{issues:#?}"
+        );
+    }
+
+    #[test]
+    fn validation_failure_output_deduplicates_exact_issues() {
+        let issues = vec![
+            ValidationIssue::new(
+                vec![PathStep::DocItem(0)],
+                "one of the listed CBOR sequence group alternatives",
+                "no matching CBOR sequence group",
+                Some("none of the CBOR sequence group alternatives matched".to_owned()),
+            ),
+            ValidationIssue::new(
+                vec![PathStep::DocItem(0)],
+                "one of the listed CBOR sequence group alternatives",
+                "no matching CBOR sequence group",
+                Some("none of the CBOR sequence group alternatives matched".to_owned()),
+            ),
+            ValidationIssue::new(
+                vec![PathStep::DocItem(0)],
+                "more CBOR sequence items",
+                "end of CBOR sequence",
+                Some("missing CBOR sequence item for element 0".to_owned()),
+            ),
+        ];
+
+        let unique = unique_validation_issues(&issues);
+
+        assert_eq!(unique.len(), 2);
+        assert_eq!(unique[0], &issues[0]);
+        assert_eq!(unique[1], &issues[2]);
+    }
+
+    #[test]
+    fn validate_non_sequence_root_rejects_top_level_sequence() {
+        let issues = validate_schema_bytes(
+            "non_sequence_root.cddl",
+            b"root = [ bstr .size 0, {} ]\n",
+            &[0x40, 0xA0],
+        );
+
+        assert!(!issues.is_empty(), "top-level sequence unexpectedly passed");
+        assert!(
+            issues.iter().any(|issue| {
+                issue.message.as_deref() == Some("CBOR sequence validation is not yet implemented")
+            }),
+            "{issues:#?}"
+        );
     }
 
     #[test]
