@@ -704,6 +704,18 @@ struct Decode {
     #[bpaf(long)]
     pretty: bool,
 
+    /// Best-effort expansion of byte strings that parse as CBOR.
+    ///
+    /// Without a schema, `cbork decode` cannot know whether a byte string
+    /// carries embedded CBOR. With this flag set, any byte string whose
+    /// bytes parse as one or more CBOR items is shown inside an
+    /// `<<...>>` wrapper using the generic EDN renderer; bytes that fail
+    /// to parse are rendered unchanged as `h'...'`. The flag never alters
+    /// the output of non-`bstr` values and never produces a warning for
+    /// bytes that happen not to parse.
+    #[bpaf(long("try-cbor-bstr"))]
+    try_cbor_bstr: bool,
+
     /// Path to CBOR input, or standard input if omitted.
     #[bpaf(positional("PATH"))]
     path: Option<PathBuf>,
@@ -719,6 +731,7 @@ impl Decode {
             self.path.as_deref(),
             self.no_color || force_no_color,
             self.pretty,
+            self.try_cbor_bstr,
         )
     }
 }

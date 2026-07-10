@@ -3540,4 +3540,125 @@ rule = 1
             "explicit ignored file should still be linted and report its parse error"
         );
     }
+
+    // Plan 016 — `cbork decode` CLI tests covering the schema-free decode
+    // mode and the opt-in `--try-cbor-bstr` flag.
+
+    /// Build a temporary CBOR file from a byte vector and return the path.
+    fn write_temp_cbor(
+        name: &str,
+        bytes: &[u8],
+    ) -> PathBuf {
+        let dir = std::env::temp_dir().join("cbork_decode_cli_test");
+        std::fs::create_dir_all(&dir).expect("temp decode-cli dir should exist");
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).expect("temp cbor file should be written");
+        path
+    }
+
+    /// `cbork decode` without any flag must render a CBOR byte string as
+    /// `h'...'` exactly as before plan 016 (the flag must be the only
+    /// behavior change).
+    #[test]
+    fn cli_decode_plain_byte_string_keeps_raw_h_literal() {
+        // A top-level byte string `h'a1 01 26'` is encoded as `0x43` (a
+        // byte string of length 3) followed by the bytes `a1 01 26`.
+        let bytes = [0x43, 0xA1, 0x01, 0x26];
+        let path = write_temp_cbor("decode_plain.cbor", &bytes);
+        let (code, output) =
+            run_cbork(&["decode", "--no-color", path.to_str().expect("utf-8 path")]);
+        assert_eq!(code, 0, "decode must succeed, got {code}:\n{output}");
+        assert!(
+            output.contains("h'a1 01 26'"),
+            "plain decode must keep the raw byte string:\n{output}"
+        );
+    }
+
+    /// `cbork decode --try-cbor-bstr` must expand byte strings that parse
+    /// as CBOR into the EDN-literals draft's `<<...>>` wrapper.
+    #[test]
+    fn cli_decode_try_cbor_bstr_expands_inner_cbor() {
+        // `{"protected": h'a10126', "unprotected": {}}` — a COSE-like map.
+        // Each text string carries its own length prefix in CBOR.
+        let mut bytes = vec![0xA2];
+        // key: text string of 9 bytes "protected"
+        bytes.push(0x69);
+        bytes.extend_from_slice(b"protected");
+        // value: byte string of 3 bytes
+        bytes.extend_from_slice(&[0x43, 0xA1, 0x01, 0x26]);
+        // key: text string of 11 bytes "unprotected"
+        bytes.push(0x6B);
+        bytes.extend_from_slice(b"unprotected");
+        // value: empty map
+        bytes.push(0xA0);
+        let path = write_temp_cbor("decode_try_cbor.cbor", &bytes);
+        let (code, output) = run_cbork(&[
+            "decode",
+            "--no-color",
+            "--try-cbor-bstr",
+            path.to_str().expect("utf-8 path"),
+        ]);
+        assert_eq!(code, 0, "decode must succeed, got {code}:\n{output}");
+        assert!(
+            output.contains("<<"),
+            "try-cbor-bstr must emit `<<` wrapper:\n{output}"
+        );
+        assert!(
+            output.contains(">>"),
+            "try-cbor-bstr must emit `>>` wrapper:\n{output}"
+        );
+        assert!(
+            output.contains("1: -7"),
+            "try-cbor-bstr must expose the decoded value:\n{output}"
+        );
+        // The raw byte-string form is replaced.
+        assert!(
+            !output.contains("h'a1 01 26'"),
+            "raw bytes must not appear once expanded:\n{output}"
+        );
+    }
+
+    /// `cbork decode --try-cbor-bstr` must keep empty byte strings as
+    /// `h''` because empty embedded sequences are reserved for explicit
+    /// `.cborseq`/`.prefpseq`/`.dtrmseq` schema contexts.
+    #[test]
+    fn cli_decode_try_cbor_bstr_keeps_empty_byte_string() {
+        // `0x40` is the empty byte string.
+        let path = write_temp_cbor("decode_try_empty.cbor", &[0x40]);
+        let (code, output) = run_cbork(&[
+            "decode",
+            "--no-color",
+            "--try-cbor-bstr",
+            path.to_str().expect("utf-8 path"),
+        ]);
+        assert_eq!(code, 0, "decode must succeed, got {code}:\n{output}");
+        assert!(
+            output.contains("h''"),
+            "empty byte string must stay raw under try-cbor-bstr:\n{output}"
+        );
+        assert!(
+            !output.contains("<<"),
+            "empty byte string must not produce a wrapper:\n{output}"
+        );
+    }
+
+    /// `cbork decode --try-cbor-bstr` must keep non-CBOR bytes raw without
+    /// emitting a warning.
+    #[test]
+    fn cli_decode_try_cbor_bstr_keeps_non_cbor_bytes_raw() {
+        // `0x43 0xFF 0xFF 0xFF` is a 3-byte string whose bytes are not
+        // a valid CBOR item.
+        let path = write_temp_cbor("decode_try_invalid.cbor", &[0x43, 0xFF, 0xFF, 0xFF]);
+        let (code, output) = run_cbork(&[
+            "decode",
+            "--no-color",
+            "--try-cbor-bstr",
+            path.to_str().expect("utf-8 path"),
+        ]);
+        assert_eq!(code, 0, "decode must succeed, got {code}:\n{output}");
+        assert!(
+            output.contains("h'ff ff ff'"),
+            "non-CBOR bytes must stay raw under try-cbor-bstr:\n{output}"
+        );
+    }
 }

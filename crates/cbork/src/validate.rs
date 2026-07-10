@@ -41,7 +41,11 @@ use cbork_edn::{Document, Float, MapEntry, Value};
 use console::style;
 
 use crate::{
-    decode::{ColorKind, push_bracket, push_colored, push_dim, push_indent, read_input},
+    decode::{
+        ColorKind, EmbedBudget, EmbedLimits, push_bracket, push_colored, push_dim, push_indent,
+        read_input, release_embed_depth, reset_render_counters, reset_sequence_counter,
+        try_charge_embed, try_charge_sequence_item,
+    },
     diagnostics::{has_error_diagnostics, print_compiler_diagnostics},
 };
 
@@ -49,6 +53,7 @@ thread_local! {
     static CURRENT_SOURCE_BYTES: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     static CURRENT_SCHEMA_NOTES: RefCell<Vec<SchemaNote>> = const { RefCell::new(Vec::new()) };
     static CURRENT_VALIDATION_WARNINGS: RefCell<Vec<ValidationWarning>> = const { RefCell::new(Vec::new()) };
+    static CURRENT_EMBEDDED_CBOR_HINTS: RefCell<Vec<EmbeddedCborHint>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Schema annotation captured during validation for later rendering.
@@ -67,6 +72,69 @@ struct ValidationWarning {
     path: Vec<PathStep>,
     /// Human-readable warning text.
     text: String,
+}
+
+/// The CBOR serialization control operator that produced an embedded payload.
+///
+/// The schema-aware renderer uses this to pick a single-item vs. sequence
+/// presentation and to carry the `.dtrm`/`.prefp` validation behavior
+/// separately from rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddedCborOperator {
+    /// `.cbor` — single embedded CBOR item.
+    Cbor,
+    /// `.cborseq` — one or more embedded CBOR items.
+    CborSeq,
+    /// `.prefp` — single embedded CBOR item (preferred-plus encoding).
+    Prefp,
+    /// `.prefpseq` — one or more embedded CBOR items (preferred-plus encoding).
+    PrefpSeq,
+    /// `.dtrm` — single deterministically-encoded embedded CBOR item.
+    Dtrm,
+    /// `.dtrmseq` — one or more deterministically-encoded embedded CBOR items.
+    DtrmSeq,
+}
+
+impl EmbeddedCborOperator {
+    /// Return true when this operator permits more than one top-level item
+    /// inside the embedded byte string.
+    fn allows_sequence(self) -> bool {
+        matches!(self, Self::CborSeq | Self::PrefpSeq | Self::DtrmSeq,)
+    }
+
+    /// Return true when this operator requires deterministic encoding
+    /// (`draft-ietf-cbor-serialization-06` Section 5).
+    fn requires_deterministic(self) -> bool {
+        matches!(self, Self::Dtrm | Self::DtrmSeq)
+    }
+
+    /// Return true when this operator requires preferred-plus encoding
+    /// (`draft-ietf-cbor-serialization-06` Section 4), either as its own
+    /// check (`.prefp`/`.prefpseq`) or as a strict superset (`.dtrm`/
+    /// `.dtrmseq`).
+    fn requires_preferred_plus(self) -> bool {
+        matches!(
+            self,
+            Self::Prefp | Self::PrefpSeq | Self::Dtrm | Self::DtrmSeq,
+        )
+    }
+}
+
+/// Hint that an embedded-CBOR byte string at a known path has been parsed
+/// and can be rendered in its decoded form during the detailed dump.
+///
+/// The retained `Document` preserves every top-level item, so the renderer
+/// can choose between single-item and sequence presentation without
+/// re-parsing the raw bytes. Original bytes are still recoverable from the
+/// `Value::Bytes` the validator originally handed off.
+#[derive(Debug, Clone)]
+struct EmbeddedCborHint {
+    /// Path of the outer byte-string field.
+    path: Vec<PathStep>,
+    /// Serialization operator that produced the byte string.
+    operator: EmbeddedCborOperator,
+    /// Parsed embedded payload.
+    document: Document,
 }
 
 /// Validate a CDDL schema against a CBOR payload.
@@ -138,6 +206,7 @@ pub(crate) fn exec(
     set_current_source_bytes(&input);
     clear_current_schema_notes();
     clear_current_validation_warnings();
+    clear_current_embedded_cbor_hints();
 
     let root_name = match resolve_validation_root(&compiled, schema_path, type_name) {
         Ok((name, _node)) => name,
@@ -154,6 +223,7 @@ pub(crate) fn exec(
     let issues = validate_document(&compiled, &definitions, &root_name, &document);
     let schema_notes = take_current_schema_notes();
     let validation_warnings = take_current_validation_warnings();
+    let embedded_hints = take_current_embedded_cbor_hints();
 
     if issues.is_empty() {
         if fails {
@@ -161,7 +231,7 @@ pub(crate) fn exec(
                 schema_path,
                 &input_path,
                 &document,
-                &schema_notes,
+                &RenderContext::new(&schema_notes, &embedded_hints),
                 None,
                 !force_no_color,
             );
@@ -186,7 +256,7 @@ pub(crate) fn exec(
                 schema_path,
                 &input_path,
                 &document,
-                &schema_notes,
+                &RenderContext::new(&schema_notes, &embedded_hints),
                 None,
                 !force_no_color,
             );
@@ -214,6 +284,7 @@ pub(crate) fn exec(
                 &input_path,
                 &document,
                 &schema_notes,
+                &embedded_hints,
                 &issues,
                 &validation_warnings,
                 force_no_color,
@@ -237,6 +308,7 @@ pub(crate) fn exec(
         &input_path,
         &document,
         &schema_notes,
+        &embedded_hints,
         &issues,
         &validation_warnings,
         force_no_color,
@@ -250,6 +322,7 @@ fn print_validation_failure(
     input_path: &str,
     document: &Document,
     schema_notes: &[SchemaNote],
+    embedded_hints: &[EmbeddedCborHint],
     issues: &[ValidationIssue],
     validation_warnings: &[ValidationWarning],
     force_no_color: bool,
@@ -269,7 +342,7 @@ fn print_validation_failure(
         schema_path,
         input_path,
         document,
-        schema_notes,
+        &RenderContext::new(schema_notes, embedded_hints),
         Some(highlight),
         !force_no_color,
     );
@@ -348,6 +421,12 @@ enum PathStep {
     MapValue(usize),
     /// Tag payload.
     TagInner,
+    /// Top-level item inside an embedded CBOR payload (single-item or sequence).
+    ///
+    /// Distinct from `ArrayItem` and `TagInner` so the renderer can identify
+    /// items inside a `<<...>>` wrapper without colliding with array indices
+    /// or ordinary tag payloads at the same path level.
+    EmbeddedItem(usize),
 }
 
 /// Numeric value used by ordering control-operator validation.
@@ -1601,31 +1680,69 @@ fn validate_ctlop_value(
             // context that CDDL does not carry.
         },
         ".cbor" => {
-            let _ = validate_embedded_cbor(compiled, definitions, rhs, value, path, issues, false);
-        },
-        ".cborseq" => {
-            let _ = validate_embedded_cbor(compiled, definitions, rhs, value, path, issues, true);
-        },
-        ".dtrm" => {
-            let _ = validate_deterministic_serialization(
+            let _ = validate_embedded_cbor_with_hint(
                 compiled,
                 definitions,
                 rhs,
                 value,
                 path,
                 issues,
-                false,
+                EmbeddedCborOperator::Cbor,
+            );
+        },
+        ".cborseq" => {
+            let _ = validate_embedded_cbor_with_hint(
+                compiled,
+                definitions,
+                rhs,
+                value,
+                path,
+                issues,
+                EmbeddedCborOperator::CborSeq,
+            );
+        },
+        ".prefp" => {
+            let _ = validate_embedded_cbor_with_hint(
+                compiled,
+                definitions,
+                rhs,
+                value,
+                path,
+                issues,
+                EmbeddedCborOperator::Prefp,
+            );
+        },
+        ".prefpseq" => {
+            let _ = validate_embedded_cbor_with_hint(
+                compiled,
+                definitions,
+                rhs,
+                value,
+                path,
+                issues,
+                EmbeddedCborOperator::PrefpSeq,
+            );
+        },
+        ".dtrm" => {
+            let _ = validate_embedded_cbor_with_hint(
+                compiled,
+                definitions,
+                rhs,
+                value,
+                path,
+                issues,
+                EmbeddedCborOperator::Dtrm,
             );
         },
         ".dtrmseq" => {
-            let _ = validate_deterministic_serialization(
+            let _ = validate_embedded_cbor_with_hint(
                 compiled,
                 definitions,
                 rhs,
                 value,
                 path,
                 issues,
-                true,
+                EmbeddedCborOperator::DtrmSeq,
             );
         },
         _ => {
@@ -1651,182 +1768,204 @@ fn find_tag_inner_type(node: &WrappedNode) -> Option<&WrappedNode> {
         .find(|child| matches!(child, WrappedNode::Syntax { rule, .. } if rule == "type"))
 }
 
-/// Validate an embedded CBOR payload from a `bstr`.
-fn validate_embedded_cbor(
+/// Validate an embedded CBOR payload from a `bstr` and record a render hint.
+///
+/// This is the single entry point for the `.cbor`, `.cborseq`, `.prefp`,
+/// `.prefpseq`, `.dtrm`, and `.dtrmseq` operators. On a successful byte-string
+/// parse the `Document` is attached to the byte-string's path so the renderer
+/// can show the decoded view inside the EDN-literals draft's `<<...>>`
+/// wrapper. The hint is recorded even when the inner value fails the RHS
+/// schema, so the user can still see what was decoded alongside the
+/// validation error; raw `h'...'` fallback is reserved for parse failure,
+/// wrong item cardinality, failed deterministic-encoding validation, and
+/// resource-limit failures.
+///
+/// The serialization-draft checks use `cbork-edn`'s deterministic and
+/// preferred-plus re-encoders:
+/// * `.dtrm`/`.dtrmseq` use `to_deterministic_bytes` (sorted maps;
+///   `draft-ietf-cbor-serialization-06` Section 5).
+/// * `.prefp`/`.prefpseq` use `to_preferred_plus_bytes` (source map order preserved; same
+///   draft Section 4).
+///
+/// For `.dtrm` and `.dtrmseq`, the operator may also appear on a non-`bstr`
+/// carrier (e.g. `any .dtrm T`). In that case the deterministic check still
+/// runs against the surrounding source bytes, but no embedded-CBOR hint is
+/// recorded because the value is not a byte string.
+fn validate_embedded_cbor_with_hint(
     compiled: &CompiledCDDL,
     definitions: &HashMap<String, &WrappedNode>,
     rhs: &WrappedNode,
     value: &Value,
     path: &mut Vec<PathStep>,
     issues: &mut Vec<ValidationIssue>,
-    allow_sequence: bool,
-) -> bool {
-    validate_embedded_cbor_with_serialization(
-        compiled,
-        definitions,
-        rhs,
-        value,
-        path,
-        issues,
-        allow_sequence,
-        false,
-    )
-}
-
-/// Validate an embedded CBOR payload from a `bstr`.
-fn validate_embedded_cbor_with_serialization(
-    compiled: &CompiledCDDL,
-    definitions: &HashMap<String, &WrappedNode>,
-    rhs: &WrappedNode,
-    value: &Value,
-    path: &mut Vec<PathStep>,
-    issues: &mut Vec<ValidationIssue>,
-    allow_sequence: bool,
-    deterministic: bool,
+    operator: EmbeddedCborOperator,
 ) -> bool {
     let start_len = issues.len();
-    let Some(bytes) = value_to_bytes(value) else {
-        issues.push(ValidationIssue::new(
-            path.clone(),
-            "bytes",
-            format!("{value}"),
-            Some("embedded CBOR operators expect a byte string".to_owned()),
-        ));
-        return false;
-    };
 
-    let document = match Document::parse(bytes) {
-        Ok(document) => document,
-        Err(error) => {
-            issues.push(ValidationIssue::new(
-                path.clone(),
-                "embedded CBOR",
-                format!("{value}"),
-                Some(format!("failed to parse embedded CBOR: {error}")),
-            ));
-            return false;
-        },
-    };
+    if let Some(bytes) = value_to_bytes(value) {
+        // Parse as a sequence for the `.cborseq`/`.prefpseq`/`.dtrmseq`
+        // operators so an empty payload is represented as a zero-item
+        // document and can be rendered as `<<>>`. Single-item operators
+        // continue to use the strict `Document::parse` to reject an empty
+        // byte string as a missing required item.
+        let document_result = if operator.allows_sequence() {
+            Document::parse_sequence(bytes)
+        } else {
+            Document::parse(bytes)
+        };
 
-    if deterministic {
-        match document.to_deterministic_bytes() {
-            Ok(encoded) if encoded == bytes => {},
-            Ok(_) => {
+        let document = match document_result {
+            Ok(document) => document,
+            Err(error) => {
                 issues.push(ValidationIssue::new(
                     path.clone(),
-                    "deterministic CBOR",
-                    render_bytes(bytes),
-                    Some("embedded CBOR was not deterministically encoded".to_owned()),
+                    "embedded CBOR",
+                    format!("{value}"),
+                    Some(format!("failed to parse embedded CBOR: {error}")),
                 ));
                 return false;
             },
+        };
+
+        // Preferred-plus check applies to `.prefp`/`.prefpseq`/`.dtrm`/`.dtrmseq`.
+        // For `.dtrm`/`.dtrmseq` the deterministic re-encoder already covers
+        // preferred-plus plus map sorting, so we only call it once.
+        if operator.requires_deterministic() {
+            match document.to_deterministic_bytes() {
+                Ok(encoded) if encoded == bytes => {},
+                Ok(_) => {
+                    issues.push(ValidationIssue::new(
+                        path.clone(),
+                        "deterministic CBOR",
+                        render_bytes(bytes),
+                        Some("embedded CBOR was not deterministically encoded".to_owned()),
+                    ));
+                    // Raw bytes must stay visible; do not record the hint.
+                    return false;
+                },
+                Err(error) => {
+                    issues.push(ValidationIssue::new(
+                        path.clone(),
+                        "deterministic CBOR",
+                        render_bytes(bytes),
+                        Some(format!("failed to re-encode embedded CBOR: {error}")),
+                    ));
+                    return false;
+                },
+            }
+        } else if operator.requires_preferred_plus() {
+            match document.to_preferred_plus_bytes() {
+                Ok(encoded) if encoded == bytes => {},
+                Ok(_) => {
+                    issues.push(ValidationIssue::new(
+                        path.clone(),
+                        "preferred-plus CBOR",
+                        render_bytes(bytes),
+                        Some(
+                            "embedded CBOR was not in preferred-plus serialization \
+                             (`draft-ietf-cbor-serialization-06` Section 4)"
+                                .to_owned(),
+                        ),
+                    ));
+                    // Do not return: keep the hint so the decoded view remains
+                    // visible alongside the preferred-plus validation error.
+                },
+                Err(error) => {
+                    issues.push(ValidationIssue::new(
+                        path.clone(),
+                        "preferred-plus CBOR",
+                        render_bytes(bytes),
+                        Some(format!("failed to re-encode embedded CBOR: {error}")),
+                    ));
+                },
+            }
+        }
+
+        if !operator.allows_sequence() && document.items().len() != 1 {
+            issues.push(ValidationIssue::new(
+                path.clone(),
+                "a single embedded CBOR item",
+                format!("{} top-level item(s)", document.items().len()),
+                Some("embedded CBOR was not a single item".to_owned()),
+            ));
+            return false;
+        }
+
+        let previous_source = set_current_source_bytes(bytes);
+        if operator.allows_sequence() {
+            for (index, item) in document.items().iter().enumerate() {
+                let mut child_path = path.clone();
+                child_path.push(PathStep::EmbeddedItem(index));
+                validate_schema_node(compiled, definitions, rhs, item, &mut child_path, issues);
+            }
+        } else {
+            let Some(item) = document.items().first() else {
+                restore_current_source_bytes(previous_source);
+                return false;
+            };
+            let mut child_path = path.clone();
+            child_path.push(PathStep::EmbeddedItem(0));
+            validate_schema_node(compiled, definitions, rhs, item, &mut child_path, issues);
+        }
+        restore_current_source_bytes(previous_source);
+
+        // Record the hint whenever embedded parsing succeeded, regardless
+        // of RHS validation outcome. The renderer uses this to expose the
+        // decoded view inside the `<<...>>` wrapper; validation errors are
+        // already in the issue list.
+        record_embedded_cbor_hint(path, operator, document);
+
+        return issues.len() == start_len;
+    }
+
+    // Non-byte-string carriers. `.dtrm` / `.dtrmseq` may also be applied
+    // directly (e.g. `any .dtrm T`); perform the deterministic check against
+    // the surrounding source bytes when required, then validate the value
+    // against the RHS. No embedded-CBOR hint is recorded because the value
+    // is not a byte string.
+    if operator.requires_deterministic() {
+        let source = current_source_bytes_view();
+        if source.is_empty() {
+            issues.push(ValidationIssue::new(
+                path.clone(),
+                "deterministic CBOR input",
+                format!("{value}"),
+                Some("no source bytes were available for deterministic comparison".to_owned()),
+            ));
+            return false;
+        }
+        let encoded = match value.to_deterministic_bytes() {
+            Ok(encoded) => encoded,
             Err(error) => {
                 issues.push(ValidationIssue::new(
                     path.clone(),
                     "deterministic CBOR",
-                    render_bytes(bytes),
-                    Some(format!("failed to re-encode embedded CBOR: {error}")),
+                    format!("{value}"),
+                    Some(format!("failed to re-encode CBOR: {error}")),
                 ));
                 return false;
             },
-        }
-    }
-
-    if !allow_sequence && document.items().len() != 1 {
-        issues.push(ValidationIssue::new(
-            path.clone(),
-            "a single embedded CBOR item",
-            format!("{} top-level item(s)", document.items().len()),
-            Some("embedded CBOR was not a single item".to_owned()),
-        ));
-        return false;
-    }
-
-    let previous_source = set_current_source_bytes(bytes);
-    if allow_sequence {
-        for (index, item) in document.items().iter().enumerate() {
-            let mut child_path = path.clone();
-            child_path.push(PathStep::TagInner);
-            child_path.push(PathStep::ArrayItem(index));
-            validate_schema_node(compiled, definitions, rhs, item, &mut child_path, issues);
-        }
-        restore_current_source_bytes(previous_source);
-        return issues.len() == start_len;
-    }
-
-    let Some(item) = document.items().first() else {
-        restore_current_source_bytes(previous_source);
-        return false;
-    };
-
-    let mut child_path = path.clone();
-    child_path.push(PathStep::TagInner);
-    validate_schema_node(compiled, definitions, rhs, item, &mut child_path, issues);
-    restore_current_source_bytes(previous_source);
-    issues.len() == start_len
-}
-
-/// Validate a deterministic serialization controller.
-fn validate_deterministic_serialization(
-    compiled: &CompiledCDDL,
-    definitions: &HashMap<String, &WrappedNode>,
-    rhs: &WrappedNode,
-    value: &Value,
-    path: &mut Vec<PathStep>,
-    issues: &mut Vec<ValidationIssue>,
-    allow_sequence: bool,
-) -> bool {
-    let start_len = issues.len();
-
-    if value_to_bytes(value).is_some() {
-        return validate_embedded_cbor_with_serialization(
-            compiled,
-            definitions,
-            rhs,
-            value,
-            path,
-            issues,
-            allow_sequence,
-            true,
-        );
-    }
-
-    let source = current_source_bytes();
-    if source.is_empty() {
-        issues.push(ValidationIssue::new(
-            path.clone(),
-            "deterministic CBOR input",
-            format!("{value}"),
-            Some("no source bytes were available for deterministic comparison".to_owned()),
-        ));
-        return false;
-    }
-
-    let encoded = match value.to_deterministic_bytes() {
-        Ok(encoded) => encoded,
-        Err(error) => {
+        };
+        if encoded != source {
             issues.push(ValidationIssue::new(
                 path.clone(),
                 "deterministic CBOR",
                 format!("{value}"),
-                Some(format!("failed to re-encode CBOR: {error}")),
+                Some("encoded bytes did not match deterministic re-encoding".to_owned()),
             ));
             return false;
-        },
-    };
-
-    if encoded != source {
-        issues.push(ValidationIssue::new(
-            path.clone(),
-            "deterministic CBOR",
-            format!("{value}"),
-            Some("encoded bytes did not match deterministic re-encoding".to_owned()),
-        ));
-        return false;
+        }
     }
 
     validate_schema_node(compiled, definitions, rhs, value, path, issues);
     issues.len() == start_len
+}
+
+/// Borrow the current deterministic-comparison source bytes without taking
+/// ownership, used by `validate_embedded_cbor_with_hint` for non-byte-string
+/// `.dtrm` / `.dtrmseq` carriers.
+fn current_source_bytes_view() -> Vec<u8> {
+    CURRENT_SOURCE_BYTES.with(|slot| slot.borrow().clone())
 }
 
 /// Validate a `regexp` control operator.
@@ -2292,12 +2431,35 @@ fn is_highlighted(
     highlight.is_some_and(|highlight| path == highlight)
 }
 
+/// Render-context carried through the schema-aware renderer.
+///
+/// Bundles the captured `SchemaNote`s with the `EmbeddedCborHint`s recorded
+/// during validation. Schema notes already include labels recorded at every
+/// inner path of an embedded payload, so the renderer does not need to look
+/// up definitions or re-resolve the compiled schema at render time.
+struct RenderContext<'a> {
+    /// Captured schema annotations.
+    notes: &'a [SchemaNote],
+    /// Captured embedded-CBOR render hints.
+    hints: &'a [EmbeddedCborHint],
+}
+
+impl<'a> RenderContext<'a> {
+    /// Build a render context for the given validation run.
+    fn new(
+        notes: &'a [SchemaNote],
+        hints: &'a [EmbeddedCborHint],
+    ) -> Self {
+        Self { notes, hints }
+    }
+}
+
 /// Render a validation dump with optional highlighting.
 fn render_validation_dump(
     schema_path: &Path,
     input_path: &str,
     document: &Document,
-    notes: &[SchemaNote],
+    ctx: &RenderContext<'_>,
     highlight: Option<&[PathStep]>,
     color: bool,
 ) -> String {
@@ -2314,12 +2476,13 @@ fn render_validation_dump(
         let _ = writeln!(output, "{} -> {}", schema_path.display(), input_path);
     }
 
-    let sequence_note = cbor_sequence_note(notes);
+    let sequence_note = cbor_sequence_note(ctx.notes);
     if let Some(note) = sequence_note {
         render_annotation_line(&mut output, note, color);
         push_dim(&mut output, "\n", color);
     }
 
+    reset_render_counters();
     for (index, item) in document.items().iter().enumerate() {
         if index > 0 {
             output.push('\n');
@@ -2327,7 +2490,7 @@ fn render_validation_dump(
         let path = [PathStep::DocItem(index)];
         let indent = if sequence_note.is_some() { 2 } else { 0 };
         push_indent(&mut output, indent);
-        render_value_with_highlight(item, &mut output, color, indent, &path, highlight, notes);
+        render_value_with_highlight(item, &mut output, color, indent, &path, highlight, ctx);
     }
 
     if !output.ends_with('\n') {
@@ -2345,11 +2508,20 @@ fn render_value_with_highlight(
     indent: usize,
     path: &[PathStep],
     highlight: Option<&[PathStep]>,
-    notes: &[SchemaNote],
+    ctx: &RenderContext<'_>,
 ) {
+    // Embedded-CBOR byte strings are rendered as `<<decoded view>>` instead
+    // of raw `h'...'` whenever a hint is available for this path.
+    if matches!(value, Value::Bytes(_))
+        && let Some(hint) = embedded_cbor_hint_for_path(ctx.hints, path)
+    {
+        render_embedded_cbor_hint(hint, output, color, indent, path, highlight, ctx);
+        return;
+    }
+
     let node_highlight = is_highlighted(path, highlight);
-    if let Some(note) = schema_note_for_path(notes, path) {
-        if is_cbor_sequence_dump(notes) && matches!(path, [PathStep::DocItem(_)]) {
+    if let Some(note) = schema_note_for_path(ctx.notes, path) {
+        if is_cbor_sequence_dump(ctx.notes) && matches!(path, [PathStep::DocItem(_)]) {
             render_sequence_field_annotation(output, &note, color, node_highlight);
         } else {
             render_annotation(output, &note, color, node_highlight);
@@ -2456,7 +2628,7 @@ fn render_value_with_highlight(
                     indent.saturating_add(2),
                     &child_path,
                     highlight,
-                    notes,
+                    ctx,
                 );
                 if index + 1 < values.len() {
                     render_punct(output, ",", color, false);
@@ -2489,7 +2661,7 @@ fn render_value_with_highlight(
                     path,
                     index,
                     highlight,
-                    notes,
+                    ctx,
                 );
                 let mut value_path = path.to_vec();
                 value_path.push(PathStep::MapValue(index));
@@ -2520,7 +2692,7 @@ fn render_value_with_highlight(
                     indent,
                     &child_path,
                     highlight,
-                    notes,
+                    ctx,
                 );
                 push_bracket(output, ")", color, depth);
             } else {
@@ -2535,7 +2707,7 @@ fn render_value_with_highlight(
                     indent,
                     &child_path,
                     highlight,
-                    notes,
+                    ctx,
                 );
                 push_bracket(output, ")", color, depth);
             }
@@ -2552,7 +2724,7 @@ fn render_map_entry_with_highlight(
     path: &[PathStep],
     entry_index: usize,
     highlight: Option<&[PathStep]>,
-    notes: &[SchemaNote],
+    ctx: &RenderContext<'_>,
 ) {
     let key_path = {
         let mut path = path.to_vec();
@@ -2564,9 +2736,7 @@ fn render_map_entry_with_highlight(
         path.push(PathStep::MapValue(entry_index));
         path
     };
-    render_value_with_highlight(
-        &entry.key, output, color, indent, &key_path, highlight, notes,
-    );
+    render_value_with_highlight(&entry.key, output, color, indent, &key_path, highlight, ctx);
     render_punct(output, ": ", color, is_highlighted(path, highlight));
     render_value_with_highlight(
         &entry.value,
@@ -2575,8 +2745,163 @@ fn render_map_entry_with_highlight(
         indent,
         &value_path,
         highlight,
-        notes,
+        ctx,
     );
+}
+
+/// Render an embedded-CBOR byte string's decoded view inside the
+/// EDN-literals draft's `<<...>>` wrapper.
+///
+/// `indent` is the column where the wrapper delimiters should land. Each
+/// embedded item is rendered into a fresh buffer using the same CDN
+/// renderer with the appropriate child path, then inserted into the wrapper
+/// at the calculated indentation. Nested embedded-CBOR byte strings inside
+/// the decoded view are handled automatically by passing the same hints
+/// through `render_value_with_highlight`.
+fn render_embedded_cbor_hint(
+    hint: &EmbeddedCborHint,
+    output: &mut String,
+    color: bool,
+    indent: usize,
+    path: &[PathStep],
+    highlight: Option<&[PathStep]>,
+    ctx: &RenderContext<'_>,
+) {
+    let depth = indent / 2;
+    let node_highlight = is_highlighted(path, highlight);
+    if let Some(note) = schema_note_for_path(ctx.notes, path) {
+        if is_cbor_sequence_dump(ctx.notes) && matches!(path, [PathStep::DocItem(_)]) {
+            render_sequence_field_annotation(output, &note, color, node_highlight);
+        } else {
+            render_annotation(output, &note, color, node_highlight);
+        }
+    }
+
+    let items: &[Value] = hint.document.items();
+    let inner_indent = indent.saturating_add(2);
+
+    push_bracket(output, "<<", color, depth);
+    if items.is_empty() {
+        push_bracket(output, ">>", color, depth);
+        return;
+    }
+
+    let is_single = !hint.operator.allows_sequence();
+    let limits = EmbedLimits::default();
+    let bytes_len = hint
+        .document
+        .to_preferred_plus_bytes()
+        .map(|b| b.len())
+        .unwrap_or(0);
+    let expanded = try_charge_embed(bytes_len, limits);
+    if expanded == EmbedBudget::LimitReached {
+        // Resource limit reached; emit raw `h'...'` form per the
+        // EDN-literals draft's byte-string diagnostic notation and stop.
+        let raw = render_bytes_fallback_for_hint(hint);
+        push_colored(output, raw, ColorKind::Bytes, color);
+        return;
+    }
+
+    push_dim(output, "\n", color);
+
+    if is_single {
+        let Some(item) = items.first() else {
+            release_embed_depth();
+            push_indent(output, indent);
+            push_bracket(output, ">>", color, depth);
+            return;
+        };
+        let mut child_path = path.to_vec();
+        child_path.push(PathStep::EmbeddedItem(0));
+        push_indent(output, inner_indent);
+        render_value_with_highlight(
+            item,
+            output,
+            color,
+            inner_indent,
+            &child_path,
+            highlight,
+            ctx,
+        );
+        push_dim(output, "\n", color);
+    } else {
+        let last = items.len().saturating_sub(1);
+        reset_sequence_counter();
+        for (index, item) in items.iter().enumerate() {
+            if !try_charge_sequence_item(limits) {
+                // Sequence too long; emit a trailing diagnostic rather
+                // than silently truncating.
+                push_indent(output, inner_indent);
+                push_colored(
+                    output,
+                    format!("... ({} more item(s) truncated)", items.len() - index),
+                    ColorKind::Simple,
+                    color,
+                );
+                push_dim(output, "\n", color);
+                release_embed_depth();
+                push_indent(output, indent);
+                push_bracket(output, ">>", color, depth);
+                return;
+            }
+            push_indent(output, inner_indent);
+            let mut child_path = path.to_vec();
+            child_path.push(PathStep::EmbeddedItem(index));
+            render_value_with_highlight(
+                item,
+                output,
+                color,
+                inner_indent,
+                &child_path,
+                highlight,
+                ctx,
+            );
+            if index != last {
+                render_punct(output, ",", color, false);
+            }
+            push_dim(output, "\n", color);
+        }
+    }
+
+    release_embed_depth();
+    push_indent(output, indent);
+    push_bracket(output, ">>", color, depth);
+}
+
+/// Render the original bytes for a hint as `h'...'` for use when a
+/// resource limit is reached.
+fn render_bytes_fallback_for_hint(hint: &EmbeddedCborHint) -> String {
+    let bytes = hint.document.to_preferred_plus_bytes().unwrap_or_default();
+    render_bytes(&bytes)
+}
+
+/// Prefix every non-empty continuation line in `text` with `indent` spaces.
+///
+/// The first line is left alone because the caller has already positioned
+/// it; only subsequent lines need shifting. Empty lines are emitted without
+/// trailing whitespace. The helper preserves the EDN-literals draft's
+/// comma-separated formatting inside the `<<...>>` wrapper.
+#[cfg(test)]
+#[allow(dead_code)]
+fn indent_multiline(
+    text: &str,
+    indent: usize,
+) -> String {
+    let mut out = String::with_capacity(text.len() + indent * 8);
+    let mut first = true;
+    for line in text.split('\n') {
+        if !first {
+            out.push('\n');
+            if !line.is_empty() {
+                for _ in 0..indent {
+                    out.push(' ');
+                }
+            }
+        }
+        out.push_str(line);
+        first = false;
+    }
+    out
 }
 
 /// Render one token with optional highlight.
@@ -2686,9 +3011,54 @@ fn schema_note_count() -> usize {
     CURRENT_SCHEMA_NOTES.with(|slot| slot.borrow().len())
 }
 
-/// Truncate recorded schema notes after a failed speculative branch.
+/// Truncate recorded schema notes and embedded-CBOR hints after a failed
+/// speculative branch. Both streams grow in lockstep with validation, so a
+/// single rollback point covers both.
 fn truncate_current_schema_notes(len: usize) {
     CURRENT_SCHEMA_NOTES.with(|slot| slot.borrow_mut().truncate(len));
+    CURRENT_EMBEDDED_CBOR_HINTS.with(|slot| slot.borrow_mut().truncate(len));
+}
+
+/// Record an embedded-CBOR render hint at `path` if no hint is already present
+/// at that path.
+///
+/// The hint carries the parsed `Document` so the renderer can produce the
+/// decoded view without re-parsing. The original byte string remains the
+/// authoritative value at the path; the hint only augments rendering.
+fn record_embedded_cbor_hint(
+    path: &[PathStep],
+    operator: EmbeddedCborOperator,
+    document: Document,
+) {
+    CURRENT_EMBEDDED_CBOR_HINTS.with(|slot| {
+        let mut hints = slot.borrow_mut();
+        if hints.iter().any(|hint| hint.path == path) {
+            return;
+        }
+        hints.push(EmbeddedCborHint {
+            path: path.to_vec(),
+            operator,
+            document,
+        });
+    });
+}
+
+/// Take all recorded embedded-CBOR hints.
+fn take_current_embedded_cbor_hints() -> Vec<EmbeddedCborHint> {
+    CURRENT_EMBEDDED_CBOR_HINTS.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+}
+
+/// Clear recorded embedded-CBOR hints.
+fn clear_current_embedded_cbor_hints() {
+    CURRENT_EMBEDDED_CBOR_HINTS.with(|slot| slot.borrow_mut().clear());
+}
+
+/// Return the embedded-CBOR hint recorded for `path`, if any.
+fn embedded_cbor_hint_for_path<'a>(
+    hints: &'a [EmbeddedCborHint],
+    path: &[PathStep],
+) -> Option<&'a EmbeddedCborHint> {
+    hints.iter().find(|hint| hint.path == path)
 }
 
 /// Record a validation warning for a path if the same warning is not already present.
@@ -2837,6 +3207,9 @@ fn format_path(path: &[PathStep]) -> String {
                 let _ = write!(out, ".value[{index}]");
             },
             PathStep::TagInner => out.push_str(".tag"),
+            PathStep::EmbeddedItem(index) => {
+                let _ = write!(out, ".embedded[{index}]");
+            },
         }
     }
     out
@@ -5328,11 +5701,6 @@ fn restore_current_source_bytes(previous: Vec<u8>) {
     CURRENT_SOURCE_BYTES.with(|slot| *slot.borrow_mut() = previous);
 }
 
-/// Fetch the current source bytes.
-fn current_source_bytes() -> Vec<u8> {
-    CURRENT_SOURCE_BYTES.with(|slot| slot.borrow().clone())
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -5344,11 +5712,11 @@ mod tests {
     use cbork_edn::Document;
 
     use super::{
-        PathStep, RootSelectionError, SchemaNote, ValidationIssue, clear_current_schema_notes,
-        collect_definitions, exec, format_root_selection_error, render_validation_dump,
-        resolve_validation_root, root_rule_name, set_current_source_bytes,
-        take_current_schema_notes, take_current_validation_warnings, unique_validation_issues,
-        validate_document,
+        PathStep, RenderContext, RootSelectionError, SchemaNote, ValidationIssue,
+        clear_current_schema_notes, collect_definitions, exec, format_root_selection_error,
+        indent_multiline, render_validation_dump, resolve_validation_root, root_rule_name,
+        set_current_source_bytes, take_current_schema_notes, take_current_validation_warnings,
+        unique_validation_issues, validate_document,
     };
 
     fn write_temp_file(
@@ -5405,9 +5773,12 @@ mod tests {
         set_current_source_bytes(cbor);
         clear_current_schema_notes();
         super::clear_current_validation_warnings();
+        super::clear_current_embedded_cbor_hints();
         let issues = validate_document(&compiled, &definitions, &root, &document);
         let notes = take_current_schema_notes();
-        let dump = render_validation_dump(&schema, "input.cbor", &document, &notes, None, false);
+        let hints = super::take_current_embedded_cbor_hints();
+        let ctx = RenderContext::new(&notes, &hints);
+        let dump = render_validation_dump(&schema, "input.cbor", &document, &ctx, None, false);
         (issues, dump)
     }
 
@@ -5833,11 +6204,19 @@ headers = ( protected: bstr .size 0, unprotected: {} )
             },
         ];
 
+        let compiled = CompiledCDDL::compile(
+            write_temp_file("validation_dump_inline.cddl", b"root = 1\n"),
+            None::<&Path>,
+        )
+        .expect("schema should compile");
+        let _definitions = collect_definitions(&compiled.complete_nodes);
+        let ctx = RenderContext::new(&notes, &[]);
+
         let rendered = render_validation_dump(
             Path::new("schema.cddl"),
             "input.cbor",
             &document,
-            &notes,
+            &ctx,
             None,
             false,
         );
@@ -6214,5 +6593,511 @@ headers = ( protected: bstr .size 0, unprotected: {} )
         // error into a pass: this is a schema/root-selection error,
         // not a data validation mismatch.
         assert!(!exec(&schema, Some(&cbor), false, false, true, None, true));
+    }
+
+    // Plan 016 — embedded-CBOR byte strings must render as `<<...>>` with
+    // their decoded contents, not as opaque `h'...'` values, whenever the
+    // schema carries a `.cbor`, `.cborseq`, `.prefp`, `.prefpseq`, `.dtrm`,
+    // or `.dtrmseq` control operator.
+    //
+    // Fixture provenance:
+    // * The `<<...>>` output syntax is taken from `rfc/draft-ietf-cbor-edn-literals-25.txt`
+    //   Section 2.5.6 (embedded CBOR) and Section 5.1 (grammar). The comma-separated sequence
+    //   inside the wrapper is the draft's prescribed formatting.
+    // * The deterministic re-encoding used by `.dtrm`/`.dtrmseq` is
+    //   `rfc/draft-ietf-cbor-serialization-06.txt` Section 5 (deterministic serialization),
+    //   which is a strict superset of Section 4 (preferred-plus serialization).
+    // * The preferred-plus re-encoding used by `.prefp`/`.prefpseq` is
+    //   `rfc/draft-ietf-cbor-serialization-06.txt` Section 4.
+    // * The COSE-style `{protected: h'a10126', unprotected: {}}` example is taken from
+    //   `rfc/draft-ietf-cbor-edn-literals-25.txt` Section 1.3.3 (embedded CBOR in a COSE
+    //   example).
+
+    fn encode_cbor_map(entries: &[(u8, u8)]) -> Vec<u8> {
+        let mut out = vec![0xA0 | u8::try_from(entries.len()).expect("fits in u8")];
+        for (key, value) in entries {
+            out.push(*key);
+            out.push(*value);
+        }
+        out
+    }
+
+    fn encode_cbor_bstr(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        match bytes.len() {
+            0..=23 => out.push(0x40 | u8::try_from(bytes.len()).expect("fits in u8")),
+            24..=255 => {
+                out.push(0x58);
+                out.push(u8::try_from(bytes.len()).expect("fits in u8"));
+            },
+            _ => {
+                out.push(0x59);
+                let len = u16::try_from(bytes.len()).expect("fits in u16");
+                out.extend_from_slice(&len.to_be_bytes());
+            },
+        }
+        out.extend_from_slice(bytes);
+        out
+    }
+
+    #[test]
+    fn embedded_cbor_bstr_renders_as_double_angle_wrapper() {
+        let dir = write_temp_dir_tree(&["embedded_cbor_basic"]);
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b"root = [ protected: bstr .cbor headers, unprotected: {} ]\n\
+              headers = { ? 1 => int }\n",
+        );
+        // Build `[bstr({1: -7}), {}]`.
+        let inner = encode_cbor_map(&[(0x01, 0x26)]);
+        let mut cbor = vec![0x82];
+        cbor.extend(encode_cbor_bstr(&inner));
+        cbor.push(0xA0);
+        let _cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        let (issues, dump) = validate_schema_bytes_with_dump(
+            "embedded_cbor_basic.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &cbor,
+        );
+
+        assert!(issues.is_empty(), "{issues:#?}");
+        // The `<<...>>` wrapper is present, the byte string is gone, and
+        // the inner `{1: -7}` map is shown with the schema-aware labels.
+        assert!(dump.contains("<<"), "{dump}");
+        assert!(dump.contains(">>"), "{dump}");
+        assert!(dump.contains("1: /int/ -7"), "{dump}");
+        assert!(!dump.contains("h'a1 01 26'"), "{dump}");
+    }
+
+    #[test]
+    fn plain_bstr_does_not_get_decoded() {
+        let dir = write_temp_dir_tree(&["plain_bstr"]);
+        let schema = write_cddl(&dir, "schema.cddl", b"root = { payload: bstr }\n");
+        // Even though the bytes are valid CBOR (a single integer `1`),
+        // a plain `bstr` carrier must not be auto-decoded.
+        let mut cbor = vec![0xA1, 0x67, b'p', b'a', b'y', b'l', b'o', b'a', b'd'];
+        cbor.extend(encode_cbor_bstr(&[0x01]));
+        let _cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        let (issues, dump) = validate_schema_bytes_with_dump(
+            "plain_bstr.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &cbor,
+        );
+
+        assert!(issues.is_empty(), "{issues:#?}");
+        assert!(dump.contains("h'01'"), "{dump}");
+        assert!(!dump.contains("<<"), "{dump}");
+    }
+
+    #[test]
+    fn embedded_cbor_indent_helper_indents_continuation_lines() {
+        let text = "first\nsecond\nthird";
+        let indented = indent_multiline(text, 4);
+        assert_eq!(indented, "first\n    second\n    third");
+
+        let blank = "first\n\nthird";
+        let indented_blank = indent_multiline(blank, 2);
+        assert_eq!(indented_blank, "first\n\n  third");
+    }
+
+    #[allow(dead_code)]
+    fn encode_cbor_array(items: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x80 | u8::try_from(items.len()).expect("fits in u8")];
+        out.extend_from_slice(items);
+        out
+    }
+
+    #[test]
+    fn embedded_cborseq_renders_multiple_top_level_items() {
+        let dir = write_temp_dir_tree(&["embedded_cborseq"]);
+        let schema = write_cddl(&dir, "schema.cddl", b"root = { ids: bstr .cborseq uint }\n");
+        // CBOR sequence with two integers: 1 and 2 → `01 02`.
+        let mut cbor = vec![0xA1, 0x63, b'i', b'd', b's'];
+        cbor.extend(encode_cbor_bstr(&[0x01, 0x02]));
+        let _cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        let (issues, dump) = validate_schema_bytes_with_dump(
+            "embedded_cborseq.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &cbor,
+        );
+
+        assert!(issues.is_empty(), "{issues:#?}");
+        assert!(dump.contains("<<"), "{dump}");
+        assert!(dump.contains(">>"), "{dump}");
+        // Both items are present in the wrapper, separated by a comma.
+        assert!(dump.contains("1,"), "{dump}");
+        assert!(dump.contains('2'), "{dump}");
+    }
+
+    #[test]
+    fn embedded_dtrm_keeps_raw_bytes_on_non_deterministic() {
+        let dir = write_temp_dir_tree(&["embedded_dtrm"]);
+        let schema = write_cddl(&dir, "schema.cddl", b"root = { payload: bstr .dtrm int }\n");
+        // A non-deterministically encoded CBOR map for `{1: 2}` —
+        // `a2 02 01 01 02` is non-canonical. The validator must report
+        // the deterministic failure and the renderer must keep the raw
+        // bytes (no `<<...>>` wrapper) so the user can compare.
+        let mut cbor = vec![0xA1, 0x67, b'p', b'a', b'y', b'l', b'o', b'a', b'd'];
+        let bad_bytes = vec![0xA2, 0x02, 0x01, 0x01, 0x02];
+        cbor.extend(encode_cbor_bstr(&bad_bytes));
+        let _cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        let (issues, dump) = validate_schema_bytes_with_dump(
+            "embedded_dtrm.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &cbor,
+        );
+
+        assert!(!issues.is_empty(), "{issues:#?}");
+        assert!(dump.contains("h'a2 02 01 01 02'"), "{dump}");
+        assert!(!dump.contains("<<"), "{dump}");
+    }
+
+    #[test]
+    fn embedded_dtrm_accepts_canonical_encoding() {
+        let dir = write_temp_dir_tree(&["embedded_dtrm_ok"]);
+        let schema = write_cddl(&dir, "schema.cddl", b"root = { payload: bstr .dtrm int }\n");
+        // `0x01` is the canonical encoding of integer 1.
+        let mut cbor = vec![0xA1, 0x67, b'p', b'a', b'y', b'l', b'o', b'a', b'd'];
+        cbor.extend(encode_cbor_bstr(&[0x01]));
+        let _cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        let (issues, dump) = validate_schema_bytes_with_dump(
+            "embedded_dtrm_ok.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &cbor,
+        );
+
+        assert!(issues.is_empty(), "{issues:#?}");
+        assert!(dump.contains("<<"), "{dump}");
+        assert!(dump.contains('1'), "{dump}");
+    }
+
+    #[test]
+    fn embedded_cbor_nested_two_levels() {
+        let dir = write_temp_dir_tree(&["nested_two_levels"]);
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b"outer = bstr .cbor middle\n\
+              middle = { inner: bstr .cbor leaf }\n\
+              leaf = { value: uint }\n",
+        );
+        // Build leaf = {value: 1} → `a1 65 76 61 6c 75 65 01`
+        let leaf_bytes = vec![0xA1, 0x65, b'v', b'a', b'l', b'u', b'e', 0x01];
+        // Build middle = {inner: bstr(leaf)} → `a1 65 69 6e 6e 65 72 47 <leaf>`
+        let mut middle_bytes = vec![0xA1, 0x65, b'i', b'n', b'n', b'e', b'r'];
+        middle_bytes.extend(encode_cbor_bstr(&leaf_bytes));
+        // Build outer = bstr(middle)
+        let outer_bytes = encode_cbor_bstr(&middle_bytes);
+
+        let _cbor_path = write_cbor(&dir, "value.cbor", &outer_bytes);
+
+        let (issues, dump) = validate_schema_bytes_with_dump(
+            "nested_two_levels.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &outer_bytes,
+        );
+
+        assert!(issues.is_empty(), "{issues:#?}");
+        // Two levels of `<<...>>` should appear.
+        let open = dump.matches("<<").count();
+        let close = dump.matches(">>").count();
+        assert_eq!(open, 2, "expected two `<<` wrappers, got:\n{dump}");
+        assert_eq!(close, 2, "expected two `>>` wrappers, got:\n{dump}");
+        // The leaf map should be visible at the deepest level.
+        assert!(dump.contains("\"value\""), "{dump}");
+        assert!(dump.contains('1'), "{dump}");
+    }
+
+    #[test]
+    fn embedded_cbor_any_rhs_renders_generic_decoded_view() {
+        let dir = write_temp_dir_tree(&["any_rhs"]);
+        let schema = write_cddl(&dir, "schema.cddl", b"root = { payload: bstr .cbor any }\n");
+        // { payload: bstr(any) } where the inner CBOR is `{1: -7}`.
+        let inner = encode_cbor_map(&[(0x01, 0x26)]);
+        let mut cbor = vec![0xA1, 0x67, b'p', b'a', b'y', b'l', b'o', b'a', b'd'];
+        cbor.extend(encode_cbor_bstr(&inner));
+        let _cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        let (issues, dump) = validate_schema_bytes_with_dump(
+            "any_rhs.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &cbor,
+        );
+
+        assert!(issues.is_empty(), "{issues:#?}");
+        assert!(dump.contains("<<"), "{dump}");
+        assert!(dump.contains(">>"), "{dump}");
+        // Generic renderer: just the key/value without a named schema label.
+        assert!(dump.contains("1: -7"), "{dump}");
+    }
+
+    #[test]
+    fn embedded_cbor_malformed_keeps_raw_bytes_and_emits_issue() {
+        let dir = write_temp_dir_tree(&["malformed"]);
+        let schema = write_cddl(&dir, "schema.cddl", b"root = { payload: bstr .cbor int }\n");
+        // CBOR that does not parse: `0xFF` is an invalid initial byte.
+        let mut cbor = vec![0xA1, 0x67, b'p', b'a', b'y', b'l', b'o', b'a', b'd'];
+        cbor.extend(encode_cbor_bstr(&[0xFF]));
+        let _cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        let (issues, dump) = validate_schema_bytes_with_dump(
+            "malformed.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &cbor,
+        );
+
+        assert!(!issues.is_empty(), "{issues:#?}");
+        // Raw bytes remain visible because the embedded parse failed.
+        assert!(dump.contains("h'ff'"), "{dump}");
+        assert!(!dump.contains("<<"), "{dump}");
+    }
+
+    /// Three-level nested `bstr .cbor` regression fixture from plan 016.
+    /// The schema deliberately has three `bstr .cbor` carriers, each in
+    /// a distinct outer context, so the validator records three separate
+    /// hints and the renderer must produce three nested `<<...>>` wrappers
+    /// with the deepest `value` field still visible.
+    #[test]
+    fn embedded_cbor_three_level_nested_regression() {
+        let dir = write_temp_dir_tree(&["nested_three_levels"]);
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b"root = { outer: bstr .cbor middle }\n\
+              middle = { inner: bstr .cbor leaf }\n\
+              leaf = { tag: bstr .cbor value }\n\
+              value = { v: uint }\n",
+        );
+        // value = {v: 1} → `a1 61 76 01`
+        let value_bytes = vec![0xA1, 0x61, b'v', 0x01];
+        // leaf = {tag: bstr(value)} → `a1 63 74 61 67 44 <value>`
+        let mut leaf_bytes = vec![0xA1, 0x63, b't', b'a', b'g'];
+        leaf_bytes.extend(encode_cbor_bstr(&value_bytes));
+        // middle = {inner: bstr(leaf)} → `a1 65 69 6e 6e 65 72 <bstr(leaf)>`
+        let mut middle_bytes = vec![0xA1, 0x65, b'i', b'n', b'n', b'e', b'r'];
+        middle_bytes.extend(encode_cbor_bstr(&leaf_bytes));
+        // root = {outer: bstr(middle)} → `a1 65 6f 75 74 65 72 <bstr(middle)>`
+        let mut root_bytes = vec![0xA1, 0x65, b'o', b'u', b't', b'e', b'r'];
+        root_bytes.extend(encode_cbor_bstr(&middle_bytes));
+        let _cbor_path = write_cbor(&dir, "value.cbor", &root_bytes);
+
+        let (issues, dump) = validate_schema_bytes_with_dump(
+            "nested_three_levels.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &root_bytes,
+        );
+
+        assert!(issues.is_empty(), "{issues:#?}");
+        // Three nested `<<...>>` wrappers, one per `.cbor` operator.
+        let open = dump.matches("<<").count();
+        let close = dump.matches(">>").count();
+        assert_eq!(open, 3, "expected three `<<` wrappers, got:\n{dump}");
+        assert_eq!(close, 3, "expected three `>>` wrappers, got:\n{dump}");
+        // The leaf `v` field must appear at the deepest level.
+        assert!(dump.contains("\"v\""), "{dump}");
+        assert!(dump.contains('1'), "{dump}");
+    }
+
+    /// Empty `.cborseq` payload renders as `<<>>` per
+    /// `rfc/draft-ietf-cbor-edn-literals-25.txt` Section 2.5.6.
+    #[test]
+    fn embedded_cborseq_empty_payload_renders_double_angle_empty() {
+        let dir = write_temp_dir_tree(&["empty_cborseq"]);
+        let schema = write_cddl(&dir, "schema.cddl", b"root = { ids: bstr .cborseq uint }\n");
+        let mut cbor = vec![0xA1, 0x63, b'i', b'd', b's'];
+        cbor.extend(encode_cbor_bstr(&[]));
+        let _cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        let (issues, dump) = validate_schema_bytes_with_dump(
+            "empty_cborseq.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &cbor,
+        );
+
+        assert!(issues.is_empty(), "{issues:#?}");
+        assert!(dump.contains("<<>>"), "{dump}");
+    }
+
+    /// Empty `.cbor` payload is rejected (a single-item context cannot be empty).
+    #[test]
+    fn embedded_cbor_empty_payload_rejected() {
+        let dir = write_temp_dir_tree(&["empty_cbor_reject"]);
+        let schema = write_cddl(&dir, "schema.cddl", b"root = { payload: bstr .cbor int }\n");
+        let mut cbor = vec![0xA1, 0x67, b'p', b'a', b'y', b'l', b'o', b'a', b'd'];
+        cbor.extend(encode_cbor_bstr(&[]));
+        let _cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        let (issues, _dump) = validate_schema_bytes_with_dump(
+            "empty_cbor_reject.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &cbor,
+        );
+
+        assert!(!issues.is_empty(), "{issues:#?}");
+    }
+
+    /// `.prefp` accepts preferred-plus encoding per
+    /// `rfc/draft-ietf-cbor-serialization-06.txt` Section 4.
+    #[test]
+    fn embedded_prefp_accepts_canonical() {
+        let dir = write_temp_dir_tree(&["prefp_ok"]);
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b"root = { payload: bstr .prefp int }\n",
+        );
+        // `0x01` is shortest-form for the integer 1.
+        let mut cbor = vec![0xA1, 0x67, b'p', b'a', b'y', b'l', b'o', b'a', b'd'];
+        cbor.extend(encode_cbor_bstr(&[0x01]));
+        let _cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        let (issues, dump) = validate_schema_bytes_with_dump(
+            "prefp_ok.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &cbor,
+        );
+
+        assert!(issues.is_empty(), "{issues:#?}");
+        assert!(dump.contains("<<"), "{dump}");
+        assert!(dump.contains('1'), "{dump}");
+    }
+
+    /// `.prefp` rejects non-shortest-form integer encoding but keeps the
+    /// decoded view visible alongside the validation error.
+    #[test]
+    fn embedded_prefp_rejects_non_shortest_form_but_keeps_decoded_view() {
+        let dir = write_temp_dir_tree(&["prefp_fail"]);
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b"root = { payload: bstr .prefp int }\n",
+        );
+        // `0x18 0x01` is a non-shortest encoding of integer 1; the
+        // draft requires shortest-form encoding.
+        let mut cbor = vec![0xA1, 0x67, b'p', b'a', b'y', b'l', b'o', b'a', b'd'];
+        cbor.extend(encode_cbor_bstr(&[0x18, 0x01]));
+        let _cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        let (issues, dump) = validate_schema_bytes_with_dump(
+            "prefp_fail.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &cbor,
+        );
+
+        // The encoding fails the preferred-plus check; the issue must
+        // be reported and the decoded view must remain visible.
+        assert!(!issues.is_empty(), "{issues:#?}");
+        assert!(
+            issues.iter().any(|i| {
+                i.message
+                    .as_deref()
+                    .is_some_and(|m| m.contains("preferred-plus"))
+            }),
+            "{issues:#?}"
+        );
+        assert!(dump.contains("<<"), "{dump}");
+        assert!(dump.contains('1'), "{dump}");
+    }
+
+    /// `.prefpseq` accepts an empty sequence.
+    #[test]
+    fn embedded_prefpseq_empty_payload_renders_double_angle_empty() {
+        let dir = write_temp_dir_tree(&["empty_prefpseq"]);
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b"root = { ids: bstr .prefpseq uint }\n",
+        );
+        let mut cbor = vec![0xA1, 0x63, b'i', b'd', b's'];
+        cbor.extend(encode_cbor_bstr(&[]));
+        let _cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        let (issues, dump) = validate_schema_bytes_with_dump(
+            "empty_prefpseq.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &cbor,
+        );
+
+        assert!(issues.is_empty(), "{issues:#?}");
+        assert!(dump.contains("<<>>"), "{dump}");
+    }
+
+    /// `.cborseq` with two top-level items renders both inside `<<...>>`,
+    /// separated by commas per the EDN-literals draft.
+    #[test]
+    fn embedded_cborseq_two_items_shows_both_with_comma() {
+        let dir = write_temp_dir_tree(&["cborseq_two_items"]);
+        let schema = write_cddl(&dir, "schema.cddl", b"root = { ids: bstr .cborseq uint }\n");
+        let mut cbor = vec![0xA1, 0x63, b'i', b'd', b's'];
+        cbor.extend(encode_cbor_bstr(&[0x01, 0x02]));
+        let _cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        let (issues, dump) = validate_schema_bytes_with_dump(
+            "cborseq_two_items.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &cbor,
+        );
+
+        assert!(issues.is_empty(), "{issues:#?}");
+        assert!(dump.contains("1,"), "{dump}");
+        assert!(dump.contains('2'), "{dump}");
+    }
+
+    /// Resource-limit fallback: when the embedded byte count exceeds
+    /// `max_embedded_bytes`, the renderer must emit raw `h'...'` rather
+    /// than crash or silently truncate.
+    #[test]
+    fn embedded_cbor_resource_limit_falls_back_to_raw_bytes() {
+        // Build a payload larger than `max_embedded_bytes` (16 MiB).
+        // We use the raw document path rather than going through the
+        // schema compiler, exercising the renderer's own limit checks.
+        use cbork_edn::Document;
+
+        use crate::decode::EmbedLimits;
+        let limits = EmbedLimits {
+            depth: 32,
+            embedded_bytes: 64,
+            sequence_items: 4096,
+        };
+        // Outer document: a map with one key whose value is a byte string.
+        let inner: Vec<u8> = (0..200).collect();
+        let mut outer = vec![0xA1, 0x01, 0x58, u8::try_from(inner.len()).unwrap()];
+        outer.extend_from_slice(&inner);
+        let document = Document::parse(&outer).expect("outer parses");
+        let rendered = crate::decode::render_document(&document, false, false, false, limits);
+        // The byte string exceeds the budget; renderer must emit raw bytes.
+        assert!(rendered.contains("h'"), "{rendered}");
+        // No `<<` expansion should occur.
+        assert!(!rendered.contains("<<"), "{rendered}");
+    }
+
+    /// Resource-limit fallback: when the recursive depth exceeds
+    /// `max_depth`, the renderer must stop expanding nested levels.
+    #[test]
+    fn embedded_cbor_resource_limit_depth_falls_back() {
+        use cbork_edn::Document;
+
+        use crate::decode::EmbedLimits;
+        let limits = EmbedLimits {
+            depth: 2,
+            embedded_bytes: 1024 * 1024,
+            sequence_items: 4096,
+        };
+        // Build two levels of nesting:
+        // inner = `0x01` (an integer)
+        // outer = `0x41 0x01` (byte string of length 1 containing inner)
+        let outer = vec![0x41, 0x01];
+        let document = Document::parse(&outer).expect("outer parses");
+        // The single byte string parses successfully but the depth limit
+        // of 2 is reached at the first level, so the renderer should
+        // fall back to raw bytes.
+        let rendered = crate::decode::render_document(&document, false, false, false, limits);
+        assert!(rendered.contains("h'01"), "{rendered}");
     }
 }

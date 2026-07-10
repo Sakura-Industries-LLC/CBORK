@@ -37,6 +37,12 @@ pub struct Document {
 impl Document {
     /// Parse raw CBOR bytes into a document.
     ///
+    /// `Document::parse` requires at least one top-level item.
+    /// Empty input is rejected so that the single-item semantics used by
+    /// `.cbor`, `.prefp`, and `.dtrm` validation stay strict; sequences
+    /// that may legitimately carry zero items must use
+    /// [`Document::parse_sequence`] instead.
+    ///
     /// # Errors
     ///
     /// Returns an error if the input is empty, contains invalid CBOR, or ends
@@ -51,6 +57,31 @@ impl Document {
 
         if items.is_empty() {
             return Err(Error::empty_input());
+        }
+
+        Ok(Self { items })
+    }
+
+    /// Parse raw CBOR bytes into a document, treating empty input as the
+    /// empty sequence (zero top-level items).
+    ///
+    /// The EDN-literals draft permits the empty `<<>>` literal; the
+    /// `.cborseq`, `.prefpseq`, and `.dtrmseq` CDDL operators accept zero
+    /// embedded items as a valid case. The schema-aware renderer can then
+    /// emit `<<>>` directly. Single-item contexts (`.cbor`, `.prefp`,
+    /// `.dtrm`) must still require a non-empty payload and continue to
+    /// use [`Document::parse`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input contains invalid CBOR or ends with
+    /// trailing bytes that are not valid CBOR.
+    pub fn parse_sequence(bytes: &[u8]) -> Result<Self, Error> {
+        let mut decoder = Decoder::new(bytes);
+        let mut items = Vec::new();
+
+        while decoder.position() < bytes.len() {
+            items.push(parse_value(&mut decoder)?);
         }
 
         Ok(Self { items })
@@ -77,16 +108,47 @@ impl Document {
     /// Encode the document using a deterministic CBOR ordering.
     ///
     /// Maps are sorted by canonical key encoding before serialization.
+    /// This is the byte sequence that a deterministic-encoding
+    /// (`draft-ietf-cbor-serialization-06` Section 5) implementation
+    /// would emit for this tree.
     ///
     /// # Errors
     ///
     /// Returns an error if the tree cannot be serialized.
     pub fn to_deterministic_bytes(&self) -> Result<Vec<u8>, Error> {
+        self.encode_with(false)
+    }
+
+    /// Encode the document using the preferred-plus serialization
+    /// (`draft-ietf-cbor-serialization-06` Section 4) without sorting
+    /// map keys.
+    ///
+    /// Unlike [`Self::to_deterministic_bytes`], this preserves the source
+    /// map order. It still enforces the common preferred-plus rules:
+    /// shortest-form integer arguments, definite-length strings/arrays/maps,
+    /// shortest-form floats, half-precision quiet NaN, and big-number
+    /// compactness.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tree cannot be serialized.
+    pub fn to_preferred_plus_bytes(&self) -> Result<Vec<u8>, Error> {
+        self.encode_with(true)
+    }
+
+    /// Encode the document. When `preserve_map_order` is true, the source
+    /// map order is preserved; otherwise maps are sorted by canonical
+    /// key encoding. Both modes apply the preferred-plus encoding rules
+    /// for integers, strings, floats, and big numbers.
+    fn encode_with(
+        &self,
+        preserve_map_order: bool,
+    ) -> Result<Vec<u8>, Error> {
         let mut bytes = Vec::new();
         {
             let mut encoder = Encoder::new(&mut bytes);
             for item in &self.items {
-                encode_value(&mut encoder, item)?;
+                encode_value(&mut encoder, item, preserve_map_order)?;
             }
         }
         Ok(bytes)
@@ -223,17 +285,45 @@ impl fmt::Display for Value {
 impl Value {
     /// Encode this value using a deterministic CBOR ordering.
     ///
+    /// Maps are sorted by canonical key encoding. This is the byte
+    /// sequence that a deterministic-encoding
+    /// (`draft-ietf-cbor-serialization-06` Section 5) implementation
+    /// would emit for this tree.
+    ///
     /// # Errors
     ///
     /// Returns an error if the value cannot be serialized.
     pub fn to_deterministic_bytes(&self) -> Result<Vec<u8>, Error> {
-        let mut bytes = Vec::new();
-        {
-            let mut encoder = Encoder::new(&mut bytes);
-            encode_value(&mut encoder, self)?;
-        }
-        Ok(bytes)
+        encode_with_map_order(self, false)
     }
+
+    /// Encode this value using the preferred-plus serialization
+    /// (`draft-ietf-cbor-serialization-06` Section 4) without sorting
+    /// map keys.
+    ///
+    /// Source map order is preserved; preferred-plus rules for integers,
+    /// strings, floats, and big numbers still apply.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the value cannot be serialized.
+    pub fn to_preferred_plus_bytes(&self) -> Result<Vec<u8>, Error> {
+        encode_with_map_order(self, true)
+    }
+}
+
+/// Shared encoder helper used by both deterministic and preferred-plus
+/// public methods.
+fn encode_with_map_order(
+    value: &Value,
+    preserve_map_order: bool,
+) -> Result<Vec<u8>, Error> {
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = Encoder::new(&mut bytes);
+        encode_value(&mut encoder, value, preserve_map_order)?;
+    }
+    Ok(bytes)
 }
 
 /// Parse a single CBOR value from the decoder.
@@ -461,10 +551,12 @@ fn write_bytes(
     f.write_str("'")
 }
 
-/// Encode a parsed value back to CBOR using deterministic ordering.
+/// Encode a parsed value back to CBOR using the preferred-plus
+/// serialization rules with optional map sorting.
 fn encode_value<W>(
     encoder: &mut Encoder<W>,
     value: &Value,
+    preserve_map_order: bool,
 ) -> Result<(), Error>
 where
     W: Write,
@@ -478,9 +570,9 @@ where
         Value::Simple(value) => encode_simple(encoder, *value)?,
         Value::Bytes(value) => encode_bytes(encoder, value)?,
         Value::Text(value) => encode_text(encoder, value)?,
-        Value::Array(values) => encode_array(encoder, values)?,
-        Value::Map(entries) => encode_map(encoder, entries)?,
-        Value::Tag(tag, inner) => encode_tag(encoder, *tag, inner)?,
+        Value::Array(values) => encode_array(encoder, values, preserve_map_order)?,
+        Value::Map(entries) => encode_map(encoder, entries, preserve_map_order)?,
+        Value::Tag(tag, inner) => encode_tag(encoder, *tag, inner, preserve_map_order)?,
     }
 
     Ok(())
@@ -653,6 +745,7 @@ where
 fn encode_array<W>(
     encoder: &mut Encoder<W>,
     values: &[Value],
+    preserve_map_order: bool,
 ) -> Result<(), Error>
 where
     W: Write,
@@ -662,25 +755,42 @@ where
         .map(|_| ())
         .map_err(|_| Error::decode(0, "encode error"))?;
     for item in values {
-        encode_value(encoder, item)?;
+        encode_value(encoder, item, preserve_map_order)?;
     }
     Ok(())
 }
 
-/// Encode a CBOR map in deterministic key order.
+/// Encode a CBOR map. When `preserve_map_order` is true, entries are
+/// emitted in source order; otherwise they are sorted by the bytewise
+/// lexicographic order of their deterministic key encodings, as required
+/// for `draft-ietf-cbor-serialization-06` Section 5 deterministic
+/// serialization.
 fn encode_map<W>(
     encoder: &mut Encoder<W>,
     entries: &[MapEntry],
+    preserve_map_order: bool,
 ) -> Result<(), Error>
 where
     W: Write,
 {
+    encoder
+        .map(entries.len() as u64)
+        .map(|_| ())
+        .map_err(|_| Error::decode(0, "encode error"))?;
+    if preserve_map_order {
+        for entry in entries {
+            encode_value(encoder, &entry.key, preserve_map_order)?;
+            encode_value(encoder, &entry.value, preserve_map_order)?;
+        }
+        return Ok(());
+    }
+
     let mut sorted = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
         let mut key_bytes = Vec::new();
         {
             let mut key_encoder = Encoder::new(&mut key_bytes);
-            encode_value(&mut key_encoder, &entry.key)?;
+            encode_value(&mut key_encoder, &entry.key, false)?;
         }
         sorted.push((index, key_bytes, entry));
     }
@@ -693,13 +803,9 @@ where
             .then_with(|| left.0.cmp(&right.0))
     });
 
-    encoder
-        .map(entries.len() as u64)
-        .map(|_| ())
-        .map_err(|_| Error::decode(0, "encode error"))?;
     for (_, _, entry) in sorted {
-        encode_value(encoder, &entry.key)?;
-        encode_value(encoder, &entry.value)?;
+        encode_value(encoder, &entry.key, false)?;
+        encode_value(encoder, &entry.value, false)?;
     }
     Ok(())
 }
@@ -709,6 +815,7 @@ fn encode_tag<W>(
     encoder: &mut Encoder<W>,
     tag: u64,
     inner: &Value,
+    preserve_map_order: bool,
 ) -> Result<(), Error>
 where
     W: Write,
@@ -717,7 +824,7 @@ where
         .tag(Tag::new(tag))
         .map(|_| ())
         .map_err(|_| Error::decode(0, "encode error"))?;
-    encode_value(encoder, inner)
+    encode_value(encoder, inner, preserve_map_order)
 }
 
 /// Return whether an `f32` value round-trips exactly through `f16`.
@@ -908,5 +1015,57 @@ mod tests {
     fn rejects_empty_input() {
         let error = parse(&[]).expect_err("error");
         assert!(matches!(error, Error::EmptyInput));
+    }
+
+    /// Empty input is accepted by `parse_sequence` as a zero-item sequence.
+    /// The EDN-literals draft (`draft-ietf-cbor-edn-literals-25` Section 2.5.6)
+    /// permits the empty `<<>>` literal, and CDDL `.cborseq`/`.prefpseq`/
+    /// `.dtrmseq` operators accept zero embedded items as a valid case.
+    #[test]
+    fn parse_sequence_accepts_empty_input() {
+        let document = Document::parse_sequence(&[]).expect("parse_sequence");
+        assert!(document.items().is_empty());
+        assert!(!document.is_sequence());
+    }
+
+    /// `parse_sequence` still rejects bytes that are not valid CBOR.
+    #[test]
+    fn parse_sequence_rejects_invalid_bytes() {
+        // `0xFF` is not a valid CBOR initial byte.
+        let error = Document::parse_sequence(&[0xFF]).expect_err("parse_sequence");
+        assert!(matches!(error, Error::Decode { .. }));
+    }
+
+    /// `to_preferred_plus_bytes` preserves the source map order while
+    /// still applying the preferred-plus rules from
+    /// `draft-ietf-cbor-serialization-06` Section 4.
+    #[test]
+    fn preferred_plus_preserves_map_order() {
+        let mut bytes = Vec::new();
+        let mut encoder = Encoder::new(&mut bytes);
+        encoder.map(2).expect("map");
+        encoder.u8(2).expect("key");
+        encoder.u8(2).expect("value");
+        encoder.u8(1).expect("key");
+        encoder.u8(1).expect("value");
+
+        let document = parse(&bytes).expect("parse");
+
+        let preferred_plus = document.to_preferred_plus_bytes().expect("encode");
+        let deterministic = document.to_deterministic_bytes().expect("encode");
+
+        // Preferred-plus must round-trip the source map order.
+        assert_eq!(preferred_plus, bytes);
+        // Deterministic must sort by key.
+        assert_ne!(deterministic, bytes);
+    }
+
+    /// `to_preferred_plus_bytes` enforces shortest-form integer arguments.
+    #[test]
+    fn preferred_plus_uses_shortest_integer_form() {
+        // `0x18 0x01` is a non-shortest encoding of `1`.
+        let document = parse(&[0x18, 0x01]).expect("parse");
+        let preferred_plus = document.to_preferred_plus_bytes().expect("encode");
+        assert_eq!(preferred_plus, vec![0x01]);
     }
 }

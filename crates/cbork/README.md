@@ -92,6 +92,52 @@ Including `cbork --type` does not change how the schema is compiled, how include
 how warnings are emitted, or how the decoded CBOR is printed; it only changes the root rule the validator starts from.
 Detailed dumps (`--detailed`) annotate the selected root type.
 
+### Decoding raw CBOR with `cbork decode`
+
+`cbork decode` renders raw CBOR input as a CDN-style tree.
+The `--pretty` flag enables multi-line, indented output suitable for human reading.
+Without a schema, byte strings are emitted as `h'...'` literals.
+
+The `--try-cbor-bstr` flag is a best-effort, schema-free inspection mode: when set,
+`cbork decode` probes every `bstr` it encounters and, if the bytes parse as one or more valid CBOR items,
+renders them inside the EDN-literals draft's `<<...>>` wrapper using the generic decoder.
+Byte strings whose bytes do not parse as CBOR stay as `h'...'` with no warning.
+This is useful when inspecting COSE-style structures or other payloads where embedded CBOR is likely but no schema is at hand:
+
+```shell
+# Show the decoded view of any byte string that happens to parse as CBOR.
+cbork decode --try-cbor-bstr cose.cbor
+```
+
+The flag never alters non-`bstr` output and never claims a byte string was intended to carry CBOR;
+it only changes the rendering heuristic.
+
+### Embedded-CBOR rendering in validation dumps
+
+When `cbork validate --detailed` walks a byte string whose RHS is `.cbor`, `.cborseq`, `.prefp`, `.prefpseq`, `.dtrm`,
+or `.dtrmseq`, the dump renders the parsed content inside the EDN-literals draft's `<<...>>` wrapper instead of the raw `h'...'`
+bytes.
+The wrapper is keyed by the byte string's path,
+so nested `bstr .cbor ...` fields inside an already-decoded payload appear
+as nested `<<...>>` wrappers with the inner schema's labels and notes.
+
+A COSE-like header with a protected header wrapped in `bstr .cbor headers` renders like:
+
+```text
+/cose/ [
+  /bstr .cbor headers/ <<
+    /headers/ {
+      /1/ 1: /int/ -7
+    }
+  >>,
+  /{}/ {}
+]
+```
+
+Plain `bstr`, `.x-enc`/`.x-hash`, compression operators, and arbitrary `any` RHS values are *not* auto-decoded.
+Non-deterministic `.dtrm`/`.dtrmseq` payloads keep their raw bytes
+so the existing deterministic-validation error remains visible alongside the original `h'...'` representation.
+
 ### Advisory / CI runs with `--no-fail`
 
 The global `--no-fail` switch forces the process to exit `0` even when a subcommand would normally report a failure.

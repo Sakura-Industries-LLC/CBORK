@@ -5,6 +5,7 @@
 //! Decode raw CBOR into a rendered EDN/CDN-style dump.
 
 use std::{
+    cell::Cell,
     fmt::Write as _,
     fs,
     io::{self, Read},
@@ -19,6 +20,7 @@ pub(crate) fn exec(
     path: Option<&Path>,
     no_color: bool,
     pretty: bool,
+    try_cbor_bstr: bool,
 ) -> bool {
     let header = path.map_or_else(|| "<stdin>".to_owned(), |path| path.display().to_string());
     let input = match read_input(path) {
@@ -37,7 +39,11 @@ pub(crate) fn exec(
         },
     };
 
-    println!("{}", render_dump(&header, &document, pretty, !no_color));
+    let limits = EmbedLimits::default();
+    println!(
+        "{}",
+        render_dump(&header, &document, pretty, !no_color, try_cbor_bstr, limits),
+    );
 
     true
 }
@@ -59,6 +65,8 @@ pub(crate) fn render_dump(
     document: &Document,
     pretty: bool,
     color: bool,
+    try_cbor_bstr: bool,
+    limits: EmbedLimits,
 ) -> String {
     let mut output = String::new();
     if color {
@@ -68,7 +76,13 @@ pub(crate) fn render_dump(
         output.push_str(header);
         output.push_str(" ->\n");
     }
-    output.push_str(&render_document(document, pretty, color));
+    output.push_str(&render_document(
+        document,
+        pretty,
+        color,
+        try_cbor_bstr,
+        limits,
+    ));
     output
 }
 
@@ -77,25 +91,60 @@ pub(crate) fn render_document(
     document: &Document,
     pretty: bool,
     color: bool,
+    try_cbor_bstr: bool,
+    limits: EmbedLimits,
 ) -> String {
     let mut output = String::new();
+    reset_render_counters();
     for (index, item) in document.items().iter().enumerate() {
         if index > 0 {
             output.push('\n');
         }
-        render_value(item, &mut output, pretty, color, 0);
+        render_value(item, &mut output, pretty, color, 0, try_cbor_bstr, limits);
     }
     output
 }
 
 /// Render a single CBOR value recursively.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn render_value(
     value: &Value,
     output: &mut String,
     pretty: bool,
     color: bool,
     indent: usize,
+    try_cbor_bstr: bool,
+    limits: EmbedLimits,
 ) {
+    if try_cbor_bstr && let Value::Bytes(bytes) = value {
+        // Empty byte strings are extremely common in real payloads (e.g.
+        // empty COSE unprotected headers). Even with `--try-cbor-bstr`,
+        // they must stay as `h''` rather than render as `<<>>`, because
+        // they are usually ordinary data and the empty `<<>>` literal
+        // is reserved for explicit `.cborseq`/`.prefpseq`/`.dtrmseq`
+        // contexts in schema-aware dumps.
+        if bytes.is_empty() {
+            push_colored(output, render_bytes(bytes), ColorKind::Bytes, color);
+            return;
+        }
+        if let Some(inner) = try_parse_cbor_bytes(bytes) {
+            match try_charge_embed(bytes.len(), limits) {
+                EmbedBudget::Expanded => {
+                    render_embedded_bstr_value(&inner, output, pretty, color, indent, limits);
+                    release_embed_depth();
+                    return;
+                },
+                EmbedBudget::LimitReached => {
+                    // Fall back to the EDN-literals draft's `h'...'` form.
+                    push_colored(output, render_bytes(bytes), ColorKind::Bytes, color);
+                    return;
+                },
+            }
+        }
+        push_colored(output, render_bytes(bytes), ColorKind::Bytes, color);
+        return;
+    }
+
     match value {
         Value::Integer(value) => push_colored(output, value.to_string(), ColorKind::Number, color),
         Value::Float(value) => {
@@ -130,7 +179,15 @@ pub(crate) fn render_value(
                 push_dim(output, "\n", color);
                 for (index, item) in values.iter().enumerate() {
                     push_indent(output, child_indent);
-                    render_value(item, output, pretty, color, child_indent);
+                    render_value(
+                        item,
+                        output,
+                        pretty,
+                        color,
+                        child_indent,
+                        try_cbor_bstr,
+                        limits,
+                    );
                     if index != last_index {
                         push_dim(output, ",", color);
                     }
@@ -144,7 +201,7 @@ pub(crate) fn render_value(
                     if index > 0 {
                         push_dim(output, ", ", color);
                     }
-                    render_value(item, output, pretty, color, indent);
+                    render_value(item, output, pretty, color, indent, try_cbor_bstr, limits);
                 }
                 push_bracket(output, "]", color, depth);
             }
@@ -163,7 +220,15 @@ pub(crate) fn render_value(
                 push_dim(output, "\n", color);
                 for (index, entry) in entries.iter().enumerate() {
                     push_indent(output, child_indent);
-                    render_map_entry(entry, output, pretty, color, child_indent);
+                    render_map_entry(
+                        entry,
+                        output,
+                        pretty,
+                        color,
+                        child_indent,
+                        try_cbor_bstr,
+                        limits,
+                    );
                     if index != last_index {
                         push_dim(output, ",", color);
                     }
@@ -177,7 +242,7 @@ pub(crate) fn render_value(
                     if index > 0 {
                         push_dim(output, ", ", color);
                     }
-                    render_map_entry(entry, output, pretty, color, indent);
+                    render_map_entry(entry, output, pretty, color, indent, try_cbor_bstr, limits);
                 }
                 push_bracket(output, "}", color, depth);
             }
@@ -186,7 +251,7 @@ pub(crate) fn render_value(
             let depth = indent / 2;
             push_colored(output, tag.to_string(), ColorKind::Tag, color);
             push_bracket(output, "(", color, depth);
-            render_value(value, output, pretty, color, indent);
+            render_value(value, output, pretty, color, indent, try_cbor_bstr, limits);
             push_bracket(output, ")", color, depth);
         },
     }
@@ -199,10 +264,85 @@ pub(crate) fn render_map_entry(
     pretty: bool,
     color: bool,
     indent: usize,
+    try_cbor_bstr: bool,
+    limits: EmbedLimits,
 ) {
-    render_value(&entry.key, output, pretty, color, indent);
+    render_value(
+        &entry.key,
+        output,
+        pretty,
+        color,
+        indent,
+        try_cbor_bstr,
+        limits,
+    );
     push_dim(output, ": ", color);
-    render_value(&entry.value, output, pretty, color, indent);
+    render_value(
+        &entry.value,
+        output,
+        pretty,
+        color,
+        indent,
+        try_cbor_bstr,
+        limits,
+    );
+}
+
+/// Attempt to parse a byte string as one or more CBOR items, returning
+/// the parsed `Document` only when the bytes form a complete sequence.
+fn try_parse_cbor_bytes(bytes: &[u8]) -> Option<Document> {
+    Document::parse(bytes).ok()
+}
+
+/// Render an embedded-CBOR byte string inside an `<<...>>` wrapper using
+/// the generic (schema-free) renderer. Used by `cbork decode --try-cbor-bstr`.
+fn render_embedded_bstr_value(
+    document: &Document,
+    output: &mut String,
+    pretty: bool,
+    color: bool,
+    indent: usize,
+    limits: EmbedLimits,
+) {
+    let depth = indent / 2;
+    push_bracket(output, "<<", color, depth);
+    let items = document.items();
+    if items.is_empty() {
+        push_bracket(output, ">>", color, depth);
+        return;
+    }
+    let inner_indent = indent.saturating_add(2);
+    push_dim(output, "\n", color);
+    let last = items.len().saturating_sub(1);
+    reset_sequence_counter();
+    for (index, item) in items.iter().enumerate() {
+        if !try_charge_sequence_item(limits) {
+            // Sequence too long; close out the wrapper with a trailing
+            // diagnostic and fall back rather than truncating silently.
+            push_indent(output, inner_indent);
+            push_colored(
+                output,
+                format!(
+                    "... ({} more item(s) truncated)",
+                    items.len().saturating_sub(index)
+                ),
+                ColorKind::Simple,
+                color,
+            );
+            push_dim(output, "\n", color);
+            push_indent(output, indent);
+            push_bracket(output, ">>", color, depth);
+            return;
+        }
+        push_indent(output, inner_indent);
+        render_value(item, output, pretty, color, inner_indent, true, limits);
+        if index != last {
+            push_dim(output, ",", color);
+        }
+        push_dim(output, "\n", color);
+    }
+    push_indent(output, indent);
+    push_bracket(output, ">>", color, depth);
 }
 
 /// Render a byte string as CDN-style `h''` output.
@@ -287,6 +427,108 @@ pub(crate) fn push_colored<T: std::fmt::Display>(
     }
 }
 
+/// Resource limits for embedded-CBOR rendering.
+///
+/// The schema-aware validation renderer and the schema-free `--try-cbor-bstr`
+/// renderer share the same limits. They are intentionally generous so that
+/// ordinary multi-level COSE payloads, the three-level regression fixture,
+/// and large header arrays are not artificially truncated; they exist to
+/// prevent malicious input from exhausting the stack or memory. Exceeding a
+/// limit falls back to the EDN-literals draft's `h'...'` byte-string
+/// diagnostic with no further descent into the embedded bytes, so the
+/// outer dump remains informative and the parser never crashes.
+#[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_field_names)]
+pub(crate) struct EmbedLimits {
+    /// Maximum number of nested `<<...>>` wrappers allowed before the
+    /// renderer falls back to raw `h'...'` for the offending payload.
+    pub depth: usize,
+    /// Maximum total bytes the renderer will decode from embedded CBOR
+    /// byte strings in a single render pass.
+    pub embedded_bytes: usize,
+    /// Maximum number of items the renderer will render for an embedded
+    /// CBOR sequence (`<<...>>`).
+    pub sequence_items: usize,
+}
+
+impl Default for EmbedLimits {
+    fn default() -> Self {
+        // Generous defaults: 32 levels of nesting handles the three-level
+        // regression plus normal COSE nesting; 16 MiB covers very large
+        // header maps; 4096 items covers the most aggressive sequence
+        // formats known today.
+        Self {
+            depth: 32,
+            embedded_bytes: 16 * 1024 * 1024,
+            sequence_items: 4096,
+        }
+    }
+}
+
+thread_local! {
+    /// Mutable counters shared by the recursive embedded renderer.
+    /// Initialized to zero by `reset_render_counters` before each render pass.
+    static RENDER_DEPTH: Cell<usize> = const { Cell::new(0) };
+    static RENDER_EMBEDDED_BYTES: Cell<usize> = const { Cell::new(0) };
+    static RENDER_SEQUENCE_ITEMS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Reset the resource counters at the start of a render pass.
+pub(crate) fn reset_render_counters() {
+    RENDER_DEPTH.set(0);
+    RENDER_EMBEDDED_BYTES.set(0);
+    RENDER_SEQUENCE_ITEMS.set(0);
+}
+
+/// Outcome of an attempt to expand an embedded-CBOR byte string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmbedBudget {
+    /// The embedded bytes were rendered inside the `<<...>>` wrapper.
+    Expanded,
+    /// A resource limit was reached; fall back to raw `h'...'` bytes.
+    LimitReached,
+}
+
+/// Check whether expanding an embedded payload of `bytes.len()` bytes at
+/// the current depth would exceed the configured limits. Increments the
+/// counters and returns `Expanded` on success, `LimitReached` otherwise.
+pub(crate) fn try_charge_embed(
+    bytes_len: usize,
+    limits: EmbedLimits,
+) -> EmbedBudget {
+    let current_depth = RENDER_DEPTH.get();
+    if current_depth >= limits.depth {
+        return EmbedBudget::LimitReached;
+    }
+    let next_depth = current_depth.saturating_add(1);
+    RENDER_DEPTH.set(next_depth);
+    RENDER_EMBEDDED_BYTES.set(RENDER_EMBEDDED_BYTES.get().saturating_add(bytes_len));
+    if RENDER_EMBEDDED_BYTES.get() > limits.embedded_bytes {
+        return EmbedBudget::LimitReached;
+    }
+    EmbedBudget::Expanded
+}
+
+/// Charge a sequence item to the sequence-items counter. Returns true if
+/// the sequence item is within the budget.
+pub(crate) fn try_charge_sequence_item(limits: EmbedLimits) -> bool {
+    let next = RENDER_SEQUENCE_ITEMS.get().saturating_add(1);
+    RENDER_SEQUENCE_ITEMS.set(next);
+    next <= limits.sequence_items
+}
+
+/// Decrement the depth counter after rendering an embedded payload.
+pub(crate) fn release_embed_depth() {
+    let current = RENDER_DEPTH.get();
+    RENDER_DEPTH.set(current.saturating_sub(1));
+}
+
+/// Reset only the sequence-items counter so a new top-level embedded
+/// sequence starts fresh without resetting the depth and bytes counters.
+pub(crate) fn reset_sequence_counter() {
+    RENDER_SEQUENCE_ITEMS.set(0);
+}
+
 /// Token categories for colorized rendering.
 #[derive(Clone, Copy)]
 pub(crate) enum ColorKind {
@@ -313,14 +555,15 @@ mod tests {
     use cbork_edn::parse;
     use console::set_colors_enabled;
 
-    use super::{render_document, render_dump};
+    use super::{EmbedLimits, render_document, render_dump};
 
     #[test]
     fn plain_and_colored_rendering_diverge() {
         set_colors_enabled(true);
         let document = parse(&[0x01, 0x61, 0x61, 0x42, 0x01, 0x02]).expect("parse");
-        let plain = render_document(&document, false, false);
-        let colored = render_document(&document, false, true);
+        let limits = EmbedLimits::default();
+        let plain = render_document(&document, false, false, false, limits);
+        let colored = render_document(&document, false, true, false, limits);
 
         assert_eq!(plain, "1\n\"a\"\nh'01 02'");
         assert!(colored.contains("\u{1b}["));
@@ -339,7 +582,8 @@ mod tests {
         ])
         .expect("parse");
 
-        let pretty = render_document(&document, true, false);
+        let limits = EmbedLimits::default();
+        let pretty = render_document(&document, true, false, false, limits);
 
         assert_eq!(
             pretty,
@@ -350,8 +594,60 @@ mod tests {
     #[test]
     fn dump_prefixes_source_label() {
         let document = parse(&[0x01]).expect("parse");
-        let dump = render_dump("input.cbor", &document, false, false);
+        let limits = EmbedLimits::default();
+        let dump = render_dump("input.cbor", &document, false, false, false, limits);
 
         assert_eq!(dump, "input.cbor ->\n1");
+    }
+
+    #[test]
+    fn try_cbor_bstr_decodes_inner_cbor_byte_string() {
+        // Build a COSE-like map: `{"protected": h'a10126', "unprotected": {}}`
+        // where the bytes `a1 01 26` are the CBOR encoding of `{1: -7}`.
+        let document = parse(&[
+            0xA2, 0x69, b'p', b'r', b'o', b't', b'e', b'c', b't', b'e', b'd', 0x43, 0xA1, 0x01,
+            0x26, 0x6B, b'u', b'n', b'p', b'r', b'o', b't', b'e', b'c', b't', b'e', b'd', 0xA0,
+        ])
+        .expect("parse");
+
+        let limits = EmbedLimits::default();
+        let without_flag = render_document(&document, false, false, false, limits);
+        let with_flag = render_document(&document, false, false, true, limits);
+
+        // Without `--try-cbor-bstr` the byte string is preserved.
+        assert!(without_flag.contains("h'a1 01 26'"), "{without_flag}");
+        assert!(!without_flag.contains("<<"), "{without_flag}");
+
+        // With `--try-cbor-bstr` the byte string is rendered as an
+        // embedded-CBOR literal showing the decoded `{1: -7}`.
+        assert!(with_flag.contains("<<"), "{with_flag}");
+        assert!(with_flag.contains(">>"), "{with_flag}");
+        assert!(with_flag.contains("1: -7"), "{with_flag}");
+        assert!(!with_flag.contains("h'a1 01 26'"), "{with_flag}");
+    }
+
+    #[test]
+    fn try_cbor_bstr_leaves_non_cbor_bytes_untouched() {
+        // A byte string that does not parse as CBOR must stay raw.
+        // `0x43 0xFF 0xFF 0xFF` is a 3-byte string whose bytes are not
+        // a valid CBOR item.
+        let document = parse(&[0x43, 0xFF, 0xFF, 0xFF]).expect("parse");
+        let limits = EmbedLimits::default();
+        let with_flag = render_document(&document, false, false, true, limits);
+        assert!(with_flag.contains("h'ff ff ff'"), "{with_flag}");
+        assert!(!with_flag.contains("<<"), "{with_flag}");
+    }
+
+    #[test]
+    fn try_cbor_bstr_keeps_empty_byte_string_as_raw() {
+        // `0x40` is an empty byte string. Even with `--try-cbor-bstr`,
+        // an empty bstr must stay raw because empty embedded sequences
+        // are reserved for explicit `.cborseq`/`.prefpseq`/`.dtrmseq`
+        // contexts in schema-aware dumps.
+        let document = parse(&[0x40]).expect("parse");
+        let limits = EmbedLimits::default();
+        let with_flag = render_document(&document, false, false, true, limits);
+        assert!(with_flag.contains("h''"), "{with_flag}");
+        assert!(!with_flag.contains("<<"), "{with_flag}");
     }
 }
