@@ -31,6 +31,49 @@ cbork validate --type payload path/to/schema.cddl path/to/data.cbor
 
 `cbork --help` lists every subcommand and option.
 
+### Agent skills
+
+`cbork agent-skills` installs, checks, and reconciles the agent skill bundles shipped inside the `cbork` binary against a
+destination directory.
+
+The skills are read from an embedded manifest
+(built from `crates/cbork/assets/agent-skills/` at compile time)
+and never access the source checkout of `.agents/skills/` at runtime.
+
+```shell
+# Install missing files from the embedded bundles into `.agents/skills/`.
+# Already-matching files are left unchanged; differing files prompt for action.
+cbork agent-skills
+
+# Check whether the skills in `.agents/skills/` match the vendored set
+# without making any changes. Exits non-zero when files differ.
+cbork agent-skills --check
+
+# Replace differing files with the vendored bytes.
+cbork agent-skills --overwrite
+
+# Three-way merge local edits against incoming vendored changes.
+cbork agent-skills --merge
+
+# Install and remove extra files that are not part of the bundled skill set
+# (removes only direct children, never recursively).
+cbork agent-skills --clean
+
+# Target a custom destination directory.
+cbork agent-skills --check /path/to/project/.agents/skills
+```
+
+Flags `--overwrite`, `--merge`, `--check`, and `--clean` are mutually exclusive.
+The default mode (no flag) is interactive when stdin is a terminal;
+run `cbork agent-skills --overwrite` or `--merge` in non-interactive contexts.
+Use `cbork --no-fail agent-skills --check` to surface differences in CI without breaking the build.
+
+Per-file warnings go to stderr; the final summary line goes to stdout.
+The same stream convention applies to all modes so CI logs can be parsed consistently.
+
+State for three-way merge ancestors is stored in a tool-owned `.cbork-agent-skills/state/` directory under the selected destination.
+Delete that directory to disable the merge ancestor cache.
+
 ### Selecting a validation root with `--type`
 
 `cbork validate` defaults to the first top-level rule in the schema file as the validation root.

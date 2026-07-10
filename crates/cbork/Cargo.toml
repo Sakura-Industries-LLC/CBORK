@@ -1,6 +1,6 @@
 [package]
 name = "cbork"
-version = "0.0.17"
+version = "0.0.18"
 edition.workspace = true
 rust-version.workspace = true
 license = "AGPL-3.0-only"
@@ -25,6 +25,7 @@ anyhow = "1.0"
 build-info = "0.0.45"
 console = "0.16.4"
 bpaf = { version = "0.9.26", features = ["derive"] }
+diffy = "0.5"
 ignore = "0.4.27"
 
 [build-dependencies]

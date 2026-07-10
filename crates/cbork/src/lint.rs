@@ -3209,6 +3209,76 @@ rule = 1
         );
     }
 
+    #[test]
+    fn cli_agent_skills_check_empty_fails() {
+        let dest =
+            std::env::temp_dir().join(format!("cbork_agent_skills_empty_{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dest));
+        let (code, output) = run_cbork(&[
+            "agent-skills",
+            "--check",
+            dest.to_str().expect("utf-8 temp path"),
+        ]);
+        assert_ne!(
+            code, 0,
+            "--check on an empty dir must be non-zero, got {code}:\n{output}"
+        );
+        assert!(
+            output.contains("differ") || output.contains("false"),
+            "output should indicate failure state:\n{output}"
+        );
+    }
+
+    #[test]
+    fn cli_agent_skills_check_no_fail_returns_zero() {
+        let dest =
+            std::env::temp_dir().join(format!("cbork_agent_skills_nf_{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dest));
+        let (code, output) = run_cbork(&[
+            "--no-fail",
+            "agent-skills",
+            "--check",
+            dest.to_str().expect("utf-8 temp path"),
+        ]);
+        assert_eq!(
+            code, 0,
+            "--no-fail --check on stale must exit 0, got {code}:\n{output}"
+        );
+    }
+
+    #[test]
+    fn cli_agent_skills_install_then_check_passes() {
+        let dest =
+            std::env::temp_dir().join(format!("cbork_agent_skills_install_{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dest));
+
+        let dest_str = dest.to_str().expect("utf-8 temp path");
+        let (code, output) = run_cbork(&["agent-skills", dest_str]);
+        assert_eq!(code, 0, "install must succeed, got {code}:\n{output}");
+
+        let (code, output) = run_cbork(&["agent-skills", "--check", dest_str]);
+        assert_eq!(
+            code, 0,
+            "--check after install must succeed, got {code}:\n{output}"
+        );
+    }
+
+    #[test]
+    fn cli_agent_skills_overwrite_works() {
+        let dest =
+            std::env::temp_dir().join(format!("cbork_agent_skills_ow_{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dest));
+
+        let dest_str = dest.to_str().expect("utf-8 temp path");
+        // First install normally
+        let (code, _) = run_cbork(&["agent-skills", dest_str]);
+        assert_eq!(code, 0, "first install must succeed");
+
+        // Overwrite (should succeed since files are identical)
+        let (code, _) = run_cbork(&["agent-skills", "--overwrite", dest_str]);
+        assert_eq!(code, 0, "--overwrite after install must succeed");
+    }
+
     // Plan 002 — recursive discovery honors ignore files.
     //
     // These tests build a temp tree that mirrors the fixture layout in

@@ -4,6 +4,7 @@
 
 //! CDDL linter cli tool
 
+mod agent_skills;
 mod cli;
 mod decode;
 mod diagnostics;

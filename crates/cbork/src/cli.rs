@@ -13,7 +13,7 @@ use cbork_cddl_compiler::CompiledCDDL;
 use console::{Emoji, style};
 
 use crate::{
-    decode,
+    agent_skills, decode,
     diagnostics::{has_error_diagnostics, print_compiler_diagnostics},
     lint, render, rfc, ui, validate, why, xref,
 };
@@ -84,6 +84,7 @@ impl Cli {
             Command::Coverage(args) => args.exec_stub("coverage"),
             Command::Docs(args) => args.exec_stub("docs"),
             Command::Lsp(args) => args.exec_stub("lsp"),
+            Command::Agent(args) => args.exec(),
         };
 
         if !ok && !self.no_fail {
@@ -121,6 +122,8 @@ enum Command {
     Docs(Docs),
     /// Launch the language server.
     Lsp(Lsp),
+    /// Agent-tooling subcommands.
+    Agent(Agent),
 }
 
 /// Build the command parser from all supported subcommands.
@@ -139,6 +142,7 @@ fn command() -> impl Parser<Command> {
         boxed_command(coverage().map(Command::Coverage)),
         boxed_command(docs().map(Command::Docs)),
         boxed_command(lsp().map(Command::Lsp)),
+        boxed_command(agent().map(Command::Agent)),
     ])
 }
 
@@ -719,6 +723,86 @@ impl Decode {
     }
 }
 
+/// Manage the agent skill bundles shipped with `cbork`.
+#[derive(Debug, Clone, Bpaf)]
+#[bpaf(command("agent-skills"))]
+#[allow(clippy::struct_excessive_bools)]
+struct Agent {
+    /// Replace differing files with the vendored bytes.
+    #[bpaf(long("overwrite"))]
+    overwrite: bool,
+
+    /// Three-way merge differing files against the stored ancestor.
+    #[bpaf(long("merge"))]
+    merge: bool,
+
+    /// Check only; do not write; non-zero on stale or missing managed files.
+    #[bpaf(long("check"))]
+    check: bool,
+
+    /// Install and remove direct extras (non-recursive).
+    #[bpaf(long("clean"))]
+    clean: bool,
+
+    /// Directory that contains skill subdirectories (default: `.agents/skills`).
+    #[bpaf(positional("DESTINATION"))]
+    destination: Option<PathBuf>,
+}
+
+impl Agent {
+    /// Execute the `agent-skills` command.
+    fn exec(self) -> bool {
+        // Validate mutually-exclusive mode flags.
+        let active: Vec<&'static str> = [
+            ("--overwrite", self.overwrite),
+            ("--merge", self.merge),
+            ("--check", self.check),
+            ("--clean", self.clean),
+        ]
+        .iter()
+        .filter_map(|(name, on)| on.then_some(*name))
+        .collect();
+
+        if active.len() > 1 {
+            eprintln!(
+                "{}: cannot combine {} (pick one)",
+                style("error").red(),
+                active.join(" + "),
+            );
+            return false;
+        }
+
+        let destination = self
+            .destination
+            .unwrap_or_else(|| PathBuf::from(".agents/skills"));
+
+        let mode = if self.overwrite {
+            agent_skills::SkillMode::Overwrite
+        } else if self.merge {
+            agent_skills::SkillMode::Merge
+        } else if self.check {
+            agent_skills::SkillMode::Check
+        } else if self.clean {
+            agent_skills::SkillMode::Clean
+        } else {
+            agent_skills::SkillMode::Install
+        };
+
+        let operation = agent_skills::SkillOperation { destination, mode };
+
+        match agent_skills::execute(&operation) {
+            Ok(report) => {
+                report.print(mode, &operation.destination);
+                report.ok
+            },
+            Err(err) => {
+                eprintln!("{}: {err}", style("error").red());
+                false
+            },
+        }
+    }
+}
+
 /// Compile a single CDDL file and print the enriched AST tree dump.
 fn compile_file_with_print(path: &PathBuf) -> bool {
     match CompiledCDDL::compile(path, None) {
@@ -910,5 +994,84 @@ mod tests {
             .run_inner(&["lint", "input.cddl"])
             .expect("default command should parse");
         assert!(!without_flag.no_fail);
+    }
+
+    #[test]
+    fn parses_agent_skills_check() {
+        let parsed = cli()
+            .run_inner(&["agent-skills", "--check"])
+            .expect("agent-skills command should parse");
+        match parsed.command {
+            Command::Agent(args) => {
+                assert!(args.check);
+                assert!(!args.overwrite);
+                assert!(!args.merge);
+                assert!(!args.clean);
+                assert!(args.destination.is_none());
+            },
+            _ => panic!("expected agent-skills command"),
+        }
+    }
+
+    #[test]
+    fn parses_agent_skills_with_destination() {
+        let parsed = cli()
+            .run_inner(&["agent-skills", "/some/path"])
+            .expect("agent-skills with dest should parse");
+        match parsed.command {
+            Command::Agent(args) => {
+                assert_eq!(args.destination, Some(PathBuf::from("/some/path")));
+            },
+            _ => panic!("expected agent-skills command"),
+        }
+    }
+
+    #[test]
+    fn parses_agent_skills_overwrite() {
+        let parsed = cli()
+            .run_inner(&["agent-skills", "--overwrite"])
+            .expect("agent-skills --overwrite should parse");
+        match parsed.command {
+            Command::Agent(args) => assert!(args.overwrite),
+            _ => panic!("expected agent-skills command"),
+        }
+    }
+
+    #[test]
+    fn parses_agent_skills_merge() {
+        let parsed = cli()
+            .run_inner(&["agent-skills", "--merge"])
+            .expect("agent-skills --merge should parse");
+        match parsed.command {
+            Command::Agent(args) => assert!(args.merge),
+            _ => panic!("expected agent-skills command"),
+        }
+    }
+
+    #[test]
+    fn parses_agent_skills_clean() {
+        let parsed = cli()
+            .run_inner(&["agent-skills", "--clean"])
+            .expect("agent-skills --clean should parse");
+        match parsed.command {
+            Command::Agent(args) => assert!(args.clean),
+            _ => panic!("expected agent-skills command"),
+        }
+    }
+
+    #[test]
+    fn parses_agent_skills_combined_modes_rejected() {
+        // Parse succeeds at the bpaf level regardless of flag combination;
+        // mutual exclusion is enforced at runtime in `exec()`.
+        let parsed = cli()
+            .run_inner(&["agent-skills", "--overwrite", "--clean"])
+            .expect("agent-skills with combined flags should parse");
+        match &parsed.command {
+            Command::Agent(args) => {
+                assert!(args.overwrite, "overwrite should be true");
+                assert!(args.clean, "clean should be true");
+            },
+            _ => panic!("expected agent-skills command"),
+        }
     }
 }
