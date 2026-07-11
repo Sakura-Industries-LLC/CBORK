@@ -2,7 +2,7 @@
 
 [package]
 name = "cbork-abnf-parser"
-version = "0.0.3"
+version = "0.0.4"
 edition.workspace = true
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"

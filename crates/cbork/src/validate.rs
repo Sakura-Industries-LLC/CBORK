@@ -27,7 +27,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use cbork_abnf_parser::parse_abnf;
+use cbork_abnf_parser::{AbnfMatch, parse_abnf};
 use cbork_cddl_compiler::{
     CompiledCDDL, DiagnosticLevel, EntryState, MetaData, WrappedNode, build_resolution, child_text,
     literals::{
@@ -47,6 +47,7 @@ use crate::{
         try_charge_embed, try_charge_sequence_item,
     },
     diagnostics::{has_error_diagnostics, print_compiler_diagnostics},
+    render_abnf_breakdown,
 };
 
 thread_local! {
@@ -207,6 +208,7 @@ pub(crate) fn exec(
     clear_current_schema_notes();
     clear_current_validation_warnings();
     clear_current_embedded_cbor_hints();
+    crate::render_abnf_breakdown::reset_traces_for_exec();
 
     let root_name = match resolve_validation_root(&compiled, schema_path, type_name) {
         Ok((name, _node)) => name,
@@ -409,8 +411,8 @@ impl ValidationIssue {
 }
 
 /// A location inside the parsed CBOR tree.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PathStep {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum PathStep {
     /// Top-level document item.
     DocItem(usize),
     /// Array element.
@@ -1636,8 +1638,26 @@ fn validate_ctlop_value(
                 format!("compression operator `{op}` is not checked during validation yet"),
             );
         },
-        ".abnf" | ".abnfb" | ".x-enc.abnf" | ".x-enc.abnfb" | ".x-hash.abnf" | ".x-hash.abnfb" => {
+        ".abnf" | ".abnfb" => {
             let _ = validate_abnf_rhs(compiled, rhs, value, path, issues);
+        },
+        ".x-enc.abnf" | ".x-enc.abnfb" | ".x-hash.abnf" | ".x-hash.abnfb" => {
+            // The four transform annotations are documentation-only at
+            // validation time. The validator does not have the encryption
+            // keys, hash preimage, or algorithm context required to
+            // reverse the transform, so the RHS ABNF cannot constrain
+            // the carrier bytes here. The left-hand-side carrier and
+            // ordinary constraints (bstr, .size, ...) have already
+            // been validated by the preceding `validate_schema_node`
+            // call on `lhs`; missing or type-mismatched carriers are
+            // reported there. Record a non-fatal warning so users know
+            // the RHS ABNF is not enforced.
+            record_validation_warning_once(
+                path,
+                format!(
+                    "transform operator `{op}` is documentation-only; the RHS ABNF is not applied to the carrier bytes"
+                ),
+            );
         },
         ".json" => {
             if let Some(text) = value_to_text(value) {
@@ -2057,6 +2077,20 @@ fn validate_regex_rhs(
 }
 
 /// Validate an ABNF controller RHS.
+///
+/// `.abnf` and `.abnfb` share this dispatcher. The RHS is resolved to
+/// the final ABNF source text (including composed `.det` expressions
+/// and named text rules), parsed as ABNF, and the input data is matched
+/// against the grammar using either `validate_text` (`.abnf`) or
+/// `validate_bytes` (`.abnfb`).
+///
+/// On a successful `.abnfb` or `.abnf` validation that involves a byte
+/// string or a non-empty text string, the trace API is also invoked so
+/// the renderer can show the selected rule path and spans via a CDN
+/// comment block. The trace is produced only on success and never
+/// changes the boolean validation outcome. If the trace cannot be
+/// produced (e.g. a memory limit), the validation result is still
+/// considered successful and a non-fatal warning is recorded.
 fn validate_abnf_rhs(
     compiled: &CompiledCDDL,
     rhs: &WrappedNode,
@@ -2064,8 +2098,8 @@ fn validate_abnf_rhs(
     path: &mut Vec<PathStep>,
     issues: &mut Vec<ValidationIssue>,
 ) -> bool {
-    let pattern = resolve_text_rhs(compiled, rhs).or_else(|| parse_text_from_node(rhs));
-    let Some(pattern) = pattern else {
+    let pattern = resolve_text_rhs_for_abnf_with_det(compiled, rhs);
+    let Some((pattern, used_det)) = pattern else {
         issues.push(ValidationIssue::new(
             path.clone(),
             "an ABNF pattern",
@@ -2073,6 +2107,25 @@ fn validate_abnf_rhs(
             Some("ABNF RHS did not resolve to text".to_owned()),
         ));
         return false;
+    };
+
+    // `.det` concatenates a human-readable label LHS with the RHS ABNF
+    // source. The label is a bare identifier that the ABNF parser
+    // would reject as a non-rule. Strip the LHS prefix only when the
+    // source was produced by `.det`; direct text literals do not need
+    // this preprocessing.
+    let pattern = if used_det {
+        strip_leading_label_line(&pattern)
+    } else {
+        pattern
+    };
+
+    // The ABNF parser requires every rule to be terminated by a
+    // newline. Ensure the source ends with one.
+    let pattern = if pattern.ends_with('\n') {
+        pattern
+    } else {
+        format!("{pattern}\n")
     };
 
     let Ok(document) = parse_abnf(&pattern) else {
@@ -2087,8 +2140,12 @@ fn validate_abnf_rhs(
 
     match value {
         Value::Text(text) => {
-            match document.validate_text(text) {
-                Ok(()) => true,
+            let result = document.match_text_with_trace(text);
+            match result {
+                Ok(trace) => {
+                    record_abnf_match_trace(path, text.as_bytes(), trace);
+                    true
+                },
                 Err(error) => {
                     issues.push(ValidationIssue::new(
                         path.clone(),
@@ -2101,8 +2158,11 @@ fn validate_abnf_rhs(
             }
         },
         Value::Bytes(bytes) => {
-            match document.validate_bytes(bytes) {
-                Ok(()) => true,
+            match document.match_bytes_with_trace(bytes) {
+                Ok(trace) => {
+                    record_abnf_match_trace(path, bytes, trace);
+                    true
+                },
                 Err(error) => {
                     issues.push(ValidationIssue::new(
                         path.clone(),
@@ -2123,6 +2183,200 @@ fn validate_abnf_rhs(
             ));
             false
         },
+    }
+}
+
+/// Store a captured `AbnfMatch` trace for the given path so the
+/// detailed dump renderer can emit a CDN comment breakdown below the
+/// value. The trace is stored as bytes (always, even for text inputs)
+/// so the renderer can format binary spans with `h'...'` literals.
+fn record_abnf_match_trace(
+    path: &[PathStep],
+    input: &[u8],
+    trace: AbnfMatch,
+) {
+    if let Err(error) = render_abnf_breakdown::record_trace(path, input, trace) {
+        record_validation_warning_once(
+            path,
+            format!("ABNF match trace could not be recorded: {error}"),
+        );
+    }
+}
+
+/// Strip a leading label produced by `.det` concatenation from an
+/// ABNF source.
+///
+/// CDDL schemas commonly write `.abnfb` (or `.abnf`) RHSs as
+/// `"label" .det <abnf-rule>` to document the start rule name. After
+/// `.det` the LHS label is either prepended on its own line
+/// (`label\nlabel = ...`) or directly concatenated
+/// (`label<label> = ...`) depending on the literal content. The ABNF
+/// parser expects every rule to be defined with `=` or `=/`, so a
+/// bare identifier prefix would be rejected. This helper removes the
+/// leading label in either form, ensures a trailing newline is present,
+/// and leaves the remainder of the text otherwise unchanged.
+fn strip_leading_label_line(text: &str) -> String {
+    // First try the own-line form: the first line is a bare
+    // identifier, followed by `\n`. We split on the first newline to
+    // keep the slicing UTF-8 safe.
+    let mut stripped = text.to_owned();
+    if let Some((first_line, rest)) = text.split_once('\n')
+        && is_bare_abnf_identifier(first_line)
+    {
+        rest.clone_into(&mut stripped);
+    }
+
+    // Then try the concatenated form: the text starts with a bare
+    // identifier immediately followed by additional content. Strip
+    // the longest bare-identifier prefix that is followed by
+    // whitespace.
+    if stripped == text {
+        let prefix_len = stripped
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+            .count();
+        if prefix_len > 0 {
+            let after = stripped.chars().nth(prefix_len);
+            if matches!(after, Some(' ' | '\t' | '\n' | '\r')) {
+                // The leading identifier is pure ASCII so every
+                // character is one byte; split_at returns the suffix
+                // on a valid UTF-8 boundary.
+                let (_, rest) = stripped.split_at(prefix_len);
+                stripped = rest.trim_start().to_owned();
+            }
+        }
+    }
+
+    // The ABNF parser expects every rule to be terminated by a
+    // newline. Ensure the stripped source ends with one.
+    if !stripped.ends_with('\n') {
+        stripped.push('\n');
+    }
+    stripped
+}
+
+/// Return true when `line` is a non-empty bare ABNF identifier with no
+/// `=`, `=/`, `=`, `/`, `:`, `;`, `<`, `>`, `[`, `]`, `(`, `)`, or
+/// whitespace tokens.
+fn is_bare_abnf_identifier(line: &str) -> bool {
+    !line.is_empty()
+        && line
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+}
+
+/// Resolve the full text payload of an `.abnf` or `.abnfb` RHS.
+///
+/// Unlike [`resolve_text_rhs`], this evaluates the same text expressions
+/// accepted by the CDDL compiler: direct text literals, named text
+/// constants and rules, parenthesized text expressions, and the
+/// `.det` text-processing operator. Unsupported forms return `None` so
+/// the caller can emit a precise `ABNF RHS did not resolve to text`
+/// diagnostic.
+#[allow(dead_code)]
+fn resolve_text_rhs_for_abnf(
+    compiled: &CompiledCDDL,
+    node: &WrappedNode,
+) -> Option<String> {
+    resolve_text_rhs_for_abnf_with_det(compiled, node).map(|(text, _)| text)
+}
+
+/// Same as [`resolve_text_rhs_for_abnf`] but also returns whether the
+/// `.det` operator was applied. The caller uses this flag to decide
+/// whether the leading LHS label must be stripped before parsing.
+fn resolve_text_rhs_for_abnf_with_det(
+    compiled: &CompiledCDDL,
+    node: &WrappedNode,
+) -> Option<(String, bool)> {
+    // Direct text leaves: literal strings, named text constants, and
+    // named text rules. The compiler's resolved-state map already
+    // produces the final bytes for those cases.
+    if let Some(text) = resolve_text_rhs(compiled, node) {
+        return Some((text, false));
+    }
+    if let Some(text) = parse_text_from_node(node) {
+        return Some((text, false));
+    }
+
+    let WrappedNode::Syntax { rule, children, .. } = node else {
+        return None;
+    };
+
+    // For `type2` nodes that contain a text-literal `value` child,
+    // resolve the value directly. `resolve_type2_leaf` only handles
+    // `type2` nodes with `typename` children, not literal values.
+    if rule == "type2" {
+        for child in children {
+            if let WrappedNode::Syntax {
+                rule: child_rule, ..
+            } = child
+                && child_rule == "value"
+                && let Some((text, _)) = resolve_text_rhs_for_abnf_with_det(compiled, child)
+            {
+                return Some((text, false));
+            }
+        }
+    }
+
+    match rule.as_str() {
+        // `text .det text` is the only composed text control the ABNF
+        // validator currently relies on. Walk the children manually
+        // because the standard `control_operator_parts` helper only
+        // recognizes `type2` operands, while the LHS of `.det` is a
+        // text-literal `value` node.
+        "type1" => {
+            // A `type1` with no `ctlop` child is just a single text
+            // expression wrapped in a `type1`. Unwrap to the child.
+            let has_ctlop = children.iter().any(|child| {
+                matches!(
+                    child,
+                    WrappedNode::Syntax { rule, .. } if rule == "ctlop"
+                )
+            });
+            if !has_ctlop {
+                return children
+                    .iter()
+                    .find_map(|child| resolve_text_rhs_for_abnf_with_det(compiled, child));
+            }
+            let mut lhs: Option<&WrappedNode> = None;
+            let mut op: Option<&str> = None;
+            let mut rhs: Option<&WrappedNode> = None;
+            for child in children {
+                if let WrappedNode::Syntax {
+                    rule: child_rule, ..
+                } = child
+                {
+                    match child_rule.as_str() {
+                        "value" if lhs.is_none() => lhs = Some(child),
+                        "type2" if lhs.is_none() => lhs = Some(child),
+                        "ctlop" => op = Some(child_text(child).trim()),
+                        "value" | "type2" => rhs = Some(child),
+                        _ => {},
+                    }
+                }
+            }
+            let (lhs, op, rhs) = (lhs?, op?, rhs?);
+            if op != ".det" {
+                return None;
+            }
+            let lhs_text = resolve_text_rhs_for_abnf_with_det(compiled, lhs)?.0;
+            let rhs_text = resolve_text_rhs_for_abnf_with_det(compiled, rhs)?.0;
+            let lhs_literal = TextLiteralBytes::from_bytes(lhs_text.into_bytes());
+            let rhs_literal = TextLiteralBytes::from_bytes(rhs_text.into_bytes());
+            let combined = lhs_literal.det(&rhs_literal);
+            String::from_utf8(combined.into_bytes())
+                .ok()
+                .map(|s| (s, true))
+        },
+        // `( text .det text )` and `text` (a single-alternative text
+        // expression) both flatten to their single child once the CDDL
+        // parser has resolved the parentheses.
+        "type" | "type2" => {
+            children
+                .iter()
+                .find_map(|child| resolve_text_rhs_for_abnf_with_det(compiled, child))
+        },
+        _ => None,
     }
 }
 
@@ -2598,6 +2852,7 @@ fn render_value_with_highlight(
                 color,
                 node_highlight,
             );
+            crate::render_abnf_breakdown::append_breakdown_comments(path, output, indent, color);
         },
         Value::Text(value) => {
             render_token(
@@ -2607,6 +2862,7 @@ fn render_value_with_highlight(
                 color,
                 node_highlight,
             );
+            crate::render_abnf_breakdown::append_breakdown_comments(path, output, indent, color);
         },
         Value::Array(values) => {
             let depth = indent / 2;
@@ -5764,6 +6020,24 @@ mod tests {
         schema: &[u8],
         cbor: &[u8],
     ) -> (Vec<super::ValidationIssue>, String) {
+        let (issues, dump, _warnings) =
+            validate_schema_bytes_with_dump_and_warnings(schema_name, schema, cbor);
+        (issues, dump)
+    }
+
+    /// Same as `validate_schema_bytes_with_dump` but also returns the
+    /// non-fatal warnings recorded by the validator. Used by the
+    /// transform-annotation tests to assert the documentation-only
+    /// warning is emitted without applying the RHS ABNF.
+    fn validate_schema_bytes_with_dump_and_warnings(
+        schema_name: &str,
+        schema: &[u8],
+        cbor: &[u8],
+    ) -> (
+        Vec<super::ValidationIssue>,
+        String,
+        Vec<super::ValidationWarning>,
+    ) {
         let schema = write_temp_file(schema_name, schema);
         let compiled =
             CompiledCDDL::compile(&schema, None::<&Path>).expect("schema should compile");
@@ -5777,9 +6051,10 @@ mod tests {
         let issues = validate_document(&compiled, &definitions, &root, &document);
         let notes = take_current_schema_notes();
         let hints = super::take_current_embedded_cbor_hints();
+        let warnings = take_current_validation_warnings();
         let ctx = RenderContext::new(&notes, &hints);
         let dump = render_validation_dump(&schema, "input.cbor", &document, &ctx, None, false);
-        (issues, dump)
+        (issues, dump, warnings)
     }
 
     #[test]
@@ -6691,6 +6966,440 @@ headers = ( protected: bstr .size 0, unprotected: {} )
         assert!(dump.contains("h'01'"), "{dump}");
         assert!(!dump.contains("<<"), "{dump}");
     }
+
+    // Plan 017 — `.abnfb` and `.abnf` must evaluate composed `.det` RHS
+    // expressions, parse the resulting ABNF source, validate the input
+    // bytes or text against the grammar, and render a CDN comment
+    // breakdown of the selected match tree.
+    //
+    // Fixture provenance:
+    // * The composed `.det` resolution rule comes from RFC 8610 §3.5 (the `.det`
+    //   text-processing operator).
+    // * The preferred-plus / deterministic / `.abnf` / `.abnfb` control operators are defined
+    //   in `rfc/draft-ietf-cbor-serialization-06.txt` and the embedded-CBOR extension; plan
+    //   017 integrates the `cbork-abnf-parser` trace API to expose match trees.
+    // * The CDN comment syntax follows `rfc/draft-ietf-cbor-edn-literals-25.txt` section 2.2.
+
+    #[test]
+    fn abnfb_accepts_direct_text_rhs_with_valid_bytes() {
+        let dir = write_temp_dir_tree(&["abnfb_direct"]);
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b"root = { payload: bstr .abnfb (\"FOO = 3OCTET\\nOCTET = %x00-FF\") }\n",
+        );
+        // Three arbitrary bytes — the grammar accepts any 3 octets.
+        let mut cbor = vec![0xA1, 0x67, b'p', b'a', b'y', b'l', b'o', b'a', b'd'];
+        cbor.extend(encode_cbor_bstr(&[0xAA, 0xBB, 0xCC]));
+        let _cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        let (issues, dump) = validate_schema_bytes_with_dump(
+            "abnfb_direct.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &cbor,
+        );
+
+        assert!(issues.is_empty(), "{issues:#?}");
+        assert!(dump.contains("// ABNF:"), "{dump}");
+    }
+
+    #[test]
+    fn abnfb_rejects_mismatch_with_abnf_data_error() {
+        let dir = write_temp_dir_tree(&["abnfb_mismatch"]);
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b"root = { payload: bstr .abnfb (\"FOO = %x41.42.43\") }\n",
+        );
+        // The grammar requires `ABC`; we provide `ABD` to trigger a
+        // data mismatch rather than a parse error.
+        let mut cbor = vec![0xA1, 0x67, b'p', b'a', b'y', b'l', b'o', b'a', b'd'];
+        cbor.extend(encode_cbor_bstr(b"ABD"));
+        let _cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        let (issues, _dump) = validate_schema_bytes_with_dump(
+            "abnfb_mismatch.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &cbor,
+        );
+
+        assert!(!issues.is_empty(), "{issues:#?}");
+        let combined: String = issues
+            .iter()
+            .filter_map(|i| i.message.as_deref())
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(
+            combined.contains("ABNF") || combined.contains("match"),
+            "expected an ABNF data-mismatch diagnostic, got: {combined}"
+        );
+    }
+
+    #[test]
+    fn abnfb_rejects_malformed_abnf_after_successful_rhs_resolution() {
+        let dir = write_temp_dir_tree(&["abnfb_bad_abnf"]);
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b"root = { payload: bstr .abnfb (\"this is not valid abnf\") }\n",
+        );
+        let mut cbor = vec![0xA1, 0x67, b'p', b'a', b'y', b'l', b'o', b'a', b'd'];
+        cbor.extend(encode_cbor_bstr(b"any bytes"));
+        let _cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        let (issues, _dump) = validate_schema_bytes_with_dump(
+            "abnfb_bad_abnf.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &cbor,
+        );
+
+        assert!(!issues.is_empty(), "{issues:#?}");
+        let combined: String = issues
+            .iter()
+            .filter_map(|i| i.message.as_deref())
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(
+            combined.contains("ABNF parsing failed"),
+            "expected an ABNF-parse diagnostic, got: {combined}"
+        );
+    }
+
+    #[test]
+    fn abnfb_rejects_unsupported_rhs_form_with_clear_diagnostic() {
+        let dir = write_temp_dir_tree(&["abnfb_unsupported"]);
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            // The RHS is a numeric literal, not text; the resolver
+            // should refuse it cleanly.
+            b"root = { payload: bstr .abnfb (42) }\n",
+        );
+        let mut cbor = vec![0xA1, 0x67, b'p', b'a', b'y', b'l', b'o', b'a', b'd'];
+        cbor.extend(encode_cbor_bstr(b"any bytes"));
+        let _cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        let (issues, _dump) = validate_schema_bytes_with_dump(
+            "abnfb_unsupported.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &cbor,
+        );
+
+        assert!(!issues.is_empty(), "{issues:#?}");
+        let combined: String = issues
+            .iter()
+            .filter_map(|i| i.message.as_deref())
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(
+            combined.contains("ABNF RHS did not resolve to text"),
+            "expected an ABNF-RHS-resolution diagnostic, got: {combined}"
+        );
+    }
+
+    #[test]
+    fn abnfb_preserves_det_whitespace_semantics() {
+        let dir = write_temp_dir_tree(&["abnfb_det_ws"]);
+        // The LHS text ends with a newline so the result is on its own
+        // line; the RHS named rule has 4 leading spaces; `.det` should
+        // dedent both to produce a well-formed ABNF source.
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b"root = { payload: bstr .abnfb (\"label\\n\" .det label-abnf) }\n\
+              label-abnf = '  label = %x41.42.43'\n",
+        );
+        // After `.det`, the source is:
+        //   label
+        //   label = %x41.42.43
+        // The leading "label\n" line is the LHS label that we strip.
+        let mut cbor = vec![0xA1, 0x67, b'p', b'a', b'y', b'l', b'o', b'a', b'd'];
+        cbor.extend(encode_cbor_bstr(b"ABC"));
+        let _cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        let (issues, _dump) = validate_schema_bytes_with_dump(
+            "abnfb_det_ws.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &cbor,
+        );
+
+        assert!(issues.is_empty(), "{issues:#?}");
+    }
+
+    #[test]
+    fn abnfb_lhs_size_failure_remains_distinguishable_from_data_mismatch() {
+        let dir = write_temp_dir_tree(&["abnfb_size_vs_mismatch"]);
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b"root = { payload: (bstr .size 3) .abnfb (\"FOO = 3OCTET\\nOCTET = %x00-FF\") }\n",
+        );
+        // The size constraint fails (only 2 bytes provided) before the
+        // ABNF matcher runs, so the diagnostic must reference size.
+        let mut cbor = vec![0xA1, 0x67, b'p', b'a', b'y', b'l', b'o', b'a', b'd'];
+        cbor.extend(encode_cbor_bstr(&[0xAA, 0xBB]));
+        let _cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        let (issues, _dump) = validate_schema_bytes_with_dump(
+            "abnfb_size_vs_mismatch.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &cbor,
+        );
+
+        assert!(!issues.is_empty(), "{issues:#?}");
+        let combined: String = issues
+            .iter()
+            .filter_map(|i| i.message.as_deref())
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(
+            combined.contains("size constraint failed") || combined.contains("size 3"),
+            "size failure must be reported, got: {combined}"
+        );
+    }
+
+    #[test]
+    fn abnfb_successful_dump_includes_cdn_comment_breakdown() {
+        let dir = write_temp_dir_tree(&["abnfb_dump"]);
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b"root = { payload: bstr .abnfb (\"FOO = 3OCTET\\nOCTET = %x00-FF\") }\n",
+        );
+        let mut cbor = vec![0xA1, 0x67, b'p', b'a', b'y', b'l', b'o', b'a', b'd'];
+        cbor.extend(encode_cbor_bstr(&[0xAA, 0xBB, 0xCC]));
+        let _cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        let (issues, dump) = validate_schema_bytes_with_dump(
+            "abnfb_dump.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &cbor,
+        );
+
+        assert!(issues.is_empty(), "{issues:#?}");
+        // The original `h'...'` value must remain.
+        assert!(dump.contains("h'aa bb cc'"), "{dump}");
+        // The CDN comment breakdown must appear below the value with
+        // indented `// ABNF: ...` lines.
+        assert!(dump.contains("// ABNF:"), "{dump}");
+        assert!(dump.contains("FOO"), "{dump}");
+    }
+
+    #[test]
+    fn abnf_text_validation_uses_validate_text_path() {
+        let dir = write_temp_dir_tree(&["abnf_text"]);
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b"root = { payload: text .abnf \"FOO = \\\"hello\\\"\" }\n",
+        );
+        let mut cbor = vec![0xA1, 0x67, b'p', b'a', b'y', b'l', b'o', b'a', b'd'];
+        // The text "hello" as a 5-byte CBOR text string.
+        cbor.extend_from_slice(&[0x65, b'h', b'e', b'l', b'l', b'o']);
+        let _cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        let (issues, _dump) = validate_schema_bytes_with_dump(
+            "abnf_text.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &cbor,
+        );
+
+        assert!(issues.is_empty(), "{issues:#?}");
+    }
+
+    // Plan 017 transform-annotation follow-up: the four `.x-enc.*` and
+    // `.x-hash.*` forms are documentation-only at validation time. They
+    // must still enforce the left-hand-side carrier constraints
+    // (CBOR type, `.size`) but must not apply the right-hand-side ABNF
+    // grammar to the encoded carrier bytes. They must also produce no
+    // ABNF match trace or CDN comment breakdown.
+
+    #[test]
+    fn xenc_abnfb_accepts_valid_carrier_without_applying_abnf() {
+        // The RHS would fail ABNF (the literal is not a complete rule
+        // and is followed by an unparsable tail) but `.x-enc.abnfb`
+        // must not parse or apply it — the carrier-only path must
+        // accept the value.
+        let dir = write_temp_dir_tree(&["xenc_abnfb_accept"]);
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b"root = (bstr .size 4) .x-enc.abnfb \"this is not valid abnf\"\n",
+        );
+        // A 4-byte byte string that does not match any ABNF grammar.
+        let cbor = encode_cbor_bstr(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let _cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        let (issues, dump, warnings) = validate_schema_bytes_with_dump_and_warnings(
+            "xenc_abnfb_accept.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &cbor,
+        );
+
+        // The RHS ABNF must not produce a mismatch issue.
+        assert!(
+            issues.is_empty(),
+            ".x-enc.abnfb must not apply the RHS ABNF: {issues:#?}"
+        );
+        // A documentation-only warning is expected.
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.text.contains(".x-enc.abnfb") && w.text.contains("documentation-only")),
+            "expected a documentation-only warning, got: {warnings:#?}"
+        );
+        // The detailed dump must not contain any ABNF comment breakdown
+        // for the transform annotation.
+        assert!(
+            !dump.contains("// ABNF:"),
+            "transform annotation must not emit an ABNF breakdown:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn xenc_abnfb_rejects_wrong_carrier_type() {
+        // The LHS is `bstr .size 4`. Supplying an `int` should still
+        // fail because the carrier constraints are authoritative.
+        let dir = write_temp_dir_tree(&["xenc_abnfb_wrong_type"]);
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b"root = (bstr .size 4) .x-enc.abnfb \"unused\"\n",
+        );
+        let _cbor_path = write_cbor(&dir, "value.cbor", &[0x18, 0x64]);
+
+        let (issues, _dump) = validate_schema_bytes_with_dump(
+            "xenc_abnfb_wrong_type.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &[0x18, 0x64],
+        );
+
+        assert!(
+            !issues.is_empty(),
+            "wrong carrier type must still be rejected"
+        );
+    }
+
+    #[test]
+    fn xenc_abnfb_rejects_wrong_size() {
+        // The LHS is `bstr .size 4`. Supplying a 3-byte byte string
+        // should still fail the size check.
+        let dir = write_temp_dir_tree(&["xenc_abnfb_wrong_size"]);
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b"root = (bstr .size 4) .x-enc.abnfb \"unused\"\n",
+        );
+        let _cbor_path = write_cbor(&dir, "value.cbor", &[0x43, 0xAA, 0xBB, 0xCC]);
+
+        let (issues, _dump) = validate_schema_bytes_with_dump(
+            "xenc_abnfb_wrong_size.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &[0x43, 0xAA, 0xBB, 0xCC],
+        );
+
+        assert!(!issues.is_empty(), "wrong .size must still be rejected");
+        let combined: String = issues
+            .iter()
+            .filter_map(|i| i.message.as_deref())
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(
+            combined.contains("size 4") || combined.contains("size constraint"),
+            "size failure must be reported, got: {combined}"
+        );
+    }
+
+    #[test]
+    fn xhash_abnf_accepts_valid_carrier_without_applying_abnf() {
+        let dir = write_temp_dir_tree(&["xhash_abnf_accept"]);
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b"root = (bstr .size 8) .x-hash.abnf \"this is not valid abnf\"\n",
+        );
+        let mut cbor = vec![0x48];
+        cbor.extend_from_slice(&[0x00; 8]);
+        let _cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        let (issues, dump, warnings) = validate_schema_bytes_with_dump_and_warnings(
+            "xhash_abnf_accept.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &cbor,
+        );
+
+        assert!(issues.is_empty(), "{issues:#?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.text.contains(".x-hash.abnf") && w.text.contains("documentation-only")),
+            "expected a documentation-only warning, got: {warnings:#?}"
+        );
+        assert!(
+            !dump.contains("// ABNF:"),
+            "transform annotation must not emit an ABNF breakdown:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn xhash_abnfb_accepts_valid_carrier_without_applying_abnf() {
+        let dir = write_temp_dir_tree(&["xhash_abnfb_accept"]);
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b"root = (bstr .size 16) .x-hash.abnfb \"this is not valid abnf\"\n",
+        );
+        let mut cbor = vec![0x50];
+        cbor.extend_from_slice(&[0x00; 16]);
+        let _cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        let (issues, dump, warnings) = validate_schema_bytes_with_dump_and_warnings(
+            "xhash_abnfb_accept.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &cbor,
+        );
+
+        assert!(issues.is_empty(), "{issues:#?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.text.contains(".x-hash.abnfb") && w.text.contains("documentation-only")),
+            "expected a documentation-only warning, got: {warnings:#?}"
+        );
+        assert!(
+            !dump.contains("// ABNF:"),
+            "transform annotation must not emit an ABNF breakdown:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn xenc_abnf_accepts_valid_text_carrier_without_applying_abnf() {
+        // The `.x-enc.abnf` text variant must also be documentation-only
+        // for ordinary text carriers.
+        let dir = write_temp_dir_tree(&["xenc_abnf_accept"]);
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b"root = (text .size 4) .x-enc.abnf \"this is not valid abnf\"\n",
+        );
+        // 4-byte text string "test".
+        let cbor = vec![0x64, b't', b'e', b's', b't'];
+        let _cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        let (issues, _dump) = validate_schema_bytes_with_dump(
+            "xenc_abnf_accept.cddl",
+            &{ std::fs::read(&schema).expect("schema read") },
+            &cbor,
+        );
+
+        assert!(issues.is_empty(), "{issues:#?}");
+    }
+
+    // Plan 017 regression — the exact reproduction from the plan
+    // is exercised as a CLI test in `lint::tests::cli_validate_dntls_*`
+    // because the dntls schema imports `./time.cddl`, which is only
+    // resolvable when the compiler runs from the schema's containing
+    // directory. Unit tests cannot easily reproduce that context.
 
     #[test]
     fn embedded_cbor_indent_helper_indents_continuation_lines() {

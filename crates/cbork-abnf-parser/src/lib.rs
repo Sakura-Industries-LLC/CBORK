@@ -40,9 +40,9 @@ mod ast;
 mod parser;
 
 pub use ast::{
-    AbnfDocument, AbnfElement, AbnfError, AbnfOption, AbnfRule, AbnfValidationError, Alternation,
-    CharVal, Concatenation, DefinitionOperator, GroupedAlternation, NumBase, NumRange, NumVal,
-    NumValue, ProseVal, Repeat, RepeatRange, Repetition, Rulename, SourceSpan,
+    AbnfDocument, AbnfElement, AbnfError, AbnfMatch, AbnfOption, AbnfRule, AbnfValidationError,
+    Alternation, CharVal, Concatenation, DefinitionOperator, GroupedAlternation, NumBase, NumRange,
+    NumVal, NumValue, ProseVal, Repeat, RepeatRange, Repetition, Rulename, SourceSpan,
 };
 
 /// Parse strict RFC 5234 ABNF and return an owned document model.

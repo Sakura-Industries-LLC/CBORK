@@ -1,6 +1,6 @@
 [package]
 name = "cbork-cddl-compiler"
-version = "0.0.5"
+version = "0.0.6"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -17,7 +17,7 @@ exclude = ["moon.yml"]
 workspace = true
 
 [dependencies]
-cbork-abnf-parser = { path = "../cbork-abnf-parser", version = "0.0.3" }
+cbork-abnf-parser = { path = "../cbork-abnf-parser", version = "0.0.4" }
 cbork-cddl-parser = { path = "../cbork-cddl-parser", version = "0.0.3" }
 anyhow = "1.0"
 base64 = "0.22"

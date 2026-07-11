@@ -135,6 +135,41 @@ impl AbnfDocument {
         self.validate_input(input.as_ref().as_bytes())
     }
 
+    /// Validate a byte slice against the start rule and return a trace of
+    /// the selected match tree.
+    ///
+    /// The trace records the byte offsets and selected children of every
+    /// rule that participated in a successful match. The top-level
+    /// `AbnfMatch` always covers the complete input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the document has no rules, contains an
+    /// unsupported ABNF construct, or the input does not match the start
+    /// rule. Failures do not produce a partial trace.
+    pub fn match_bytes_with_trace(
+        &self,
+        input: &[u8],
+    ) -> Result<AbnfMatch, AbnfValidationError> {
+        self.match_with_trace(input)
+    }
+
+    /// Validate a text slice against the start rule and return a trace of
+    /// the selected match tree. Offsets are byte offsets into the UTF-8
+    /// encoding of the input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the document has no rules, contains an
+    /// unsupported ABNF construct, or the input does not match the start
+    /// rule. Failures do not produce a partial trace.
+    pub fn match_text_with_trace(
+        &self,
+        input: &str,
+    ) -> Result<AbnfMatch, AbnfValidationError> {
+        self.match_with_trace(input.as_bytes())
+    }
+
     /// Validate a byte slice against the start rule.
     fn validate_input(
         &self,
@@ -155,6 +190,27 @@ impl AbnfDocument {
                 expected: start_rule.name().as_str().to_owned(),
             })
         }
+    }
+
+    /// Run the validator with tracing enabled, returning the selected
+    /// match tree on success or an error on failure.
+    fn match_with_trace(
+        &self,
+        input: &[u8],
+    ) -> Result<AbnfMatch, AbnfValidationError> {
+        let Some(start_rule) = self.rules.first() else {
+            return Err(AbnfValidationError::EmptyDocument);
+        };
+
+        let mut validator = AbnfValidator::new(self);
+        let trace = validator.match_rule_with_trace(start_rule.name().as_str(), 0, input)?;
+        if trace.end() != input.len() {
+            return Err(AbnfValidationError::Mismatch {
+                offset: trace.end(),
+                expected: start_rule.name().as_str().to_owned(),
+            });
+        }
+        Ok(trace)
     }
 }
 
@@ -756,6 +812,71 @@ enum MemoState {
     Done(BTreeSet<usize>),
 }
 
+/// A successful match of a single ABNF rule against an input span.
+///
+/// The trace records the byte offsets of the consumed input and the
+/// selected child matches in source order. The tree is rooted at the
+/// start rule and the root span always covers the complete input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbnfMatch {
+    /// The matched rule name.
+    rule: String,
+    /// The inclusive start offset of the match in the original input.
+    start: usize,
+    /// The exclusive end offset of the match in the original input.
+    end: usize,
+    /// The selected child matches in source order.
+    children: Vec<AbnfMatch>,
+}
+
+impl AbnfMatch {
+    /// Construct a new `AbnfMatch`.
+    #[must_use]
+    pub fn new(
+        rule: String,
+        start: usize,
+        end: usize,
+        children: Vec<AbnfMatch>,
+    ) -> Self {
+        Self {
+            rule,
+            start,
+            end,
+            children,
+        }
+    }
+
+    /// Return the matched rule name.
+    #[must_use]
+    pub fn rule(&self) -> &str {
+        &self.rule
+    }
+
+    /// Return the inclusive start byte offset of the match.
+    #[must_use]
+    pub fn start(&self) -> usize {
+        self.start
+    }
+
+    /// Return the exclusive end byte offset of the match.
+    #[must_use]
+    pub fn end(&self) -> usize {
+        self.end
+    }
+
+    /// Return the selected child matches in source order.
+    #[must_use]
+    pub fn children(&self) -> &[AbnfMatch] {
+        &self.children
+    }
+
+    /// Consume the match and return its owned parts.
+    #[must_use]
+    pub fn into_parts(self) -> (String, usize, usize, Vec<AbnfMatch>) {
+        (self.rule, self.start, self.end, self.children)
+    }
+}
+
 impl<'a> AbnfValidator<'a> {
     /// Construct a validator for a document.
     fn new(document: &'a AbnfDocument) -> Self {
@@ -787,6 +908,24 @@ impl<'a> AbnfValidator<'a> {
         };
 
         self.match_rule_index(index, pos, input)
+    }
+
+    /// Match a rule by name at the given input position and return the
+    /// selected match trace. The validator must have produced a
+    /// successful full match; partial matches are reported as errors.
+    fn match_rule_with_trace(
+        &mut self,
+        name: &str,
+        pos: usize,
+        input: &[u8],
+    ) -> Result<AbnfMatch, AbnfValidationError> {
+        let Some(&index) = self.rule_indices.get(name) else {
+            return Err(AbnfValidationError::UnknownRule {
+                name: name.to_owned(),
+            });
+        };
+
+        self.match_rule_index_with_trace(index, pos, input)
     }
 
     /// Match a rule by index at the given input position.
@@ -825,6 +964,279 @@ impl<'a> AbnfValidator<'a> {
             Err(err) => {
                 self.memo.remove(&key);
                 Err(err)
+            },
+        }
+    }
+
+    /// Match a rule by index at the given input position and return
+    /// the selected match trace.
+    fn match_rule_index_with_trace(
+        &mut self,
+        index: usize,
+        pos: usize,
+        input: &[u8],
+    ) -> Result<AbnfMatch, AbnfValidationError> {
+        let rule = self.document.rules.get(index).ok_or_else(|| {
+            AbnfValidationError::InvalidNumericLiteral {
+                message: "rule index was out of bounds".to_owned(),
+            }
+        })?;
+
+        let key = (index, pos);
+        if let Some(state) = self.memo.get(&key) {
+            return match state {
+                MemoState::InProgress | MemoState::Done(_) => {
+                    Err(AbnfValidationError::RecursiveRule {
+                        name: rule.name().as_str().to_owned(),
+                        offset: pos,
+                    })
+                },
+            };
+        }
+
+        self.memo.insert(key, MemoState::InProgress);
+        let (end, children) = self.match_alternation_with_trace(rule.expression(), pos, input)?;
+        self.memo
+            .insert(key, MemoState::Done(BTreeSet::from([end])));
+        Ok(AbnfMatch::new(
+            rule.name().as_str().to_owned(),
+            pos,
+            end,
+            children,
+        ))
+    }
+
+    /// Match an alternation at the given input position and return the
+    /// selected branch as a trace.
+    fn match_alternation_with_trace(
+        &mut self,
+        alternation: &Alternation,
+        pos: usize,
+        input: &[u8],
+    ) -> Result<(usize, Vec<AbnfMatch>), AbnfValidationError> {
+        let mut last_error: Option<AbnfValidationError> = None;
+        for concatenation in alternation.concatenations() {
+            match self.match_concatenation_with_trace(concatenation, pos, input) {
+                Ok((end, children)) => return Ok((end, children)),
+                Err(err) => {
+                    if last_error.is_none() {
+                        last_error = Some(err);
+                    }
+                },
+            }
+        }
+        Err(last_error.unwrap_or(AbnfValidationError::Mismatch {
+            offset: pos,
+            expected: "<alternation>".to_owned(),
+        }))
+    }
+
+    /// Match a concatenation at the given input position and return the
+    /// selected children.
+    fn match_concatenation_with_trace(
+        &mut self,
+        concatenation: &Concatenation,
+        pos: usize,
+        input: &[u8],
+    ) -> Result<(usize, Vec<AbnfMatch>), AbnfValidationError> {
+        let mut positions = BTreeSet::from([pos]);
+        let mut all_children = Vec::new();
+        for repetition in concatenation.repetitions() {
+            let (next_positions, children) =
+                self.match_repetition_with_trace(repetition, &positions, input)?;
+            if next_positions.is_empty() {
+                return Err(AbnfValidationError::Mismatch {
+                    offset: pos,
+                    expected: "<concatenation>".to_owned(),
+                });
+            }
+            all_children.extend(children);
+            positions = next_positions;
+        }
+        // Pick the longest successful position; if multiple, pick the
+        // last (deterministic) one to keep the trace stable.
+        let end = *positions.iter().next_back().ok_or_else(|| {
+            AbnfValidationError::Mismatch {
+                offset: pos,
+                expected: "<concatenation>".to_owned(),
+            }
+        })?;
+        Ok((end, all_children))
+    }
+
+    /// Match a repetition at the given input position and return the
+    /// positions and selected children.
+    fn match_repetition_with_trace(
+        &mut self,
+        repetition: &Repetition,
+        positions: &BTreeSet<usize>,
+        input: &[u8],
+    ) -> Result<(BTreeSet<usize>, Vec<AbnfMatch>), AbnfValidationError> {
+        match repetition.repeat() {
+            None => self.match_element_with_trace(repetition.element(), positions, input),
+            Some(Repeat::Exact(count)) => {
+                let count = usize::try_from(*count).map_err(|_| {
+                    AbnfValidationError::InvalidNumericLiteral {
+                        message: "repeat count exceeded usize".to_owned(),
+                    }
+                })?;
+                self.match_repeated_element_with_trace(
+                    repetition.element(),
+                    positions,
+                    count,
+                    Some(count),
+                    input,
+                )
+            },
+            Some(Repeat::Range(range)) => {
+                let min = match range.min() {
+                    Some(min) => {
+                        usize::try_from(min).map_err(|_| {
+                            AbnfValidationError::InvalidNumericLiteral {
+                                message: "repeat minimum exceeded usize".to_owned(),
+                            }
+                        })?
+                    },
+                    None => 0,
+                };
+                let max = match range.max() {
+                    Some(max) => {
+                        Some(usize::try_from(max).map_err(|_| {
+                            AbnfValidationError::InvalidNumericLiteral {
+                                message: "repeat maximum exceeded usize".to_owned(),
+                            }
+                        })?)
+                    },
+                    None => None,
+                };
+                self.match_repeated_element_with_trace(
+                    repetition.element(),
+                    positions,
+                    min,
+                    max,
+                    input,
+                )
+            },
+        }
+    }
+
+    /// Match a repeated element at the given input position and return
+    /// the positions and selected children.
+    fn match_repeated_element_with_trace(
+        &mut self,
+        element: &AbnfElement,
+        positions: &BTreeSet<usize>,
+        min: usize,
+        max: Option<usize>,
+        input: &[u8],
+    ) -> Result<(BTreeSet<usize>, Vec<AbnfMatch>), AbnfValidationError> {
+        if let Some(max) = max
+            && max < min
+        {
+            return Err(AbnfValidationError::InvalidNumericLiteral {
+                message: "repeat maximum is smaller than minimum".to_owned(),
+            });
+        }
+
+        let mut current = positions.clone();
+        let mut all_children = Vec::new();
+        for _ in 0..min {
+            let (next, children) = self.match_element_with_trace(element, &current, input)?;
+            if next.is_empty() {
+                return Err(AbnfValidationError::Mismatch {
+                    offset: *current.iter().next().unwrap_or(&0),
+                    expected: "<repetition minimum>".to_owned(),
+                });
+            }
+            all_children.extend(children);
+            current = next;
+        }
+
+        let mut repeats = min;
+        while max.is_none_or(|max| repeats < max) {
+            let (next, children) = self.match_element_with_trace(element, &current, input)?;
+            if next.is_empty() || next == current {
+                break;
+            }
+            all_children.extend(children);
+            current = next;
+            repeats = repeats.checked_add(1).ok_or_else(|| {
+                AbnfValidationError::InvalidNumericLiteral {
+                    message: "repeat count exceeded usize".to_owned(),
+                }
+            })?;
+        }
+
+        Ok((current, all_children))
+    }
+
+    /// Match an element against a set of candidate positions and return
+    /// the positions and selected children.
+    fn match_element_with_trace(
+        &mut self,
+        element: &AbnfElement,
+        positions: &BTreeSet<usize>,
+        input: &[u8],
+    ) -> Result<(BTreeSet<usize>, Vec<AbnfMatch>), AbnfValidationError> {
+        if positions.is_empty() {
+            return Ok((BTreeSet::new(), Vec::new()));
+        }
+        // Pick the earliest candidate as the primary starting position.
+        let Some(&pos) = positions.iter().next() else {
+            return Ok((BTreeSet::new(), Vec::new()));
+        };
+        match element {
+            AbnfElement::RuleRef(rule) => {
+                let child = self.match_rule_with_trace(rule.as_str(), pos, input)?;
+                let mut next = BTreeSet::new();
+                next.insert(child.end());
+                Ok((next, vec![child]))
+            },
+            AbnfElement::Group(group) => {
+                self.match_alternation_with_trace(group.alternation(), pos, input)
+                    .map(|(end, children)| {
+                        let mut next = BTreeSet::new();
+                        next.insert(end);
+                        (next, children)
+                    })
+            },
+            AbnfElement::Optional(option) => {
+                // First try to match the inner alternation. If it
+                // succeeds, record it; otherwise return the original
+                // positions unchanged.
+                if let Ok((end, children)) =
+                    self.match_alternation_with_trace(option.alternation(), pos, input)
+                {
+                    let mut next = BTreeSet::new();
+                    next.insert(end);
+                    Ok((next, children))
+                } else {
+                    Ok((positions.clone(), Vec::new()))
+                }
+            },
+            AbnfElement::CharVal(value) => {
+                if let Some(end) = Self::match_char_value_end(value.value().as_bytes(), pos, input)
+                {
+                    let mut next = BTreeSet::new();
+                    next.insert(end);
+                    Ok((next, Vec::new()))
+                } else {
+                    Ok((BTreeSet::new(), Vec::new()))
+                }
+            },
+            AbnfElement::NumVal(value) => {
+                if let Some(end) = Self::match_num_value_end(value, pos, input)? {
+                    let mut next = BTreeSet::new();
+                    next.insert(end);
+                    Ok((next, Vec::new()))
+                } else {
+                    Ok((BTreeSet::new(), Vec::new()))
+                }
+            },
+            AbnfElement::ProseVal(value) => {
+                Err(AbnfValidationError::UnsupportedProseValue {
+                    span: value.span().clone(),
+                })
             },
         }
     }
@@ -998,23 +1410,29 @@ impl<'a> AbnfValidator<'a> {
         pos: usize,
         input: &[u8],
     ) -> BTreeSet<usize> {
-        let Some(end) = pos.checked_add(value.len()) else {
-            return BTreeSet::new();
-        };
+        Self::match_char_value_end(value, pos, input)
+            .into_iter()
+            .collect()
+    }
 
-        let Some(candidate) = input.get(pos..end) else {
-            return BTreeSet::new();
-        };
-
+    /// Return the next offset after a successful case-insensitive match
+    /// of a quoted string, or `None` when the match fails.
+    fn match_char_value_end(
+        value: &[u8],
+        pos: usize,
+        input: &[u8],
+    ) -> Option<usize> {
+        let end = pos.checked_add(value.len())?;
+        let candidate = input.get(pos..end)?;
         if candidate
             .iter()
             .copied()
             .zip(value.iter().copied())
             .all(|(left, right)| left.eq_ignore_ascii_case(&right))
         {
-            BTreeSet::from([end])
+            Some(end)
         } else {
-            BTreeSet::new()
+            None
         }
     }
 
@@ -1024,6 +1442,19 @@ impl<'a> AbnfValidator<'a> {
         pos: usize,
         input: &[u8],
     ) -> Result<BTreeSet<usize>, AbnfValidationError> {
+        Ok(Self::match_num_value_end(value, pos, input)?
+            .into_iter()
+            .collect())
+    }
+
+    /// Return the next offset after a successful numeric match, or
+    /// `None` when the match fails. Empty success sets are represented
+    /// as empty `Vec`s so the trace can distinguish them from errors.
+    fn match_num_value_end(
+        value: &NumVal,
+        pos: usize,
+        input: &[u8],
+    ) -> Result<Option<usize>, AbnfValidationError> {
         match value.value() {
             NumValue::Sequence(parts) => {
                 let bytes = parts
@@ -1038,7 +1469,7 @@ impl<'a> AbnfValidator<'a> {
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(Self::match_exact_bytes(&bytes, pos, input))
+                Ok(Self::match_exact_bytes_end(&bytes, pos, input))
             },
             NumValue::Range(range) => {
                 let start = u8::try_from(range.start()).map_err(|_| {
@@ -1065,7 +1496,7 @@ impl<'a> AbnfValidator<'a> {
                 }
 
                 let Some(&byte) = input.get(pos) else {
-                    return Ok(BTreeSet::new());
+                    return Ok(None);
                 };
                 if (start..=end).contains(&byte) {
                     let Some(next) = pos.checked_add(1) else {
@@ -1073,32 +1504,39 @@ impl<'a> AbnfValidator<'a> {
                             message: "match position exceeded usize".to_owned(),
                         });
                     };
-                    Ok(BTreeSet::from([next]))
+                    Ok(Some(next))
                 } else {
-                    Ok(BTreeSet::new())
+                    Ok(None)
                 }
             },
         }
     }
 
     /// Match an exact byte sequence at the given input position.
+    #[allow(dead_code)]
     fn match_exact_bytes(
         expected: &[u8],
         pos: usize,
         input: &[u8],
     ) -> BTreeSet<usize> {
-        let Some(end) = pos.checked_add(expected.len()) else {
-            return BTreeSet::new();
-        };
+        Self::match_exact_bytes_end(expected, pos, input)
+            .into_iter()
+            .collect()
+    }
 
-        let Some(candidate) = input.get(pos..end) else {
-            return BTreeSet::new();
-        };
-
+    /// Return the next offset after a successful exact byte match, or
+    /// `None` when the match fails.
+    fn match_exact_bytes_end(
+        expected: &[u8],
+        pos: usize,
+        input: &[u8],
+    ) -> Option<usize> {
+        let end = pos.checked_add(expected.len())?;
+        let candidate = input.get(pos..end)?;
         if candidate == expected {
-            BTreeSet::from([end])
+            Some(end)
         } else {
-            BTreeSet::new()
+            None
         }
     }
 }

@@ -94,6 +94,58 @@ fn validates_text_and_bytes_against_the_document() {
 }
 
 #[test]
+fn trace_records_selected_rule_tree_for_successful_match() {
+    // The grammar mirrors the X-Wing public-key layout used in the
+    // dntls regression fixture: a top-level rule that concatenates
+    // an ML-KEM span and an X25519 span, with two child rules and an
+    // OCTET helper.
+    let source = "\
+ml-kem-768-x25519-public-key =
+    ml-kem-768-public-key
+    x25519-public-key
+
+ml-kem-768-public-key = 1184OCTET
+x25519-public-key      = 32OCTET
+OCTET                  = %x00-FF
+";
+    let document = parse_abnf(source).expect("ABNF should parse");
+
+    let mut input = vec![0xAA_u8; 1184];
+    input.extend(std::iter::repeat_n(0xBB_u8, 32));
+    let trace = document
+        .match_bytes_with_trace(&input)
+        .expect("trace should be produced for a full match");
+
+    assert_eq!(trace.rule(), "ml-kem-768-x25519-public-key");
+    assert_eq!(trace.start(), 0);
+    assert_eq!(trace.end(), input.len());
+
+    let children = trace.children();
+    assert_eq!(children.len(), 2, "expected two top-level spans");
+    let mlkem = &children[0];
+    let x25519 = &children[1];
+    assert_eq!(mlkem.rule(), "ml-kem-768-public-key");
+    assert_eq!(mlkem.start(), 0);
+    assert_eq!(mlkem.end(), 1184);
+    assert_eq!(x25519.rule(), "x25519-public-key");
+    assert_eq!(x25519.start(), 1184);
+    assert_eq!(x25519.end(), input.len());
+
+    // The 1184-byte child must in turn expand to 1184 OCTET matches.
+    assert_eq!(mlkem.children().len(), 1184);
+    for (i, child) in mlkem.children().iter().enumerate() {
+        assert_eq!(child.rule(), "OCTET");
+        assert_eq!(child.start(), i);
+        assert_eq!(child.end(), i + 1);
+    }
+
+    let err = document
+        .match_bytes_with_trace(&[0x00; 10])
+        .expect_err("partial match should report a mismatch");
+    assert!(matches!(err, AbnfValidationError::Mismatch { .. }));
+}
+
+#[test]
 fn validates_numeric_literal_bytes() {
     let document = parse_abnf("start = %x41.42.43\n").expect("ABNF should parse");
 

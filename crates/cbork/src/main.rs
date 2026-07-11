@@ -10,6 +10,7 @@ mod decode;
 mod diagnostics;
 mod lint;
 mod render;
+mod render_abnf_breakdown;
 mod rfc;
 mod ui;
 mod validate;

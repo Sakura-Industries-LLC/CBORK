@@ -3661,4 +3661,53 @@ rule = 1
             "non-CBOR bytes must stay raw under try-cbor-bstr:\n{output}"
         );
     }
+
+    // Plan 017 regression — the exact reproduction command from the
+    // plan. The dntls ML-KEM-768-X25519 public-key vector must
+    // validate as bytes against the ABNF grammar declared in
+    // dntls-cose-defs.cddl. We use the detailed dump so the
+    // CDN-comment breakdown is exercised end-to-end.
+    #[test]
+    fn cli_validate_dntls_mlkem768_x25519_public_key_succeeds() {
+        let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap()
+            .to_path_buf();
+        let schema = workspace.join("test/dntls-core/doc/dntls-cose-defs.cddl");
+        let vector = workspace.join("test/dntls-core/vectors/mlkem768_public.cbor");
+        let (code, output) = run_cbork(&[
+            "--color=never",
+            "validate",
+            "--type=Cose-Public-Key-mlkem768-x25519-dntls",
+            "--detailed",
+            schema.to_str().expect("utf-8 path"),
+            vector.to_str().expect("utf-8 path"),
+        ]);
+        assert_eq!(
+            code, 0,
+            "reproduction command must succeed, got {code}:\n{output}"
+        );
+        assert!(
+            output.contains(": OK"),
+            "reproduction must report a successful match:\n{output}"
+        );
+        // The detailed dump must include the CDN comment breakdown.
+        assert!(
+            output.contains("// ABNF:"),
+            "detailed dump must include the ABNF comment breakdown:\n{output}"
+        );
+        assert!(
+            output.contains("ml-kem-768-x25519-public-key"),
+            "comment breakdown must include the start rule:\n{output}"
+        );
+        assert!(
+            output.contains("ml-kem-768-public-key"),
+            "comment breakdown must include the 1184-byte child rule:\n{output}"
+        );
+        assert!(
+            output.contains("x25519-public-key"),
+            "comment breakdown must include the 32-byte child rule:\n{output}"
+        );
+    }
 }
