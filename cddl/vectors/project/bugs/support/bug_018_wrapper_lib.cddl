@@ -1,0 +1,15 @@
+; Support library for bug_018_imported_generic_within_namespace.cddl.
+;
+; Imports RFC 9052 as `cose` so the generic rule's `.within` RHS can
+; reference `cose.COSE_Encrypt0` in the generic's definition-site
+; scope.  Consumers of `COSE_Encrypt0<headers, payload>` should not
+; have to import `cose` themselves.
+
+;@ CBORK: Library
+;@ CBORK: Export
+COSE_Encrypt0<headers, payload> = [
+    headers,
+    ciphertext: bstr / nil,
+] .within cose.COSE_Encrypt0
+
+;# import rfc9052 as cose

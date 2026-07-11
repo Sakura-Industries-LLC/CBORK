@@ -197,6 +197,21 @@ fn resolve_node_single<S: BuildHasher>(
                 wrap_with_alias(&mut resolved, alias, &local_rule_names);
             }
 
+            // BUG-018: hoist any trailing `Directive` (with its
+            // `ModuleStart`/`ModuleEnd` markers) out of a generic
+            // template `RuleLine` so the reachability pruner cannot
+            // drop the directive's subtree along with the template.
+            //
+            // The pest grammar attaches a trailing `;# import ...`
+            // as a `Comment` child of the preceding rule line, which
+            // `inject_directives_into_nodes` later turns into a
+            // `Directive` child.  When the consumer instantiates the
+            // generic and the template becomes unreferenced, the
+            // pruner would otherwise delete the entire template
+            // subtree and lose the imported definitions referenced by
+            // the expanded `.within` RHS.
+            hoist_trailing_directives_from_generic_templates(&mut resolved);
+
             // Step 5.12: record the imported / included library's
             // metadata so the consumer's finalization pass can
             // enforce the export contract for direct uses.  Both
@@ -872,4 +887,105 @@ fn prepend_alias_to_rule_text(
     let name = rule_text.get(..name_end).unwrap_or(rule_text);
     let rest = rule_text.get(name_end..).unwrap_or("");
     format!("{alias}.{name}{rest}")
+}
+
+// ---------------------------------------------------------------------------
+// Generic-template directive hoisting (BUG-018)
+// ---------------------------------------------------------------------------
+
+/// Hoist any trailing `Directive` (with its `ModuleStart`/`ModuleEnd`
+/// markers) out of a generic template `RuleLine` so the reachability
+/// pruner cannot drop the directive's subtree along with the
+/// template after the template is expanded.
+///
+/// The pest grammar attaches a trailing `;# import ...` as a `Comment`
+/// child of the preceding rule line, which `inject_directives_into_nodes`
+/// later turns into a `Directive` child.  When the consumer instantiates
+/// the generic and the template becomes unreferenced, the pruner would
+/// otherwise delete the entire template subtree and lose the imported
+/// definitions referenced by the expanded `.within` RHS.
+///
+/// Hoisting runs on `resolved` (the importer-wrapped subtree of the
+/// imported module) so that the directive lands as a sibling of the
+/// generic template in the consumer's tree.  The directive's subtree
+/// (which the resolve pass has already populated with the imported
+/// definitions) then becomes reachable from the consumer's roots and
+/// survives the pruner.
+fn hoist_trailing_directives_from_generic_templates(nodes: &mut Vec<WrappedNode>) {
+    let mut hoisted: Vec<WrappedNode> = Vec::new();
+    for node in nodes.iter_mut() {
+        hoist_trailing_directives_from_node(node, &mut hoisted);
+    }
+    nodes.extend(hoisted);
+}
+
+/// Recursive helper for [`hoist_trailing_directives_from_generic_templates`].
+/// Hoists any trailing `ModuleStart` + `Directive` + `ModuleEnd`
+/// cluster out of `node` (when it is a generic template `RuleLine`)
+/// and recurses into non-generic nodes for completeness.
+fn hoist_trailing_directives_from_node(
+    node: &mut WrappedNode,
+    hoisted: &mut Vec<WrappedNode>,
+) {
+    match node {
+        WrappedNode::RuleLine { text, children, .. } => {
+            if is_generic_rule_text(text.trim()) {
+                // Walk the children looking for trailing
+                // `ModuleStart` + `Directive` + `ModuleEnd` clusters
+                // and move them out of the generic template.  Drain
+                // by removing the head of `children` on each
+                // iteration; the loop terminates when `children` is
+                // empty.
+                let mut kept = Vec::with_capacity(children.len());
+                while let Some(first) = children.first() {
+                    let is_cluster_start = matches!(first, WrappedNode::ModuleStart { .. })
+                        && children
+                            .get(1)
+                            .is_some_and(|c| matches!(c, WrappedNode::Directive { .. }))
+                        && children
+                            .get(2)
+                            .is_some_and(|c| matches!(c, WrappedNode::ModuleEnd { .. }));
+                    if is_cluster_start {
+                        // Pop the three elements in reverse order so
+                        // the remaining indices remain valid.
+                        let end = children.remove(2);
+                        let directive = children.remove(1);
+                        let start = children.remove(0);
+                        hoisted.push(start);
+                        hoisted.push(directive);
+                        hoisted.push(end);
+                    } else {
+                        // Move the kept child out, then recurse into
+                        // it.  This avoids a borrow conflict between
+                        // `children` and a recursive call.
+                        let mut child = children.remove(0);
+                        hoist_trailing_directives_from_node(&mut child, hoisted);
+                        kept.push(child);
+                    }
+                }
+                *children = kept;
+            } else {
+                // Plain rule lines keep their children as-is, but the
+                // descendants may still contain generic templates
+                // whose directives need hoisting.
+                for child in children.iter_mut() {
+                    hoist_trailing_directives_from_node(child, hoisted);
+                }
+            }
+        },
+        WrappedNode::Directive { children, .. } | WrappedNode::Syntax { children, .. } => {
+            // The wrapped subtree of a sub-module's `Directive` has
+            // already been processed by the recursive `resolve_includes`
+            // call, so its own generic templates were hoisted there.
+            // We still recurse into nested generic templates for
+            // completeness (e.g. generic helper inside the directive's
+            // own subtree).
+            for child in children.iter_mut() {
+                hoist_trailing_directives_from_node(child, hoisted);
+            }
+        },
+        WrappedNode::Comment { .. }
+        | WrappedNode::ModuleStart { .. }
+        | WrappedNode::ModuleEnd { .. } => {},
+    }
 }

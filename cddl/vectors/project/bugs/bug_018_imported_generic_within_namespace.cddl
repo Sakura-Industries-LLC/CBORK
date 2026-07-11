@@ -1,0 +1,30 @@
+; BUG-018 reproducer (plan 018): an imported generic rule whose
+; effective type uses `.within <aliased-rfc9052-name>` must resolve
+; the `.within` RHS through the generic definition's own import
+; scope, not the consumer's.
+;
+; Topology (matches the dntls-cose-encrypt shape from the plan):
+;
+; 1. `wrapper_lib.cddl` imports the RFC 9052 standard CDDL as `cose`
+;    and declares a generic rule whose effective type uses
+;    `.within cose.COSE_Encrypt0`.
+; 2. `consumer.cddl` imports `wrapper_lib.cddl` under a different
+;    alias (`encrypt`) and instantiates the imported generic with
+;    concrete arguments.  The consumer does NOT import `cose`
+;    itself.
+;
+; The `.within` subtype check must complete without surfacing an
+; unresolved `cose.COSE_Encrypt0` diagnostic.  The `cose.COSE_Encrypt0`
+; reference is supplied by RFC 9052; this is a compiler/linter
+; regression, not a CBOR validation case.
+;
+; Note: the LHS and RHS shapes differ on purpose.  The point of the
+; fixture is to verify that `.within cose.COSE_Encrypt0` *resolves*
+; through the generic's definition-site import scope.  A subtype
+; failure here proves the `.within` RHS was resolved (it cannot
+; fail for the wrong reason when the name is unresolved).
+
+root = encrypt.COSE_Encrypt0<uint, nil>
+
+;# import encrypt.COSE_Encrypt0<headers, payload> from "./support/bug_018_wrapper_lib.cddl" as encrypt
+

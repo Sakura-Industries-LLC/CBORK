@@ -1,0 +1,14 @@
+; Companion to bug_018: a direct (non-generic) `.within
+; cose.COSE_Encrypt0` from inside an imported library, where the
+; `cose` namespace comes from the library's own import and the
+; consumer does not import `cose` itself.  This shape must already
+; lint cleanly (no E030); it pins the contrast with the bug-018
+; generic case.
+;
+; The library file defines a plain rule `direct-encrypt` whose
+; effective type uses `.within cose.COSE_Encrypt0`.  The consumer
+; instantiates that plain rule through an `encrypt.` alias.
+
+root = encrypt.direct-encrypt
+
+;# import encrypt.direct-encrypt from "./support/bug_018_wrapper_lib_plain.cddl" as encrypt

@@ -107,6 +107,7 @@ COSE_recipient = [
 COSE_Encrypt0_Tagged = #6.16(COSE_Encrypt0)
 
 
+;@ CBORK: Export
 COSE_Encrypt0 = [
     Headers,
     ciphertext : bstr / nil,

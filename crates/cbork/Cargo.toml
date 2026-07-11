@@ -19,7 +19,7 @@ workspace = true
 [dependencies]
 cbork-abnf-parser = { path = "../cbork-abnf-parser", version = "0.0.4" }
 cbork-cddl-parser = { path = "../cbork-cddl-parser", version = "0.0.3" }
-cbork-cddl-compiler = { path = "../cbork-cddl-compiler", version = "0.0.6" }
+cbork-cddl-compiler = { path = "../cbork-cddl-compiler", version = "0.0.7" }
 cbork-edn = { path = "../cbork-edn", version = "0.0.1" }
 anyhow = "1.0"
 build-info = "0.0.45"

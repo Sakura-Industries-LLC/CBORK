@@ -1,0 +1,24 @@
+; Negative companion to bug_018_imported_generic_within_namespace.cddl.
+;
+; The generic rule's `.within` RHS references `cose.COSE_Encrypt0`,
+; but `cose` is NOT imported in this fixture, so the namespaced
+; reference is genuinely unresolved.  An E030 unresolved-name
+; diagnostic must still fire here — this guards against the
+; bug-018 fix accidentally silencing all unresolved-name
+; diagnostics.
+;
+; Note: this is the negative shape (genuinely missing namespaced
+; rule), distinct from the positive bug-018 fixture which has the
+; reference resolved through the library's import scope.
+
+Concrete-Headers = (
+    protected: bstr .size 0,
+    unprotected: {}
+)
+
+root = COSE_Encrypt0<Concrete-Headers, nil>
+
+COSE_Encrypt0<headers, payload> = [
+    headers,
+    ciphertext: bstr / nil,
+] .within cose.COSE_Encrypt0

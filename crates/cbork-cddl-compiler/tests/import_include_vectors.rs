@@ -1272,3 +1272,151 @@ fn bare_generic_template_reference_is_undefined_vector() {
         compiled.warnings
     );
 }
+
+#[test]
+fn bug_018_imported_generic_within_namespace_resolution_vector() {
+    // BUG-018 regression (plan 018): an imported generic whose
+    // `.within` RHS uses a name from a namespace imported by the
+    // generic's definition site must resolve the RHS through the
+    // definition-site scope, not the consumer's.  The
+    // `cose.COSE_Encrypt0` reference is supplied by RFC 9052 via the
+    // library's own `import rfc9052 as cose` directive; the consumer
+    // never imports `cose` itself.
+    //
+    // The fixture's LHS and RHS shapes differ on purpose: the test
+    // asserts two things that together pin the resolution contract:
+    //
+    // 1. The compiled dump preserves `cose.COSE_Encrypt0` as the `.within` RHS text on the
+    //    expanded root rule.  A silent drop or alias rewrite of the RHS would surface here.
+    // 2. The subtype check fires with E030 and a structural reason ("Uint not subtype of { 2
+    //    entries }"), NOT the `unresolved name` reason.  If the namespace were missing the
+    //    diagnostic would carry `unresolved name: cose.COSE_Encrypt0` instead.
+    let path = repo_root()
+        .join("cddl/vectors/project/bugs/bug_018_imported_generic_within_namespace.cddl");
+    let compiled = CompiledCDDL::compile(&path, None).expect("bug-018 fixture must compile");
+    let dump = dump_tree(&compiled);
+
+    assert_contains_all(&dump, &[
+        "RuleLine: root = [",
+        "uint,",
+        "ciphertext: bstr / nil",
+        "] .within cose.COSE_Encrypt0",
+        "[Prunable]",
+    ]);
+    assert!(
+        !dump.contains("unresolved name"),
+        "BUG-018 regression: compiled tree must not surface an unresolved-name diagnostic \
+         for `cose.COSE_Encrypt0`; got dump:\n{dump}"
+    );
+
+    let e030 = compiled.warnings.iter().find(|d| d.code == "E030").expect(
+        "BUG-018 regression: a `.within` subtype diagnostic must be produced after the \
+                 RHS has resolved (LHS and RHS shapes intentionally differ)",
+    );
+    assert!(
+        !e030.message.contains("unresolved name"),
+        "BUG-018 regression: E030 reason must be a structural subtype mismatch, not an \
+         unresolved-name diagnostic; got: {e030:#?}"
+    );
+    assert!(
+        e030.message.contains("Uint not subtype of"),
+        "BUG-018 regression: E030 reason must mention the structural subtype mismatch between \
+         the expanded LHS (`uint`) and the resolved RHS (cose.COSE_Encrypt0's Headers map); \
+         got: {e030:#?}"
+    );
+    // The renderer inlines the resolved `cose.COSE_Encrypt0` body in
+    // the EFFECTIVE RHS subdiag.  The presence of `empty_or_serialized_map`
+    // and `header_map` (both reached transitively through `cose.Headers`)
+    // proves the namespace resolution chain succeeded.
+    let rhs_snippet = e030
+        .related
+        .iter()
+        .find(|s| matches!(s.kind, SubdiagKind::Rhs))
+        .map(|s| s.snippet.as_str())
+        .expect("E030 must carry an RHS subdiag");
+    assert!(
+        rhs_snippet.contains("empty_or_serialized_map") && rhs_snippet.contains("header_map"),
+        "BUG-018 regression: RHS subdiag must be the inlined cose.COSE_Encrypt0 body, proving \
+         the namespace resolution succeeded; got snippet:\n{rhs_snippet}"
+    );
+}
+
+#[test]
+fn bug_018_imported_plain_within_namespace_resolution_vector() {
+    // BUG-018 contrast fixture: a direct (non-generic) `.within
+    // cose.COSE_Encrypt0` from inside an imported library, where the
+    // `cose` namespace comes from the library's own internal
+    // `import rfc9052 as cose` and the consumer never imports
+    // `cose` itself.  The plain (non-generic) shape must already
+    // resolve through the library's scope and lint without an
+    // unresolved-name diagnostic.  This pins the contrast with the
+    // bug-018 generic case: the generic case used to drop the
+    // library's `.within` RHS subtree along with the unused
+    // template, but the plain case never had that template so it
+    // always worked.
+    let path =
+        repo_root().join("cddl/vectors/project/bugs/bug_018_imported_plain_within_namespace.cddl");
+    let compiled = CompiledCDDL::compile(&path, None).expect("plain fixture must compile");
+    let dump = dump_tree(&compiled);
+
+    // The plain rule is preserved under the consumer alias, and the
+    // library's `.within cose.COSE_Encrypt0` RHS survives intact.
+    // The presence of the RHS text proves the namespace resolution
+    // chain (`cose` alias from the library's internal `import rfc9052`)
+    // succeeded.
+    assert_contains_all(&dump, &[
+        "RuleLine: encrypt.direct-encrypt = [",
+        "ciphertext: bstr / nil",
+        "] .within cose.COSE_Encrypt0",
+    ]);
+    assert!(
+        !dump.contains("unresolved name"),
+        "BUG-018 contrast: plain imported `.within` RHS must resolve through the library's \
+         definition-site import scope; got dump:\n{dump}"
+    );
+    assert!(
+        !compiled
+            .warnings
+            .iter()
+            .any(|d| d.code == "E030" && d.message.contains("unresolved name")),
+        "BUG-018 contrast: plain imported `.within` must not emit an E030 \
+         unresolved-name diagnostic; got: {:#?}",
+        compiled.warnings
+    );
+    // No `.within` subtype diagnostic should fire either — the
+    // definition-site subtree is reachable so the `.within` check
+    // sees the resolved `cose.COSE_Encrypt0` RHS, not a missing
+    // reference.
+    assert!(
+        compiled.warnings.iter().all(|d| d.code != "E030"),
+        "BUG-018 contrast: plain imported `.within` must not emit any E030 diagnostic; \
+         got: {:#?}",
+        compiled.warnings
+    );
+}
+
+#[test]
+fn bug_018_unresolved_namespaced_within_still_emits_e030_vector() {
+    // BUG-018 negative regression: a generic whose `.within` RHS
+    // uses a genuinely missing namespaced rule must still emit an
+    // E030 unresolved-name diagnostic.  This guards against the
+    // bug-018 fix accidentally silencing all unresolved-name
+    // diagnostics on imported-generic `.within` checks.
+    let compiled = CompiledCDDL::compile(
+        repo_root()
+            .join("cddl/vectors/project/semantic-errors/generic_within_unresolved_namespace.cddl"),
+        None,
+    )
+    .expect("bug-018 negative fixture must compile");
+    assert!(
+        compiled.warnings.iter().any(|d| {
+            d.code == "E030"
+                && d.message.contains("unresolved name")
+                && d.message.contains("cose.COSE_Encrypt0")
+        }),
+        "BUG-018 negative regression: a generic `.within` RHS that references a \
+         genuinely missing namespaced rule must still emit an E030 unresolved-name diagnostic; \
+         got: {:#?}",
+        compiled.warnings
+    );
+}

@@ -1,0 +1,16 @@
+; Companion support library for
+; bug_018_imported_plain_within_namespace.cddl.
+;
+; Same topology as bug_018_wrapper_lib.cddl but with a plain (non-
+; generic) rule.  This is the contrast shape: a direct `.within
+; cose.COSE_Encrypt0` from inside an imported library already
+; resolves cleanly because it is the library's own body and the
+; consumer never instantiates a generic template.
+
+;@ CBORK: Library
+;@ CBORK: Export
+direct-encrypt = [
+    ciphertext: bstr / nil,
+] .within cose.COSE_Encrypt0
+
+;# import rfc9052 as cose
