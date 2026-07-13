@@ -2165,7 +2165,9 @@ fn collect_subtype_conflicts_inner(
         // value shape. Once the assertion exists in the tree it is
         // validated independently by `validate_within_pass`; when a
         // `.within` expression is used as an operand to another subtype
-        // check, the effective schema is its carrier.
+        // check, the effective schema is its carrier, except for
+        // `any`-carried narrowing controls whose controller is the
+        // constrained value shape.
         (
             ResolvedType::Control {
                 op: ControlOp::Within,
@@ -2175,7 +2177,8 @@ fn collect_subtype_conflicts_inner(
             _,
         ) => {
             path.push(PathSegment::ControlOp(ControlOp::Within));
-            collect_subtype_conflicts_inner(carrier, rhs, defs, visited, path, conflicts);
+            let effective_lhs = within_effective_shape(carrier);
+            collect_subtype_conflicts_inner(effective_lhs, rhs, defs, visited, path, conflicts);
             path.pop();
         },
 
@@ -2197,21 +2200,25 @@ fn collect_subtype_conflicts_inner(
         // `.bits`, `.cbor`, `.cborseq`, `.dtrm`, `.dtrmseq`). The
         // narrowing rule says: a value that satisfies a narrowing
         // operator on `carrier` is also a valid `carrier`, so the
-        // subtype check reduces to `carrier ⊆ R`. This is what makes
-        // `uint .gt 1 ⊆ uint`, `bstr .cbor T ⊆ bstr`, etc. pass.
+        // subtype check normally reduces to `carrier ⊆ R`. An `any`
+        // carrier is only the attachment point for controls such as
+        // `any .dtrm T`, so those reduce to `T ⊆ R` instead. This is
+        // what makes `uint .gt 1 ⊆ uint`, `bstr .cbor T ⊆ bstr`, and
+        // `any .dtrm T ⊆ T` pass.
         //
         // `.and` is represented separately as `Intersection`.
         // `.within` is handled above as an assertion wrapper.
         (
             ResolvedType::Control {
                 op,
-                carrier,
+                carrier: _,
                 controller: _,
             },
             _,
         ) if op.is_narrowing() && !matches!(rhs, ResolvedType::Control { .. }) => {
             path.push(PathSegment::ControlOp(op.clone()));
-            collect_subtype_conflicts_inner(carrier, rhs, defs, visited, path, conflicts);
+            let effective_lhs = within_effective_shape(lhs);
+            collect_subtype_conflicts_inner(effective_lhs, rhs, defs, visited, path, conflicts);
             path.pop();
         },
 
@@ -2233,6 +2240,30 @@ fn collect_subtype_conflicts_inner(
                 ),
             );
         },
+    }
+}
+
+/// Return the value shape exposed by a type when it participates in a
+/// `.within` assertion.
+///
+/// A serialization control written as `any .dtrm T` uses `any` only as
+/// the carrier for the encoding constraint; the constrained value shape
+/// is `T`.  Other carriers, notably `bstr .dtrm T`, describe the wrapper
+/// value itself and must continue to project to their carrier.
+fn within_effective_shape(ty: &ResolvedType) -> &ResolvedType {
+    match ty {
+        ResolvedType::Control {
+            op,
+            carrier: inner_carrier,
+            controller,
+        } if op.is_narrowing() => {
+            if matches!(inner_carrier.as_ref(), ResolvedType::Any) {
+                controller
+            } else {
+                inner_carrier
+            }
+        },
+        _ => ty,
     }
 }
 
@@ -6053,6 +6084,31 @@ mod tests {
                 -19 => bstr .size 64,
                 -48 => bstr .size 2420
             } .within sig-map
+        ";
+        let nodes = parse_snippet(source);
+        let mut warnings = Vec::new();
+        validate_within_pass(&nodes, &mut warnings);
+        let e030: Vec<_> = warnings.iter().filter(|w| w.code == "E030").collect();
+        assert!(e030.is_empty(), "expected no E030, got {e030:#?}");
+    }
+
+    #[test]
+    fn within_after_any_dtrm_compares_against_dtrm_controller() {
+        // `any .dtrm T .within U` constrains the same value shape as `T`;
+        // `any` is only the carrier used to attach the encoding constraint.
+        // The subtype check must not project the controlled type back to
+        // `any`, or a valid `T` within `U` is rejected.
+        let source = r"
+            narrow = {
+                protected: bstr .size 0,
+                unprotected: {}
+            }
+            broad = {
+                protected: bstr,
+                unprotected: {}
+            }
+            headers = any .dtrm (narrow .within broad)
+            checked = (any .dtrm narrow) .within broad
         ";
         let nodes = parse_snippet(source);
         let mut warnings = Vec::new();
