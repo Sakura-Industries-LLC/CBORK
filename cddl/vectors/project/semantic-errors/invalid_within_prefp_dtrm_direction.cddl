@@ -1,0 +1,9 @@
+; plan-019 negative regression: `.prefp ⊄ .dtrm` direction check.
+; `.prefp` is broader than `.dtrm`, so a prefp-encoded bstr does not
+; fit inside a dtrm constraint.
+
+root = a .within b
+
+a = bstr .prefp map-prefp-dtrm
+b = bstr .dtrm map-prefp-dtrm
+map-prefp-dtrm = { 1: "one", 2: "two" }

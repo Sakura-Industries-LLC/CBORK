@@ -67,10 +67,14 @@ struct WithinContext<'a> {
 pub(crate) enum ControlOp {
     /// `.cbor` — CBOR encoding refinement of a byte string.
     Cbor,
+    /// `.prefp` — preferred-plus CBOR encoding refinement of a byte string.
+    Prefp,
     /// `.dtrm` — deterministic CBOR encoding refinement of a byte string.
     Dtrm,
     /// `.cborseq` — sequence of CBOR-encoded items.
     CborSeq,
+    /// `.prefpseq` — sequence of preferred-plus CBOR-encoded items.
+    PrefpSeq,
     /// `.dtrmseq` — sequence of deterministically CBOR-encoded items.
     DtrmSeq,
     /// `.and` — schema intersection.
@@ -131,8 +135,10 @@ impl ControlOp {
     pub(crate) fn as_text(&self) -> &str {
         match self {
             Self::Cbor => ".cbor",
+            Self::Prefp => ".prefp",
             Self::Dtrm => ".dtrm",
             Self::CborSeq => ".cborseq",
+            Self::PrefpSeq => ".prefpseq",
             Self::DtrmSeq => ".dtrmseq",
             Self::And => ".and",
             Self::Within => ".within",
@@ -161,8 +167,10 @@ impl ControlOp {
     pub(crate) fn from_text(text: &str) -> Self {
         match text.trim() {
             ".cbor" => Self::Cbor,
+            ".prefp" => Self::Prefp,
             ".dtrm" => Self::Dtrm,
             ".cborseq" => Self::CborSeq,
+            ".prefpseq" => Self::PrefpSeq,
             ".dtrmseq" => Self::DtrmSeq,
             ".and" => Self::And,
             ".within" => Self::Within,
@@ -208,8 +216,10 @@ impl ControlOp {
         matches!(
             self,
             Self::Cbor
+                | Self::Prefp
                 | Self::Dtrm
                 | Self::CborSeq
+                | Self::PrefpSeq
                 | Self::DtrmSeq
                 | Self::And
                 | Self::Within
@@ -257,6 +267,8 @@ impl ControlOp {
                 | Self::Bits
                 | Self::Cbor
                 | Self::CborSeq
+                | Self::Prefp
+                | Self::PrefpSeq
                 | Self::Dtrm
                 | Self::DtrmSeq
                 | Self::XEnc
@@ -2289,12 +2301,28 @@ fn collect_control_conflicts(
 
     path.push(PathSegment::ControlOp(lop.clone()));
     collect_subtype_conflicts_inner(lcarrier, rcarrier, defs, visited, path, conflicts);
+    #[allow(clippy::unnested_or_patterns)]
     match (lop, rop) {
         (a, b) if a == b => {
             collect_subtype_conflicts_inner(lctrl, rctrl, defs, visited, path, conflicts);
         },
-        (ControlOp::Dtrm, ControlOp::Cbor) | (ControlOp::DtrmSeq, ControlOp::CborSeq) => {
+        (ControlOp::Dtrm, ControlOp::Cbor)
+        | (ControlOp::Dtrm, ControlOp::Prefp)
+        | (ControlOp::Prefp, ControlOp::Cbor)
+        | (ControlOp::DtrmSeq, ControlOp::CborSeq)
+        | (ControlOp::DtrmSeq, ControlOp::PrefpSeq)
+        | (ControlOp::PrefpSeq, ControlOp::CborSeq) => {
             collect_subtype_conflicts_inner(lctrl, rctrl, defs, visited, path, conflicts);
+        },
+        (ControlOp::Cbor, ControlOp::Prefp) => {
+            push_conflict(
+                conflicts,
+                path,
+                WithinConflictKind::ControlMismatch,
+                Some(lhs.clone()),
+                Some(rhs.clone()),
+                ".cbor is broader than .prefp".to_owned(),
+            );
         },
         (ControlOp::Cbor, ControlOp::Dtrm) => {
             push_conflict(
@@ -2306,6 +2334,26 @@ fn collect_control_conflicts(
                 ".cbor is broader than .dtrm".to_owned(),
             );
         },
+        (ControlOp::Prefp, ControlOp::Dtrm) => {
+            push_conflict(
+                conflicts,
+                path,
+                WithinConflictKind::ControlMismatch,
+                Some(lhs.clone()),
+                Some(rhs.clone()),
+                ".prefp is broader than .dtrm".to_owned(),
+            );
+        },
+        (ControlOp::CborSeq, ControlOp::PrefpSeq) => {
+            push_conflict(
+                conflicts,
+                path,
+                WithinConflictKind::ControlMismatch,
+                Some(lhs.clone()),
+                Some(rhs.clone()),
+                ".cborseq is broader than .prefpseq".to_owned(),
+            );
+        },
         (ControlOp::CborSeq, ControlOp::DtrmSeq) => {
             push_conflict(
                 conflicts,
@@ -2314,6 +2362,16 @@ fn collect_control_conflicts(
                 Some(lhs.clone()),
                 Some(rhs.clone()),
                 ".cborseq is broader than .dtrmseq".to_owned(),
+            );
+        },
+        (ControlOp::PrefpSeq, ControlOp::DtrmSeq) => {
+            push_conflict(
+                conflicts,
+                path,
+                WithinConflictKind::ControlMismatch,
+                Some(lhs.clone()),
+                Some(rhs.clone()),
+                ".prefpseq is broader than .dtrmseq".to_owned(),
             );
         },
         // Compression annotation compatibility matrix (mirrors
@@ -2826,19 +2884,30 @@ fn is_control_subtype(
     is_subtype_impl(lcarrier, rcarrier, defs, visited).map_err(|e| format!("carrier: {e}"))?;
 
     // 2. Operator compatibility matrix.
+    #[allow(clippy::unnested_or_patterns)]
     match (lop, rop) {
         (a, b) if a == b => {
             is_subtype_impl(lctrl, rctrl, defs, visited).map_err(|e| format!("controller: {e}"))
         },
-        (ControlOp::Dtrm, ControlOp::Cbor) => {
+        (ControlOp::Dtrm, ControlOp::Cbor)
+        | (ControlOp::Dtrm, ControlOp::Prefp)
+        | (ControlOp::Prefp, ControlOp::Cbor)
+        | (ControlOp::DtrmSeq, ControlOp::CborSeq)
+        | (ControlOp::DtrmSeq, ControlOp::PrefpSeq)
+        | (ControlOp::PrefpSeq, ControlOp::CborSeq) => {
             is_subtype_impl(lctrl, rctrl, defs, visited).map_err(|e| format!("controller: {e}"))
         },
-        (ControlOp::DtrmSeq, ControlOp::CborSeq) => {
-            is_subtype_impl(lctrl, rctrl, defs, visited).map_err(|e| format!("controller: {e}"))
-        },
+        (ControlOp::Cbor, ControlOp::Prefp) => Err(".cbor is broader than .prefp".to_owned()),
         (ControlOp::Cbor, ControlOp::Dtrm) => Err(".cbor is broader than .dtrm".to_owned()),
+        (ControlOp::Prefp, ControlOp::Dtrm) => Err(".prefp is broader than .dtrm".to_owned()),
+        (ControlOp::CborSeq, ControlOp::PrefpSeq) => {
+            Err(".cborseq is broader than .prefpseq".to_owned())
+        },
         (ControlOp::CborSeq, ControlOp::DtrmSeq) => {
             Err(".cborseq is broader than .dtrmseq".to_owned())
+        },
+        (ControlOp::PrefpSeq, ControlOp::DtrmSeq) => {
+            Err(".prefpseq is broader than .dtrmseq".to_owned())
         },
         // Compression annotation compatibility matrix:
         // * A named algorithm (`.x-brotli`/`.x-zstd`/`.x-gzip`/`.x-deflate`) is within the generic

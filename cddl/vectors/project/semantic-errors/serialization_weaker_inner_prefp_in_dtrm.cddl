@@ -1,0 +1,12 @@
+; plan-019 W008 positive regression: direct `any` composition
+; where an inner operator is weaker than the current effective
+; constraint.  The chain is:
+;   a = any .dtrm b   (effective: .dtrm)
+;   b = any .prefp c  (inner: .prefp — weaker)
+;
+; Expected: W008 warning on the `.prefp` at line 22, column 10
+; because `.prefp` is wider than the effective `.dtrm`.
+
+a = any .dtrm b
+b = any .prefp c
+c = { 1: "one", 2: "two" }

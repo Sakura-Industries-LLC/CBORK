@@ -147,6 +147,7 @@ Postfach
 Pritikin
 Prunability
 QCHAR
+RAII
 RELAXNG
 RFC8610
 RFC9165
@@ -423,6 +424,7 @@ myctl
 mymodule
 mynumber
 mytestfile
+mytype
 narrowings
 nbarbaz
 necragnomicon

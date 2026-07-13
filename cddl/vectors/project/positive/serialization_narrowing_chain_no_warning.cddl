@@ -1,0 +1,7 @@
+; plan-019 positive: `.cbor → .prefp → .dtrm` narrowing chain.
+; No W008 warning should fire because each step narrows, not widens.
+
+a = any .cbor b
+b = any .prefp c
+c = any .dtrm d
+d = { 1: "one", 2: "two" }

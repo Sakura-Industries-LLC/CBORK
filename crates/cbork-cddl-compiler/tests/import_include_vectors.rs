@@ -1420,3 +1420,154 @@ fn bug_018_unresolved_namespaced_within_still_emits_e030_vector() {
         compiled.warnings
     );
 }
+
+// -----------------------------------------------------------------------
+// plan-019 — serialization control scope & bstr boundaries
+// -----------------------------------------------------------------------
+
+#[test]
+fn plan019_dtrm_within_prefp_positive_vector() {
+    let dump = compile_ok(
+        "cddl/vectors/project/positive/valid_within_dtrm_prefp.cddl",
+        None,
+    );
+    assert!(
+        !dump.contains(".cbor is broader than")
+            && !dump.contains(".prefp is broader than")
+            && !dump.contains("control operator")
+            && !dump.contains("unresolved name"),
+        "`.dtrm ⊆ .prefp` must pass the subtype check; got dump:\n{dump}"
+    );
+}
+
+#[test]
+fn plan019_prefp_within_cbor_positive_vector() {
+    let dump = compile_ok(
+        "cddl/vectors/project/positive/valid_within_prefp_cbor.cddl",
+        None,
+    );
+    assert!(
+        !dump.contains("is broader than") && !dump.contains("control operator"),
+        "`.prefp ⊆ .cbor` must pass the subtype check; got dump:\n{dump}"
+    );
+}
+
+#[test]
+fn plan019_cbor_not_within_prefp_negative_vector() {
+    let compiled = CompiledCDDL::compile(
+        repo_root()
+            .join("cddl/vectors/project/semantic-errors/invalid_within_cbor_prefp_direction.cddl"),
+        None,
+    )
+    .expect("fixture must compile");
+    assert!(
+        compiled
+            .warnings
+            .iter()
+            .any(|d| { d.code == "E030" && d.message.contains(".cbor is broader than .prefp") }),
+        "`.cbor ⊄ .prefp` must emit E030 direction diagnostic; got: {:#?}",
+        compiled.warnings
+    );
+}
+
+#[test]
+fn plan019_prefp_not_within_dtrm_negative_vector() {
+    let compiled = CompiledCDDL::compile(
+        repo_root()
+            .join("cddl/vectors/project/semantic-errors/invalid_within_prefp_dtrm_direction.cddl"),
+        None,
+    )
+    .expect("fixture must compile");
+    assert!(
+        compiled
+            .warnings
+            .iter()
+            .any(|d| { d.code == "E030" && d.message.contains(".prefp is broader than .dtrm") }),
+        "`.prefp ⊄ .dtrm` must emit E030 direction diagnostic; got: {:#?}",
+        compiled.warnings
+    );
+}
+
+#[test]
+fn plan019_w008_cbor_in_dtrm_warns() {
+    let compiled = CompiledCDDL::compile(
+        repo_root().join(
+            "cddl/vectors/project/semantic-errors/serialization_weaker_inner_cbor_in_dtrm.cddl",
+        ),
+        None,
+    )
+    .expect("fixture must compile");
+    assert!(
+        compiled.warnings.iter().any(|d| {
+            d.code == "W008" && d.message.contains(".cbor") && d.message.contains(".dtrm")
+        }),
+        "W008 must fire for `.cbor` inside `.dtrm`; got: {:#?}",
+        compiled.warnings
+    );
+}
+
+#[test]
+fn plan019_w008_cbor_in_prefp_warns() {
+    let compiled = CompiledCDDL::compile(
+        repo_root().join(
+            "cddl/vectors/project/semantic-errors/serialization_weaker_inner_cbor_in_prefp.cddl",
+        ),
+        None,
+    )
+    .expect("fixture must compile");
+    assert!(
+        compiled.warnings.iter().any(|d| {
+            d.code == "W008" && d.message.contains(".cbor") && d.message.contains(".prefp")
+        }),
+        "W008 must fire for `.cbor` inside `.prefp`; got: {:#?}",
+        compiled.warnings
+    );
+}
+
+#[test]
+fn plan019_w008_prefp_in_dtrm_warns() {
+    let compiled = CompiledCDDL::compile(
+        repo_root().join(
+            "cddl/vectors/project/semantic-errors/serialization_weaker_inner_prefp_in_dtrm.cddl",
+        ),
+        None,
+    )
+    .expect("fixture must compile");
+    assert!(
+        compiled.warnings.iter().any(|d| {
+            d.code == "W008" && d.message.contains(".prefp") && d.message.contains(".dtrm")
+        }),
+        "W008 must fire for `.prefp` inside `.dtrm`; got: {:#?}",
+        compiled.warnings
+    );
+}
+
+#[test]
+fn plan019_narrowing_chain_no_warning_vector() {
+    let compiled = CompiledCDDL::compile(
+        repo_root()
+            .join("cddl/vectors/project/positive/serialization_narrowing_chain_no_warning.cddl"),
+        None,
+    )
+    .expect("fixture must compile");
+    assert!(
+        !compiled.warnings.iter().any(|d| d.code == "W008"),
+        "narrowing chain `.cbor -> .prefp -> .dtrm` must not emit W008; got: {:#?}",
+        compiled.warnings
+    );
+}
+
+#[test]
+fn plan019_repeated_identical_no_warning_vector() {
+    let compiled = CompiledCDDL::compile(
+        repo_root()
+            .join("cddl/vectors/project/positive/serialization_repeated_identical_no_warning.cddl"),
+        None,
+    )
+    .expect("fixture must compile");
+    assert!(
+        !compiled.warnings.iter().any(|d| d.code == "W008"),
+        "repeated identical operators must not emit W008; got: {:#?}",
+        compiled.warnings
+    );
+}

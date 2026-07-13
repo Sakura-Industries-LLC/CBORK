@@ -1,0 +1,6 @@
+; plan-019 W008 positive regression: `.cbor` inside `.dtrm`.
+; Expected: W008 on the `.cbor` at line 11, column 10.
+
+a = any .dtrm b
+b = any .cbor c
+c = { 1: "one", 2: "two" }

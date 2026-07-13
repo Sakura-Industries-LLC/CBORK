@@ -10,4 +10,5 @@ pub mod decode_context;
 pub mod decode_helper;
 pub mod deterministic_helper;
 pub mod map;
+pub mod serialization_checker;
 pub mod with_cbor_bytes;

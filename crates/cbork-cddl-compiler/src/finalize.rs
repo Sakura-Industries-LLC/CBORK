@@ -329,6 +329,8 @@ pub(crate) fn finalize_compiled(compiled: &mut CompiledCDDL) {
         &mut compiled.warnings,
     );
 
+    crate::ctlop::warn_serialization_weaker_inner(&complete_nodes, &mut compiled.warnings);
+
     crate::within::validate_within_pass(&complete_nodes, &mut compiled.warnings);
 
     detect_group_reference_cycles(&complete_nodes, &mut compiled.warnings);

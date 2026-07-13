@@ -1313,3 +1313,325 @@ fn operand_family(
 
     OperandFamily::Unknown
 }
+
+// ---------------------------------------------------------------------------
+// Serialization composition warnings (W008 — plan 019)
+// ---------------------------------------------------------------------------
+
+/// How strictly a serialization operator constrains encoding.
+///
+/// The ordered width is `.cbor(0) < .prefp(1) < .dtrm(2)`.
+/// A higher index means *narrower* (stricter) encoding constraints.
+fn serialization_width(op: &str) -> Option<u8> {
+    match op {
+        ".cbor" | ".cborseq" => Some(0),
+        ".prefp" | ".prefpseq" => Some(1),
+        ".dtrm" | ".dtrmseq" => Some(2),
+        _ => None,
+    }
+}
+
+/// Walk the resolved user tree and warn when a direct `any` composition
+/// names an inner encoding that is weaker than the current effective
+/// serialization constraint.
+///
+/// For each `RuleLine` whose RHS is `any .<op> <controller>`, the
+/// function resolves `<controller>` to its definition node and checks
+/// whether that definition itself carries a serialization operator on
+/// `any`.  If the inner operator is *wider* (weaker) than the outer
+/// effective constraint, a W008 warning is emitted using the wording
+/// required by the draft:
+///
+/// ```text
+/// warning[W008]: inner explicit encoding `.prefp` is wider than the
+/// current `.dtrm` constraint; this type will be constrained to `.dtrm`
+/// ```
+///
+/// * Narrowing paths (`.cbor → .prefp → .dtrm`) produce no warning.
+/// * Repeated identical operators produce no warning.
+/// * `.cborseq`/`.prefpseq`/`.dtrmseq` are treated the same as their single-item
+///   counterparts for the purposes of the width comparison.
+pub(crate) fn warn_serialization_weaker_inner(
+    nodes: &[WrappedNode],
+    warnings: &mut Vec<crate::error::Diagnostic>,
+) {
+    for node in nodes {
+        warn_serialization_weaker_inner_node(node, nodes, warnings);
+    }
+}
+
+/// Recursive helper for [`warn_serialization_weaker_inner`].
+fn warn_serialization_weaker_inner_node(
+    node: &WrappedNode,
+    all_nodes: &[WrappedNode],
+    warnings: &mut Vec<crate::error::Diagnostic>,
+) {
+    match node {
+        WrappedNode::RuleLine {
+            children,
+            origin,
+            span,
+            ..
+        } => {
+            let Some(expr) = children.iter().find_map(|c| {
+                if let WrappedNode::Syntax { rule, children, .. } = c
+                    && rule == "expr"
+                {
+                    return Some(children.as_slice());
+                }
+                None
+            }) else {
+                return;
+            };
+            let Some((ctlop_text, ctlop_span, controller_name)) =
+                find_serialization_ctlop_on_any(expr)
+            else {
+                return;
+            };
+            let Some(outer_width) = serialization_width(&ctlop_text) else {
+                return;
+            };
+
+            // Resolve the controller to its definition node in the tree.
+            let Some(def) = find_definition_node(controller_name.as_str(), all_nodes) else {
+                return;
+            };
+            let WrappedNode::RuleLine {
+                children: def_children,
+                ..
+            } = def
+            else {
+                return;
+            };
+            let Some(def_expr) = def_children.iter().find_map(|c| {
+                if let WrappedNode::Syntax { rule, children, .. } = c
+                    && rule == "expr"
+                {
+                    return Some(children.as_slice());
+                }
+                None
+            }) else {
+                return;
+            };
+            let Some((inner_ctlop, inner_ctlop_span, _inner_ctrl)) =
+                find_serialization_ctlop_on_any(def_expr)
+            else {
+                return;
+            };
+            let Some(inner_width) = serialization_width(&inner_ctlop) else {
+                return;
+            };
+
+            if inner_width >= outer_width {
+                return;
+            }
+
+            let outer_op = ctlop_text.trim();
+            let inner_op = inner_ctlop.trim();
+
+            warnings.push(crate::error::Diagnostic {
+                code: "W008",
+                level: crate::error::DiagnosticLevel::Warning,
+                message: format!(
+                    "inner explicit encoding `{inner_op}` is wider than the current \
+                     `{outer_op}` constraint; this type will be constrained to `{outer_op}`"
+                ),
+                source_file: Some(origin.source_path.clone()),
+                span: Some(inner_ctlop_span.clone()),
+                previous_origin: Some(crate::node::SourceOrigin {
+                    source_path: origin.source_path.clone(),
+                    line: origin.line,
+                    column: origin
+                        .column
+                        .saturating_add(ctlop_span.start.saturating_sub(span.start)),
+                }),
+                related: Vec::new(),
+            });
+        },
+        WrappedNode::Directive { children, .. } | WrappedNode::Syntax { children, .. } => {
+            for child in children {
+                warn_serialization_weaker_inner_node(child, all_nodes, warnings);
+            }
+        },
+        WrappedNode::Comment { .. }
+        | WrappedNode::ModuleStart { .. }
+        | WrappedNode::ModuleEnd { .. } => {},
+    }
+}
+
+/// Scan a `RuleLine`'s `expr` children for a pattern where the RHS is
+/// `any .<serialization-op> <typename>` (e.g. `any .dtrm mytype`).
+///
+/// Returns the ctlop text, its span, and the controller typename if found.
+fn find_serialization_ctlop_on_any(
+    expr_children: &[WrappedNode]
+) -> Option<(String, std::ops::Range<usize>, String)> {
+    let mut lhs_seen = false;
+    for child in expr_children {
+        if let WrappedNode::Syntax { rule, .. } = child {
+            if (rule == "typename" || rule == "groupname") && !lhs_seen {
+                lhs_seen = true;
+                continue;
+            }
+            if rule == "assignt" {
+                continue;
+            }
+            if rule == "type1" {
+                return find_serialization_in_type1(child);
+            }
+            if let WrappedNode::Syntax { children: c, .. } = child
+                && let Some(found) = find_serialization_ctlop_on_any(c)
+            {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Walk a `type1` node looking for `any .<ctlop> <typename>`.
+fn find_serialization_in_type1(
+    type1: &WrappedNode
+) -> Option<(String, std::ops::Range<usize>, String)> {
+    let WrappedNode::Syntax { children, .. } = type1 else {
+        return None;
+    };
+    let mut type2_found = None;
+    let mut ctlop_found = None;
+    for child in children {
+        if let WrappedNode::Syntax { rule, .. } = child {
+            match rule.as_str() {
+                "type2" if type2_found.is_none() => type2_found = Some(child),
+                "ctlop" if ctlop_found.is_none() => ctlop_found = Some(child),
+                _ => {},
+            }
+        }
+    }
+    let ctlop_node = ctlop_found?;
+    let WrappedNode::Syntax {
+        text: ctlop_text,
+        span: ctlop_span,
+        ..
+    } = ctlop_node
+    else {
+        return None;
+    };
+    let _ = serialization_width(ctlop_text.trim())?;
+    let type2 = type2_found?;
+    let _ = type2;
+    let controller_name = find_rhs_type2_text(type1, ctlop_node)?;
+    Some((ctlop_text.clone(), ctlop_span.clone(), controller_name))
+}
+
+/// After a ctlop node in type1, find the rhs type2's typename text.
+#[allow(clippy::collapsible_if)]
+fn find_rhs_type2_text(
+    type1: &WrappedNode,
+    ctlop_node: &WrappedNode,
+) -> Option<String> {
+    let WrappedNode::Syntax { children, .. } = type1 else {
+        return None;
+    };
+    let ctlop_span = node_span(ctlop_node);
+    let mut after_ctlop = false;
+    for child in children {
+        let child_span = node_span(child);
+        if !after_ctlop {
+            if child_span == ctlop_span {
+                after_ctlop = true;
+            }
+            continue;
+        }
+        #[allow(clippy::collapsible_if)]
+        if let WrappedNode::Syntax {
+            rule,
+            text,
+            children: c,
+            ..
+        } = child
+        {
+            if rule == "type2" {
+                for gc in c {
+                    if let WrappedNode::Syntax {
+                        rule: r, text: t, ..
+                    } = gc
+                        && (r == "typename" || r == "groupname")
+                    {
+                        return Some(t.trim().to_owned());
+                    }
+                }
+                return Some(text.trim().to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Extract the source span from a `WrappedNode`.
+fn node_span(node: &WrappedNode) -> std::ops::Range<usize> {
+    match node {
+        WrappedNode::RuleLine { span, .. }
+        | WrappedNode::Comment { span, .. }
+        | WrappedNode::Syntax { span, .. }
+        | WrappedNode::Directive { span, .. } => span.clone(),
+        WrappedNode::ModuleStart { .. } | WrappedNode::ModuleEnd { .. } => 0..0,
+    }
+}
+
+/// Walk the entire node tree looking for the `RuleLine` that defines
+/// the given name, starting from the provided sibling scope.  This is
+/// used to resolve controller references for W008.
+fn find_definition_node<'a>(
+    name: &str,
+    search_siblings: &'a [WrappedNode],
+) -> Option<&'a WrappedNode> {
+    for node in search_siblings {
+        if let WrappedNode::RuleLine { children, .. } = node {
+            if let Some(n) = rule_name(node)
+                && (n == name || n.starts_with(&format!("{name}<")))
+            {
+                return Some(node);
+            }
+            for child in children {
+                if let Some(found) = find_definition_node(name, std::slice::from_ref(child)) {
+                    return Some(found);
+                }
+            }
+            continue;
+        }
+        if let Some(found) = find_definition_node_in_children(node, name) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Recursive helper for [`find_definition_node`] that walks directive
+/// and syntax children.
+fn find_definition_node_in_children<'a>(
+    node: &'a WrappedNode,
+    name: &str,
+) -> Option<&'a WrappedNode> {
+    match node {
+        WrappedNode::RuleLine { children, .. }
+        | WrappedNode::Directive { children, .. }
+        | WrappedNode::Syntax { children, .. } => find_definition_node(name, children),
+        _ => None,
+    }
+}
+
+/// Extract the LHS typename from a `RuleLine` node's source text.
+fn rule_name(node: &WrappedNode) -> Option<String> {
+    let WrappedNode::RuleLine { text, .. } = node else {
+        return None;
+    };
+    let lhs = text
+        .split_once('=')
+        .map_or(text.as_str(), |(lhs, _)| lhs)
+        .trim();
+    Some(
+        lhs.chars()
+            .take_while(|ch| !matches!(ch, ' ' | '<' | '\t'))
+            .collect(),
+    )
+}

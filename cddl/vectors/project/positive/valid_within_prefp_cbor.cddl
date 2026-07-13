@@ -1,0 +1,9 @@
+; plan-019 positive regression: `.prefp ⊆ .cbor` for the same
+; controller type.  `.prefp` is stricter than `.cbor`, so a
+; prefp-encoded bstr is also valid under `.cbor`.
+
+root = a .within b
+
+a = bstr .prefp map-prefp-cbor
+b = bstr .cbor map-prefp-cbor
+map-prefp-cbor = { 1: "one", 2: "two" }

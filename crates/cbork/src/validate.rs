@@ -55,6 +55,8 @@ thread_local! {
     static CURRENT_SCHEMA_NOTES: RefCell<Vec<SchemaNote>> = const { RefCell::new(Vec::new()) };
     static CURRENT_VALIDATION_WARNINGS: RefCell<Vec<ValidationWarning>> = const { RefCell::new(Vec::new()) };
     static CURRENT_EMBEDDED_CBOR_HINTS: RefCell<Vec<EmbeddedCborHint>> = const { RefCell::new(Vec::new()) };
+    static CURRENT_SERIALIZATION_FLOOR: RefCell<Option<u8>> =
+        const { RefCell::new(None) };
 }
 
 /// Schema annotation captured during validation for later rendering.
@@ -1800,12 +1802,12 @@ fn find_tag_inner_type(node: &WrappedNode) -> Option<&WrappedNode> {
 /// wrong item cardinality, failed deterministic-encoding validation, and
 /// resource-limit failures.
 ///
-/// The serialization-draft checks use `cbork-edn`'s deterministic and
-/// preferred-plus re-encoders:
-/// * `.dtrm`/`.dtrmseq` use `to_deterministic_bytes` (sorted maps;
-///   `draft-ietf-cbor-serialization-06` Section 5).
-/// * `.prefp`/`.prefpseq` use `to_preferred_plus_bytes` (source map order preserved; same
-///   draft Section 4).
+/// The serialization-draft checks use `cbork-utils`'s schema-independent
+/// raw-byte checker (`check_serialization`):
+/// * `.dtrm`/`.dtrmseq` — checks deterministic encoding plus preferred-plus (shortest
+///   int/length, no indefinite, shortest float, map-key ordering).
+/// * `.prefp`/`.prefpseq` — checks preferred-plus encoding without requiring
+///   deterministic map-key ordering.
 ///
 /// For `.dtrm` and `.dtrmseq`, the operator may also appear on a non-`bstr`
 /// carrier (e.g. `any .dtrm T`). In that case the deterministic check still
@@ -1823,6 +1825,11 @@ fn validate_embedded_cbor_with_hint(
     let start_len = issues.len();
 
     if let Some(bytes) = value_to_bytes(value) {
+        // Explicit bstr payload creates a new independent scope —
+        // reset the serialization floor so nested controls are not
+        // suppressed by an outer `.dtrm` or `.prefp` on the bstr
+        // wrapper.
+        let _floor_reset = SerializationFloorReset::new();
         // Parse as a sequence for the `.cborseq`/`.prefpseq`/`.dtrmseq`
         // operators so an empty payload is represented as a zero-item
         // document and can be rendered as `<<>>`. Single-item operators
@@ -1847,59 +1854,74 @@ fn validate_embedded_cbor_with_hint(
             },
         };
 
-        // Preferred-plus check applies to `.prefp`/`.prefpseq`/`.dtrm`/`.dtrmseq`.
-        // For `.dtrm`/`.dtrmseq` the deterministic re-encoder already covers
-        // preferred-plus plus map sorting, so we only call it once.
-        if operator.requires_deterministic() {
-            match document.to_deterministic_bytes() {
-                Ok(encoded) if encoded == bytes => {},
-                Ok(_) => {
-                    issues.push(ValidationIssue::new(
-                        path.clone(),
-                        "deterministic CBOR",
-                        render_bytes(bytes),
-                        Some("embedded CBOR was not deterministically encoded".to_owned()),
-                    ));
-                    // Raw bytes must stay visible; do not record the hint.
-                    return false;
-                },
-                Err(error) => {
-                    issues.push(ValidationIssue::new(
-                        path.clone(),
-                        "deterministic CBOR",
-                        render_bytes(bytes),
-                        Some(format!("failed to re-encode embedded CBOR: {error}")),
-                    ));
-                    return false;
-                },
-            }
+        // Serialization checks using the schema-independent raw-byte
+        // checker from cbork-utils.  The monotonic serialization
+        // floor tracks the effective constraint for direct `any`
+        // composition — a weaker or equal operator skips the check.
+        // Empty payloads for sequence operators skip the check.
+        let is_empty_seq = operator.allows_sequence() && bytes.is_empty();
+        let mode = if operator.requires_deterministic() {
+            cbork_utils::serialization_checker::SerializationMode::Dtrm
         } else if operator.requires_preferred_plus() {
-            match document.to_preferred_plus_bytes() {
-                Ok(encoded) if encoded == bytes => {},
-                Ok(_) => {
-                    issues.push(ValidationIssue::new(
-                        path.clone(),
-                        "preferred-plus CBOR",
-                        render_bytes(bytes),
-                        Some(
-                            "embedded CBOR was not in preferred-plus serialization \
-                             (`draft-ietf-cbor-serialization-06` Section 4)"
-                                .to_owned(),
-                        ),
-                    ));
-                    // Do not return: keep the hint so the decoded view remains
-                    // visible alongside the preferred-plus validation error.
-                },
-                Err(error) => {
-                    issues.push(ValidationIssue::new(
-                        path.clone(),
-                        "preferred-plus CBOR",
-                        render_bytes(bytes),
-                        Some(format!("failed to re-encode embedded CBOR: {error}")),
-                    ));
-                },
+            cbork_utils::serialization_checker::SerializationMode::Prefp
+        } else {
+            cbork_utils::serialization_checker::SerializationMode::Cbor
+        };
+        let _floor_guard = if mode != cbork_utils::serialization_checker::SerializationMode::Cbor {
+            let width = serialization_mode_width(mode);
+            let skip =
+                CURRENT_SERIALIZATION_FLOOR.with(|slot| slot.borrow().is_some_and(|f| f >= width));
+            if skip {
+                None
+            } else {
+                let guard = SerializationFloorGuard::push(mode);
+                #[allow(clippy::collapsible_if)]
+                if !is_empty_seq {
+                    if let Err(err) = cbork_utils::serialization_checker::check_serialization(
+                        bytes,
+                        mode,
+                        operator.allows_sequence(),
+                    ) {
+                        let label = if mode
+                            == cbork_utils::serialization_checker::SerializationMode::Dtrm
+                        {
+                            "deterministic CBOR"
+                        } else {
+                            "preferred-plus CBOR"
+                        };
+                        let fatal =
+                            mode == cbork_utils::serialization_checker::SerializationMode::Dtrm;
+                        issues.push(ValidationIssue::new(
+                            path.clone(),
+                            label,
+                            render_bytes(bytes),
+                            Some(format!("{label} serialization check failed: {err}")),
+                        ));
+                        if fatal {
+                            return false;
+                        }
+                    }
+                }
+                Some(guard)
             }
-        }
+        } else if !is_empty_seq {
+            if let Err(err) = cbork_utils::serialization_checker::check_serialization(
+                bytes,
+                mode,
+                operator.allows_sequence(),
+            ) {
+                issues.push(ValidationIssue::new(
+                    path.clone(),
+                    "embedded CBOR",
+                    render_bytes(bytes),
+                    Some(format!("embedded CBOR serialization check failed: {err}")),
+                ));
+                return false;
+            }
+            None
+        } else {
+            None
+        };
 
         if !operator.allows_sequence() && document.items().len() != 1 {
             issues.push(ValidationIssue::new(
@@ -1938,40 +1960,43 @@ fn validate_embedded_cbor_with_hint(
         return issues.len() == start_len;
     }
 
-    // Non-byte-string carriers. `.dtrm` / `.dtrmseq` may also be applied
-    // directly (e.g. `any .dtrm T`); perform the deterministic check against
-    // the surrounding source bytes when required, then validate the value
-    // against the RHS. No embedded-CBOR hint is recorded because the value
-    // is not a byte string.
-    if operator.requires_deterministic() {
+    // Non-byte-string carriers. `.dtrm` / `.dtrmseq` and `.prefp` /
+    // `.prefpseq` may also be applied directly (e.g. `any .dtrm T`,
+    // `any .prefp T`); perform the serialization check against the
+    // surrounding source bytes when required, then validate the value
+    // against the RHS. No embedded-CBOR hint is recorded because the
+    // value is not a byte string.
+    if operator.requires_deterministic() || operator.requires_preferred_plus() {
         let source = current_source_bytes_view();
         if source.is_empty() {
             issues.push(ValidationIssue::new(
                 path.clone(),
-                "deterministic CBOR input",
+                "serialization check input",
                 format!("{value}"),
-                Some("no source bytes were available for deterministic comparison".to_owned()),
+                Some("no source bytes for serialization comparison".to_owned()),
             ));
             return false;
         }
-        let encoded = match value.to_deterministic_bytes() {
-            Ok(encoded) => encoded,
-            Err(error) => {
-                issues.push(ValidationIssue::new(
-                    path.clone(),
-                    "deterministic CBOR",
-                    format!("{value}"),
-                    Some(format!("failed to re-encode CBOR: {error}")),
-                ));
-                return false;
-            },
+        let mode = if operator.requires_deterministic() {
+            cbork_utils::serialization_checker::SerializationMode::Dtrm
+        } else {
+            cbork_utils::serialization_checker::SerializationMode::Prefp
         };
-        if encoded != source {
+        if let Err(err) = cbork_utils::serialization_checker::check_serialization(
+            &source,
+            mode,
+            operator.allows_sequence(),
+        ) {
+            let label = if operator.requires_deterministic() {
+                "deterministic CBOR"
+            } else {
+                "preferred-plus CBOR"
+            };
             issues.push(ValidationIssue::new(
                 path.clone(),
-                "deterministic CBOR",
+                label,
                 format!("{value}"),
-                Some("encoded bytes did not match deterministic re-encoding".to_owned()),
+                Some(format!("{label} serialization check failed: {err}")),
             ));
             return false;
         }
@@ -5955,6 +5980,88 @@ fn set_current_source_bytes(bytes: &[u8]) -> Vec<u8> {
 /// Restore the previous source bytes after a nested validation scope.
 fn restore_current_source_bytes(previous: Vec<u8>) {
     CURRENT_SOURCE_BYTES.with(|slot| *slot.borrow_mut() = previous);
+}
+
+/// Push a serialization floor, returning the previous value for restore.
+fn push_serialization_floor(
+    mode: cbork_utils::serialization_checker::SerializationMode
+) -> Option<u8> {
+    let new_width = serialization_mode_width(mode);
+    CURRENT_SERIALIZATION_FLOOR.with(|slot| {
+        let mut floor = slot.borrow_mut();
+        let prev = *floor;
+        if let Some(current) = *floor {
+            if new_width > current {
+                *floor = Some(new_width);
+            }
+        } else {
+            *floor = Some(new_width);
+        }
+        prev
+    })
+}
+
+/// Pop a previously pushed serialization floor.
+fn pop_serialization_floor(previous: Option<u8>) {
+    CURRENT_SERIALIZATION_FLOOR.with(|slot| *slot.borrow_mut() = previous);
+}
+
+/// RAII guard that pushes a serialization floor on creation and pops
+/// it on drop.
+struct SerializationFloorGuard {
+    /// Previous floor value to restore on drop.
+    prev: Option<u8>,
+}
+
+impl SerializationFloorGuard {
+    /// Push a new floor if it is stricter than the current one.
+    fn push(mode: cbork_utils::serialization_checker::SerializationMode) -> Self {
+        Self {
+            prev: push_serialization_floor(mode),
+        }
+    }
+}
+
+impl Drop for SerializationFloorGuard {
+    fn drop(&mut self) {
+        pop_serialization_floor(self.prev);
+    }
+}
+
+/// RAII guard that resets the serialization floor to None on creation
+/// and restores it on drop.  Used when entering an explicit bstr
+/// payload scope.
+struct SerializationFloorReset {
+    /// Previous floor value to restore on drop.
+    prev: Option<u8>,
+}
+
+impl SerializationFloorReset {
+    /// Save the current floor and reset it to None.
+    fn new() -> Self {
+        let prev = CURRENT_SERIALIZATION_FLOOR.with(|slot| {
+            let mut floor = slot.borrow_mut();
+            let prev = *floor;
+            *floor = None;
+            prev
+        });
+        Self { prev }
+    }
+}
+
+impl Drop for SerializationFloorReset {
+    fn drop(&mut self) {
+        pop_serialization_floor(self.prev);
+    }
+}
+
+/// Map a serialization mode to its strictness level (0 = Cbor, 1 = Prefp, 2 = Dtrm).
+fn serialization_mode_width(mode: cbork_utils::serialization_checker::SerializationMode) -> u8 {
+    match mode {
+        cbork_utils::serialization_checker::SerializationMode::Cbor => 0,
+        cbork_utils::serialization_checker::SerializationMode::Prefp => 1,
+        cbork_utils::serialization_checker::SerializationMode::Dtrm => 2,
+    }
 }
 
 #[cfg(test)]

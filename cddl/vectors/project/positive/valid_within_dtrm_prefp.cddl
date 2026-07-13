@@ -1,0 +1,9 @@
+; plan-019 positive regression: `.dtrm ⊆ .prefp` for the same
+; controller type.  `.dtrm` is stricter than `.prefp`, so a
+; dtrm-encoded bstr is also valid under `.prefp`.
+
+root = a .within b
+
+a = bstr .dtrm map-dtrm-prefp
+b = bstr .prefp map-dtrm-prefp
+map-dtrm-prefp = { 1: "one", 2: "two" }

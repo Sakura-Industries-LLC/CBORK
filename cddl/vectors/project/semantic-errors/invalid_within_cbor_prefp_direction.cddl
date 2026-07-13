@@ -1,0 +1,9 @@
+; plan-019 negative regression: `.cbor ⊄ .prefp` direction check.
+; `.cbor` is broader than `.prefp`, so a bare cbor-encoded bstr does
+; not fit inside a prefp constraint.
+
+root = a .within b
+
+a = bstr .cbor map-cbor-prefp
+b = bstr .prefp map-cbor-prefp
+map-cbor-prefp = { 1: "one", 2: "two" }

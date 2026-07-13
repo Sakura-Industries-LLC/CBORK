@@ -1,0 +1,6 @@
+; plan-019 positive: repeated identical operators emit no W008 warning.
+; Both sides are `.dtrm`, so no width difference exists.
+
+a = any .dtrm b
+b = any .dtrm c
+c = { 1: "one", 2: "two" }
