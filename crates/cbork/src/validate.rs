@@ -52,6 +52,7 @@ use crate::{
 
 thread_local! {
     static CURRENT_SOURCE_BYTES: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static CURRENT_SOURCE_PATH: RefCell<Vec<PathStep>> = const { RefCell::new(Vec::new()) };
     static CURRENT_SCHEMA_NOTES: RefCell<Vec<SchemaNote>> = const { RefCell::new(Vec::new()) };
     static CURRENT_VALIDATION_WARNINGS: RefCell<Vec<ValidationWarning>> = const { RefCell::new(Vec::new()) };
     static CURRENT_EMBEDDED_CBOR_HINTS: RefCell<Vec<EmbeddedCborHint>> = const { RefCell::new(Vec::new()) };
@@ -206,7 +207,7 @@ pub(crate) fn exec(
         },
     };
 
-    set_current_source_bytes(&input);
+    set_current_source_context(&input, &[]);
     clear_current_schema_notes();
     clear_current_validation_warnings();
     clear_current_embedded_cbor_hints();
@@ -1934,6 +1935,7 @@ fn validate_embedded_cbor_with_hint(
         }
 
         let previous_source = set_current_source_bytes(bytes);
+        let previous_source_path = set_current_source_path(path);
         if operator.allows_sequence() {
             for (index, item) in document.items().iter().enumerate() {
                 let mut child_path = path.clone();
@@ -1943,6 +1945,7 @@ fn validate_embedded_cbor_with_hint(
         } else {
             let Some(item) = document.items().first() else {
                 restore_current_source_bytes(previous_source);
+                restore_current_source_path(previous_source_path);
                 return false;
             };
             let mut child_path = path.clone();
@@ -1950,6 +1953,7 @@ fn validate_embedded_cbor_with_hint(
             validate_schema_node(compiled, definitions, rhs, item, &mut child_path, issues);
         }
         restore_current_source_bytes(previous_source);
+        restore_current_source_path(previous_source_path);
 
         // Record the hint whenever embedded parsing succeeded, regardless
         // of RHS validation outcome. The renderer uses this to expose the
@@ -1968,22 +1972,44 @@ fn validate_embedded_cbor_with_hint(
     // value is not a byte string.
     if operator.requires_deterministic() || operator.requires_preferred_plus() {
         let source = current_source_bytes_view();
-        if source.is_empty() {
+        let Some(relative_path) = source_relative_path(path) else {
             issues.push(ValidationIssue::new(
                 path.clone(),
                 "serialization check input",
                 format!("{value}"),
-                Some("no source bytes for serialization comparison".to_owned()),
+                Some("could not locate the current item in the source bytes".to_owned()),
             ));
             return false;
-        }
+        };
+        let (start, end) =
+            match cbork_utils::serialization_checker::item_span_at_path(&source, &relative_path) {
+                Ok(span) => span,
+                Err(error) => {
+                    issues.push(ValidationIssue::new(
+                        path.clone(),
+                        "serialization check input",
+                        format!("{value}"),
+                        Some(format!("could not locate the current item: {error}")),
+                    ));
+                    return false;
+                },
+            };
+        let Some(source) = source.get(start..end) else {
+            issues.push(ValidationIssue::new(
+                path.clone(),
+                "serialization check input",
+                format!("{value}"),
+                Some("located item span was outside the source bytes".to_owned()),
+            ));
+            return false;
+        };
         let mode = if operator.requires_deterministic() {
             cbork_utils::serialization_checker::SerializationMode::Dtrm
         } else {
             cbork_utils::serialization_checker::SerializationMode::Prefp
         };
         if let Err(err) = cbork_utils::serialization_checker::check_serialization(
-            &source,
+            source,
             mode,
             operator.allows_sequence(),
         ) {
@@ -2011,6 +2037,65 @@ fn validate_embedded_cbor_with_hint(
 /// `.dtrm` / `.dtrmseq` carriers.
 fn current_source_bytes_view() -> Vec<u8> {
     CURRENT_SOURCE_BYTES.with(|slot| slot.borrow().clone())
+}
+
+/// Set both the current source bytes and the path represented by their root.
+fn set_current_source_context(
+    bytes: &[u8],
+    path: &[PathStep],
+) {
+    set_current_source_bytes(bytes);
+    set_current_source_path(path);
+}
+
+/// Replace the current source-root path and return its previous value.
+fn set_current_source_path(path: &[PathStep]) -> Vec<PathStep> {
+    CURRENT_SOURCE_PATH.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), path.to_vec()))
+}
+
+/// Restore a previously saved source-root path.
+fn restore_current_source_path(previous: Vec<PathStep>) {
+    CURRENT_SOURCE_PATH.with(|slot| *slot.borrow_mut() = previous);
+}
+
+/// Convert a validation path into a path relative to the current source root.
+fn source_relative_path(
+    path: &[PathStep]
+) -> Option<Vec<cbork_utils::serialization_checker::SerializationPathStep>> {
+    let base = CURRENT_SOURCE_PATH.with(|slot| slot.borrow().clone());
+    if path.get(..base.len())? != base.as_slice() {
+        return None;
+    }
+    path.get(base.len()..)?
+        .iter()
+        .map(|step| {
+            match step {
+                PathStep::DocItem(index) | PathStep::EmbeddedItem(index) => {
+                    Some(
+                        cbork_utils::serialization_checker::SerializationPathStep::TopLevel(*index),
+                    )
+                },
+                PathStep::ArrayItem(index) => {
+                    Some(
+                        cbork_utils::serialization_checker::SerializationPathStep::ArrayItem(
+                            *index,
+                        ),
+                    )
+                },
+                PathStep::MapKey(index) => {
+                    Some(cbork_utils::serialization_checker::SerializationPathStep::MapKey(*index))
+                },
+                PathStep::MapValue(index) => {
+                    Some(
+                        cbork_utils::serialization_checker::SerializationPathStep::MapValue(*index),
+                    )
+                },
+                PathStep::TagInner => {
+                    Some(cbork_utils::serialization_checker::SerializationPathStep::TagInner)
+                },
+            }
+        })
+        .collect()
 }
 
 /// Validate a `regexp` control operator.

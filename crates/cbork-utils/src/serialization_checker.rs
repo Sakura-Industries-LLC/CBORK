@@ -77,6 +77,22 @@ pub enum SerializationMode {
 /// The result of a serialization check.
 pub type SerializationResult = Result<(), SerializationError>;
 
+/// A path component used to locate an encoded item without decoding and
+/// re-encoding its value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SerializationPathStep {
+    /// A top-level item in a document or sequence.
+    TopLevel(usize),
+    /// An item in an array.
+    ArrayItem(usize),
+    /// A map key.
+    MapKey(usize),
+    /// A map value.
+    MapValue(usize),
+    /// The payload of a tag.
+    TagInner,
+}
+
 /// A descriptive serialization failure.
 #[derive(Debug, Clone)]
 pub struct SerializationError {
@@ -161,6 +177,123 @@ pub fn check_serialization(
         if d.position() >= bytes.len() {
             return Ok(());
         }
+    }
+}
+
+/// Return the byte span of the item selected by `path`.
+///
+/// This only navigates the original byte stream. It never constructs a
+/// replacement representation, so callers can validate the exact encoding
+/// supplied for a nested item.
+///
+/// # Errors
+///
+/// Returns an error when the path does not identify an item or the source
+/// bytes cannot be navigated as valid CBOR.
+pub fn item_span_at_path(
+    bytes: &[u8],
+    path: &[SerializationPathStep],
+) -> Result<(usize, usize), SerializationError> {
+    use minicbor::Decoder;
+
+    let mut decoder = Decoder::new(bytes);
+    locate_item(&mut decoder, path)
+}
+
+fn locate_item(
+    decoder: &mut minicbor::Decoder<'_>,
+    path: &[SerializationPathStep],
+) -> Result<(usize, usize), SerializationError> {
+    if path.is_empty() {
+        let start = decoder.position();
+        decoder.skip()?;
+        return Ok((start, decoder.position()));
+    }
+
+    let step = path[0];
+    match step {
+        SerializationPathStep::TopLevel(index) => {
+            for _ in 0..index {
+                decoder.skip()?;
+            }
+            locate_item(decoder, &path[1..])
+        },
+        SerializationPathStep::ArrayItem(index) => {
+            let count = decoder.array()?;
+            if let Some(count) = count {
+                if index >= count as usize {
+                    return Err(path_error(decoder, "array index out of bounds"));
+                }
+                for current in 0..count as usize {
+                    if current == index {
+                        return locate_item(decoder, &path[1..]);
+                    }
+                    decoder.skip()?;
+                }
+            } else {
+                let mut current = 0;
+                loop {
+                    if decoder.datatype()? == minicbor::data::Type::Break {
+                        return Err(path_error(decoder, "array index out of bounds"));
+                    }
+                    if current == index {
+                        return locate_item(decoder, &path[1..]);
+                    }
+                    decoder.skip()?;
+                    current += 1;
+                }
+            }
+            Err(path_error(decoder, "array index out of bounds"))
+        },
+        SerializationPathStep::MapKey(index) | SerializationPathStep::MapValue(index) => {
+            let count = decoder.map()?;
+            if let Some(count) = count {
+                if index >= count as usize {
+                    return Err(path_error(decoder, "map index out of bounds"));
+                }
+                for current in 0..count as usize {
+                    if matches!(step, SerializationPathStep::MapKey(_)) && current == index {
+                        return locate_item(decoder, &path[1..]);
+                    }
+                    decoder.skip()?;
+                    if matches!(step, SerializationPathStep::MapValue(_)) && current == index {
+                        return locate_item(decoder, &path[1..]);
+                    }
+                    decoder.skip()?;
+                }
+            } else {
+                let mut current = 0;
+                loop {
+                    if decoder.datatype()? == minicbor::data::Type::Break {
+                        return Err(path_error(decoder, "map index out of bounds"));
+                    }
+                    if matches!(step, SerializationPathStep::MapKey(_)) && current == index {
+                        return locate_item(decoder, &path[1..]);
+                    }
+                    decoder.skip()?;
+                    if matches!(step, SerializationPathStep::MapValue(_)) && current == index {
+                        return locate_item(decoder, &path[1..]);
+                    }
+                    decoder.skip()?;
+                    current += 1;
+                }
+            }
+            Err(path_error(decoder, "map index out of bounds"))
+        },
+        SerializationPathStep::TagInner => {
+            decoder.tag()?;
+            locate_item(decoder, &path[1..])
+        },
+    }
+}
+
+fn path_error(
+    decoder: &minicbor::Decoder<'_>,
+    message: &str,
+) -> SerializationError {
+    SerializationError {
+        offset: decoder.position(),
+        message: message.to_owned(),
     }
 }
 
@@ -431,38 +564,19 @@ fn check_bignum_tag(
         });
     }
 
-    // Leading-zero rules: a leading 0x00 is only allowed when it
-    // prevents the high bit of the real value from being set (which
-    // would make it look like a negative number in two's complement).
-    let has_allowed_leading_zero = if payload[0] == 0 {
-        if payload.len() == 1 {
-            return Err(SerializationError {
-                offset: pos,
-                message: format!("tag {tag} with single zero byte is not a valid bignum"),
-            });
-        }
-        if payload[1] & 0x80 == 0 {
-            return Err(SerializationError {
-                offset: pos,
-                message: format!("tag {tag} has a redundant leading zero byte"),
-            });
-        }
-        true
-    } else {
-        false
-    };
-
-    // Strip the allowed leading zero to get the effective payload
-    // whose numeric value is compared against the regular-integer range.
-    let effective = if has_allowed_leading_zero {
-        &payload[1..]
-    } else {
-        payload
-    };
+    // Preferred-plus uses the shortest unsigned big-endian magnitude.
+    // Unlike signed two's-complement integers, a bignum magnitude never
+    // needs a sign-protection byte.
+    if payload.first() == Some(&0) {
+        return Err(SerializationError {
+            offset: pos,
+            message: format!("tag {tag} contains a leading zero byte"),
+        });
+    }
 
     // Any value that fits in a u64 can be represented as a regular
     // CBOR integer (major type 0 or 1) and must not use bignum.
-    if effective.len() <= 8 {
+    if payload.len() <= 8 {
         return Err(SerializationError {
             offset: pos,
             message: format!("tag {tag} bignum value fits in a regular CBOR integer"),
@@ -853,6 +967,25 @@ mod tests {
     }
 
     #[test]
+    fn item_span_navigates_nested_array_map_and_tag() {
+        let bytes = [0xC1, 0x82, 1, 0xA1, 2, 3];
+        let span = item_span_at_path(&bytes, &[
+            SerializationPathStep::TagInner,
+            SerializationPathStep::ArrayItem(1),
+            SerializationPathStep::MapValue(0),
+        ])
+        .unwrap();
+        assert_eq!(span, (5, 6));
+    }
+
+    #[test]
+    fn item_span_navigates_sequence_items() {
+        let bytes = [0, 0x82, 1, 2];
+        let span = item_span_at_path(&bytes, &[SerializationPathStep::TopLevel(1)]).unwrap();
+        assert_eq!(span, (1, 4));
+    }
+
+    #[test]
     fn array_with_bstr_continues_after_payload() {
         // [h'deadbeef', 1] — valid prefp array with opaque bstr payload
         ok_prefp(&[0x82, 0x44, 0xDE, 0xAD, 0xBE, 0xEF, 1]);
@@ -896,7 +1029,7 @@ mod tests {
         let err =
             check_serialization(&[0xC2, 0x41, 0x00], SerializationMode::Prefp, false).unwrap_err();
         assert!(
-            err.message.contains("not a valid bignum") || err.message.contains("fits in a regular"),
+            err.message.contains("leading zero") || err.message.contains("fits in a regular"),
             "got: {err:?}"
         );
     }
