@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rfc version="3" ipr="trust200902" submissionType="IETF" category="std" docName="draft-sakura-cddl-documentation-comments-00">
+  <front>
+    <title abbrev="CDDL Documentation Comments">Documentation Comments for CDDL</title>
+    <author fullname="Sakura Industries LLC" initials="SI" surname="LLC" role="editor"/>
+    <date year="2026" month="July" day="13"/>
+    <area>art</area>
+    <workgroup>CBOR</workgroup>
+    <keyword>CDDL</keyword>
+    <keyword>comments</keyword>
+    <keyword>documentation</keyword>
+    <abstract>
+      <t>This document defines a convention for documentation comments in Concise Data Definition Language (CDDL) source as specified by <xref target="RFC8610"/>. A documentation comment is a standalone comment line beginning with <tt>;!</tt>. Documentation comments are retained as Markdown text and are associated with the following CDDL definition or with the module when they occur before the first definition.</t>
+      <t>This document specifies lexical recognition, comment-block grouping, attachment, and the distinction between standalone documentation comments and ordinary trailing comments. It does not prescribe Markdown heading levels or other project-specific documentation style rules.</t>
+      <t>Documentation comments are intentionally separate from ordinary comments because they can carry structured Markdown such as tables, quotations, examples, lists, and explanatory prose. This structure serves two related purposes: it supports rendered, user-facing CDDL documentation, and it matches the ability of modern language models to reason over Markdown structure when assisting development and code generation. An item-attached documentation block gives such tools a stronger guide to the meaning of a schema type than loose comments or separate prose documents provide.</t>
+    </abstract>
+  </front>
+  <middle>
+    <section anchor="intro" numbered="true">
+      <name>Introduction</name>
+      <t>CDDL files are both machine-readable schemas and human-readable protocol documentation. Ordinary CDDL comments are useful for local notes, but tools that render or index a schema need a way to distinguish documentation intended to follow a definition from comments that are incidental to the source.</t>
+      <t>The distinction also gives documentation generators and AI-assisted tools a stable structural relationship between prose and the CDDL item it describes. A table, quotation, example, or other Markdown block can remain attached to the relevant schema definition when the document is rendered, analyzed, or used to guide implementation and test-vector generation.</t>
+      <t>The ordinary <tt>;</tt> comment form remains available for silent maintenance notes. Such comments may be useful to the authors or maintainers of a CDDL file, but they are not user-facing documentation, MUST NOT be attached as documentation blocks, and MUST NOT affect rendered documentation or the documentation structure presented to AI-assisted tools.</t>
+      <t>This document defines the <tt>;!</tt> documentation-comment marker. The marker is intentionally a comment syntax: removing documentation comments from a CDDL document MUST NOT change the CDDL data model or the values accepted by the schema.</t>
+      <t>Documentation comments carry Markdown after the marker. The Markdown is not interpreted as CDDL and is not part of the CDDL grammar. When extracted or exchanged as a standalone document, the content can be represented using the <tt>text/markdown</tt> media type registered by <xref target="RFC7763"/>. This document does not select or define a Markdown variant; applications should follow the variant and interoperability guidance in <xref target="RFC7764"/>.</t>
+    </section>
+    <section anchor="conventions" numbered="true">
+      <name>Conventions and Terminology</name>
+      <t>The key words <strong>MUST</strong>, <strong>MUST NOT</strong>, <strong>REQUIRED</strong>, <strong>SHALL</strong>, <strong>SHALL NOT</strong>, <strong>SHOULD</strong>, <strong>SHOULD NOT</strong>, <strong>RECOMMENDED</strong>, <strong>NOT RECOMMENDED</strong>, <strong>MAY</strong>, and <strong>OPTIONAL</strong> in this document are to be interpreted as described in BCP 14 when, and only when, they appear in all capitals.</t>
+      <t>A <em>documentation line</em> is a source line whose first non-whitespace characters are <tt>;!</tt>. A <em>documentation block</em> is a group of documentation lines joined according to the grouping rules in this document.</t>
+      <t>An <em>ordinary comment</em> is any CDDL comment that is not a standalone documentation line. Directive comments and import/include comments are ordinary comments for the purposes of documentation-block grouping.</t>
+    </section>
+    <section anchor="syntax" numbered="true">
+      <name>Documentation-Line Syntax</name>
+      <t>A documentation line has the following conceptual form:</t>
+      <artwork><![CDATA[
+optional-leading-whitespace ;! markdown-text
+      ]]></artwork>
+      <t>Leading whitespace before <tt>;!</tt> is not part of the documentation content. The two-character marker is removed, and all characters after the marker are retained as Markdown content, including whitespace. An empty documentation line is valid and contributes an empty Markdown line.</t>
+      <t>For example:</t>
+      <artwork><![CDATA[
+;! A description of the payload.
+  ;! The second line preserves its Markdown indentation.
+      ]]></artwork>
+      <t>Tools MUST recognize the marker independently of whether the source line is indented within a multi-line CDDL array, map, or group. The attachment of such a line is determined by the surrounding source and the enclosing definition, not by Markdown heading conventions.</t>
+    </section>
+    <section anchor="trailing" numbered="true">
+      <name>Trailing Comments Are Ordinary Comments</name>
+      <t>If <tt>;!</tt> occurs after CDDL content on the same source line, it is an ordinary trailing comment, not a documentation line.</t>
+      <artwork><![CDATA[
+payload = int  ;! This is an ordinary trailing comment.
+      ]]></artwork>
+      <t>In particular, a <tt>;!</tt> appearing on the right-hand side of an identifier or after any other CDDL token is not a documentation comment. It MUST NOT be collected into a documentation block or attached to the identifier.</t>
+      <t>This distinction prevents an inline note from changing the documentation association of a definition merely because it uses the documentation marker characters.</t>
+    </section>
+    <section anchor="grouping" numbered="true">
+      <name>Documentation-Block Grouping</name>
+      <t>A documentation block is a contiguous run of standalone documentation lines, with ordinary standalone comments and directives treated as transparent lines.</t>
+      <t>The following source events end a documentation block:</t>
+      <ul>
+        <li>a blank or whitespace-only line;</li>
+        <li>a CDDL definition line or continuation line; or</li>
+        <li>end of the source document.</li>
+      </ul>
+      <t>Ordinary comments, directive comments, and import/include comments between documentation lines do not end the block. They are not included in the Markdown content.</t>
+      <t>Documentation lines inside a multi-line map, array, or group are still documentation lines. They may therefore form blocks describing the enclosing rule or parts of its body. A tool MAY provide more detailed field-level attachment, but the base association remains the enclosing CDDL source context.</t>
+    </section>
+    <section anchor="attachment" numbered="true">
+      <name>Attachment</name>
+      <t>After collecting a documentation block, a tool examines the following source lines for an attachment target. Ordinary comments and directives may be skipped while looking for that target.</t>
+      <t>If the next non-transparent source line is a CDDL definition, the documentation block attaches to that definition. The block is associated with the definition's source location and is available to renderers and documentation indexes as that definition's Markdown documentation.</t>
+      <t>If the block occurs before any CDDL definition in the document and no definition precedes it, it is the module-level documentation block. A tool MAY expose this as file-level or module-level documentation.</t>
+      <t>A blank line prevents attachment to a following definition. A block at the end of a document, or a block for which no definition is found before the next documentation block, is an orphan block. Tools MAY retain and display orphan blocks, but MUST NOT silently attach them to an unrelated definition.</t>
+      <t>When multiple blocks occur in a source file, each block is attached independently. A definition ends the preceding block and a later block can attach to a later definition.</t>
+    </section>
+    <section anchor="markdown" numbered="true">
+      <name>Markdown Preservation</name>
+      <t>The content after each <tt>;!</tt> marker is Markdown source. Tools extracting documentation MUST preserve the source order of documentation lines.</t>
+      <t>Tools MUST NOT require a particular heading level, heading name, list style, or other Markdown structure as part of this syntax. A project or tool MAY define additional documentation-quality checks, but those checks are separate from the comment attachment semantics specified here.</t>
+      <t>A renderer MAY normalize the marker itself and present the collected Markdown as a normal Markdown document. Such rendering MUST NOT cause ordinary trailing comments, directive comments, or import/include comments to become documentation content.</t>
+    </section>
+    <section anchor="examples" numbered="true">
+      <name>Examples</name>
+      <section anchor="definition-example" numbered="true">
+        <name>Definition Documentation</name>
+        <artwork><![CDATA[
+;! The public key used by the protocol.
+;! This description is attached to `public-key`.
+public-key = bstr
+        ]]></artwork>
+      </section>
+      <section anchor="module-example" numbered="true">
+        <name>Module Documentation</name>
+        <artwork><![CDATA[
+;! This module defines the wire format for service records.
+;! The block occurs before the first definition and documents the module.
+
+root = service-record
+        ]]></artwork>
+      </section>
+      <section anchor="transparent-example" numbered="true">
+        <name>Transparent Comments</name>
+        <artwork><![CDATA[
+;! Description of the following definition.
+; ordinary implementation note
+;# import shared from "shared.cddl"
+payload = bstr
+        ]]></artwork>
+        <t>The ordinary comments and tool-specific annotation lines do not become Markdown content and do not prevent the documentation block from attaching to <tt>payload</tt>.</t>
+      </section>
+      <section anchor="inline-example" numbered="true">
+        <name>Trailing and Nested Comments</name>
+        <artwork><![CDATA[
+payload = {
+  ;! Documentation for the enclosing payload rule or its field area.
+  value: bstr  ;! Ordinary trailing implementation note.
+}
+        ]]></artwork>
+        <t>The standalone line is a documentation line because it begins with <tt>;!</tt> after indentation. The comment after <tt>bstr</tt> is ordinary because it occurs after CDDL content on the same line.</t>
+      </section>
+    </section>
+    <section anchor="implementation" numbered="true">
+      <name>Implementation Guidance</name>
+      <t>A parser or documentation extractor SHOULD classify source lines before applying transformations that may add or remove generated CDDL content. It SHOULD retain source line locations for documentation blocks and their attachment targets.</t>
+      <t>Implementations MAY expose a structured result containing the block's source range, Markdown lines, module-level status, and optional definition source location. The structured result is useful for editors, renderers, documentation generators, and diagnostics.</t>
+      <t>Documentation comments do not constrain CBOR values. Validation and subtype analysis MUST ignore their Markdown content.</t>
+    </section>
+    <section anchor="security" numbered="true">
+      <name>Security Considerations</name>
+      <t>Documentation comments are not executable schema content and MUST NOT affect validation. Tools rendering Markdown from untrusted CDDL source should apply the usual protections for untrusted Markdown and generated HTML.</t>
+      <t>Because documentation can describe security-sensitive wire data, tools SHOULD preserve the association between a block and its source definition accurately. An incorrectly attached comment can cause a human reader to misunderstand the protocol even though machine validation remains unchanged.</t>
+    </section>
+  </middle>
+  <back>
+    <references>
+      <name>Normative References</name>
+      <reference anchor="RFC8610" target="https://www.rfc-editor.org/rfc/rfc8610">
+        <front><title>Concise Data Definition Language (CDDL): A Notational Convention to Express Concise Data Formats</title><author initials="H." surname="Birkholz" fullname="Henk Birkholz"/><author initials="C." surname="Bormann" fullname="Carsten Bormann"/><date year="2019" month="June"/></front>
+        <seriesInfo name="RFC" value="8610"/>
+      </reference>
+    </references>
+    <references>
+      <name>Informative References</name>
+      <reference anchor="RFC7763" target="https://www.rfc-editor.org/rfc/rfc7763">
+        <front><title>The text/markdown Media Type</title><author initials="S." surname="Leonard" fullname="Sean Leonard"/><date year="2016" month="March"/></front>
+        <seriesInfo name="RFC" value="7763"/>
+      </reference>
+      <reference anchor="RFC7764" target="https://www.rfc-editor.org/rfc/rfc7764">
+        <front><title>Guidance on Markdown: Design Philosophies, Stability Strategies, and Select Registrations</title><author initials="S." surname="Leonard" fullname="Sean Leonard"/><date year="2016" month="March"/></front>
+        <seriesInfo name="RFC" value="7764"/>
+      </reference>
+    </references>
+  </back>
+</rfc>

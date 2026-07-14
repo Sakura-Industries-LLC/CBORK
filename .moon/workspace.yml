@@ -11,3 +11,4 @@ projects:
   crates/cbork-edn: "crates/cbork-edn"
   crates/cbork-utils: "crates/cbork-utils"
   extension/zed: "extension/zed"
+  rfc/draft: "rfc/draft"

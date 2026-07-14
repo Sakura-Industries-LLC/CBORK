@@ -1,0 +1,51 @@
+id: "rfc/draft"
+layer: "application"
+
+tasks:
+  rfc-cddl-transformations:
+    command: "bash"
+    args:
+      - "-lc"
+      - >-
+        mkdir -p rfc/draft/build &&
+        xml2rfc --v3 --text --html
+        --path=rfc/draft/build
+        rfc/draft/draft-sakura-cddl-transformations-00.xml
+    options:
+      runFromWorkspaceRoot: true
+      runInCI: false
+      outputStyle: "stream"
+    inputs:
+      - "draft-sakura-cddl-transformations-00.xml"
+
+  rfc-cddl-documentation-comments:
+    command: "bash"
+    args:
+      - "-lc"
+      - >-
+        mkdir -p rfc/draft/build &&
+        xml2rfc --v3 --text --html
+        --path=rfc/draft/build
+        rfc/draft/draft-sakura-cddl-documentation-comments-00.xml
+    options:
+      runFromWorkspaceRoot: true
+      runInCI: false
+      outputStyle: "stream"
+    inputs:
+      - "draft-sakura-cddl-documentation-comments-00.xml"
+
+  rfc-cddl-tool-annotations:
+    command: "bash"
+    args:
+      - "-lc"
+      - >-
+        mkdir -p rfc/draft/build &&
+        xml2rfc --v3 --text --html
+        --path=rfc/draft/build
+        rfc/draft/draft-sakura-cddl-tool-annotations-00.xml
+    options:
+      runFromWorkspaceRoot: true
+      runInCI: false
+      outputStyle: "stream"
+    inputs:
+      - "draft-sakura-cddl-tool-annotations-00.xml"

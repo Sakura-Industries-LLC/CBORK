@@ -1,0 +1,239 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="rfc2629.xslt"?>
+<rfc version="3" ipr="trust200902" submissionType="IETF" category="std" docName="draft-sakura-cddl-transformations-00">
+  <front>
+    <title abbrev="CDDL Transformation Annotations">Transformation and Representation Annotations for CDDL</title>
+    <author fullname="Sakura Industries LLC" initials="SI" surname="LLC" role="editor"/>
+    <date year="2026" month="July" day="13"/>
+    <area>art</area>
+    <workgroup>CBOR</workgroup>
+    <keyword>CDDL</keyword>
+    <keyword>CBOR</keyword>
+    <keyword>encryption</keyword>
+    <keyword>hashing</keyword>
+    <keyword>compression</keyword>
+    <abstract>
+      <t>This document defines CDDL control operators for describing values that are the result of a transformation of a logical value. The transformations include encryption, hashing, and compression. The operators preserve the schema of the logical value as a controller while describing the transformed representation at the schema boundary.</t>
+      <t>The primary purpose of the <tt>.enc</tt> and <tt>.hash</tt> annotations is authoritative schema documentation. They record the logical contents of a byte-string payload in the CDDL itself, rather than leaving that information only in informal comments or a separate Markdown document. The document also defines suffixes for interpreting the controller as CBOR, ABNF text, or ABNF bytes. A decoder that does not know a named transformation or representation suffix can retain the schema and issue a warning without treating the unknown annotation as a malformed CBOR value.</t>
+      <t>The ABNF binding defined here extends that role to binary payloads that are not pure CDDL data. CDDL can describe a generic data model that is used with formats such as JSON, but a protocol payload can also be an ABNF-described byte structure with selected fields whose contents have a CDDL meaning. The binding records that relationship without claiming that the complete binary payload is itself a CDDL instance.</t>
+      <t>This creates a closed composition between CDDL and ABNF. ABNF contributes precise byte-level structure where CDDL is not the appropriate language, while CDDL contributes typed data-model validation where ABNF has no equivalent semantic vocabulary. Neither language is superior in every layer; a complete schema can use each for the part it describes best and connect them without leaving the relationship in informal prose.</t>
+      <t>Machine-readable descriptions are increasingly important for AI-assisted software development and code generation. Recording encrypted and hashed payload schemas in CDDL gives such tools a stronger specification from which to generate accurate implementations, validation logic, and relevant test vectors than prose-only descriptions provide. This benefit does not replace human review or cryptographic analysis; it reduces ambiguity in the data-shape portion of the implementation.</t>
+    </abstract>
+  </front>
+  <middle>
+    <section anchor="intro" numbered="true">
+      <name>Introduction</name>
+      <t>CDDL control operators extend a type with a constraint or interpretation of that type. Existing applications commonly need to describe a byte string that contains encrypted, hashed, or compressed data while also documenting the logical data that produced the byte string.</t>
+      <t>CDDL is also useful for describing a generic data model independent of a single wire syntax, including data represented as JSON, as discussed in <xref target="RFC8610"/>. This document applies the same separation of structural and semantic description to binary payloads that are not pure CDDL: ABNF describes the outer bytes, while named CDDL rules describe selected embedded values.</t>
+      <t>Under this model, a CDDL document can serve as the universal schema container for a format that combines raw bytes and CDDL data. A schema can begin with an ABNF-defined byte envelope, enter CDDL validation at named fields, and return to ABNF for the remaining bytes. The binding is deliberately one-way in meaning at each field: it identifies which existing CDDL rule controls the matched bytes and does not create a second grammar or metadata language.</t>
+      <t>For example, the following definition describes an encrypted payload whose plaintext is an ABNF-described byte sequence:</t>
+      <artwork><![CDATA[
+encrypted-payload = bstr .enc.abnfb payload-abnf
+payload-abnf = '\n  payload = 32OCTET\n'
+      ]]></artwork>
+      <t>The encrypted carrier is still a byte string. The ABNF controller documents the plaintext structure, but an implementation cannot validate it unless it has the required decryption key and algorithm context.</t>
+      <t>This document defines the annotation family without requiring every CDDL implementation to implement cryptography or compression. An implementation can therefore parse, preserve, and display these annotations even when it cannot reverse the transformation.</t>
+    </section>
+    <section anchor="conventions" numbered="true">
+      <name>Conventions and Terminology</name>
+      <t>The key words <strong>MUST</strong>, <strong>MUST NOT</strong>, <strong>REQUIRED</strong>, <strong>SHALL</strong>, <strong>SHALL NOT</strong>, <strong>SHOULD</strong>, <strong>SHOULD NOT</strong>, <strong>RECOMMENDED</strong>, <strong>NOT RECOMMENDED</strong>, <strong>MAY</strong>, and <strong>OPTIONAL</strong> in this document are to be interpreted as described in BCP 14 when, and only when, they appear in all capitals.</t>
+      <t>The <em>carrier</em> is the type to the left of a transformation operator. The <em>controller</em> is the type or literal to the right. The controller describes the logical input to the transformation, not necessarily bytes that are present at the schema boundary.</t>
+      <t>A <em>representation suffix</em> identifies how the controller is described. It does not change the transformed carrier.</t>
+    </section>
+    <section anchor="syntax" numbered="true">
+      <name>Operator Syntax</name>
+      <t>The transformation annotation family is formed from a transformation family name, an optional algorithm name, and an optional representation suffix:</t>
+      <artwork><![CDATA[
+transformation = ".enc"
+                / ".hash"
+                / ".compressed"
+                / ".compressed." algorithm
+algorithm      = cddl-identifier
+representation = ".abnf" / ".abnfb"
+annotation     = transformation [ representation ]
+                / transformation representation
+      ]]></artwork>
+      <t>In the CDDL source syntax, the complete annotation is written as one control-operator name. Examples include <tt>.enc</tt>, <tt>.enc.abnf</tt>, <tt>.hash.abnfb</tt>, <tt>.compressed.brotli</tt>, and <tt>.compressed.zstd.abnfb</tt>.</t>
+      <t>The algorithm component is an identifier selected from the registry defined by this document or from a future specification. An implementation that does not recognize the algorithm component MUST preserve the annotation and SHOULD emit a warning. It MUST NOT silently claim that the transformation was reversed.</t>
+      <t>The generic <tt>.enc</tt> and <tt>.hash</tt> forms do not identify an algorithm. They are useful when the algorithm is specified by an enclosing protocol or by out-of-band context.</t>
+    </section>
+    <section anchor="semantics" numbered="true">
+      <name>Transformation Semantics</name>
+      <section anchor="enc" numbered="true">
+        <name>Encryption</name>
+        <t>The primary purpose of the <tt>.enc</tt> family is to authoritatively document the logical value represented by an encrypted carrier. It prevents the contents of an encrypted byte-string payload from being specified only in loose prose or an external Markdown document. The annotation indicates that the carrier is the result of encrypting the logical value described by the controller. The carrier is normally a <tt>bstr</tt>, but this document does not require a particular carrier so that protocol-specific wrappers can add their own constraints.</t>
+        <t>An implementation without the key, algorithm, parameters, and authentication context needed to decrypt the carrier MUST NOT apply the controller as a constraint on the carrier bytes. It MUST validate the carrier type and all independent constraints, such as <tt>.size</tt>.</t>
+        <t>Successful decryption does not by itself make the result valid. When decryption is available, the implementation MUST validate the recovered value against the controller and MUST report authentication failure separately from schema failure.</t>
+      </section>
+      <section anchor="hash" numbered="true">
+        <name>Hashing</name>
+        <t>The primary purpose of the <tt>.hash</tt> family is to authoritatively document the logical input represented by a digest carrier. It records that input schema next to the wire representation instead of relying on loose prose or an external Markdown document. The annotation indicates that the carrier is a digest or hash result derived from the logical value described by the controller.</t>
+        <t>A hash is generally not reversible. An implementation without the input value and algorithm context MUST treat the controller as documentation and MUST validate only the carrier and independent constraints. It MUST NOT attempt to parse the digest bytes as the controller representation merely because the controller has an ABNF or CBOR suffix.</t>
+        <t>An implementation that has the required input and hash algorithm MAY calculate and compare the expected result. Such verification is an additional semantic check and is not implied by parsing the CDDL annotation.</t>
+      </section>
+      <section anchor="compression" numbered="true">
+        <name>Compression</name>
+        <t>The <tt>.compressed</tt> family indicates that the carrier is a compressed representation of the logical value described by the controller. The generic form does not identify an algorithm.</t>
+        <t>A named form such as <tt>.compressed.brotli</tt> identifies the algorithm. An implementation that recognizes the algorithm and supports decompression MAY decompress the carrier and validate the recovered value against the controller.</t>
+        <t>An implementation that does not recognize the algorithm MUST preserve the annotation and SHOULD warn that the algorithm is unknown. It MUST still validate the carrier and independent constraints. It MUST NOT interpret compressed bytes as the controller value without decompression.</t>
+      </section>
+    </section>
+    <section anchor="representations" numbered="true">
+      <name>Controller Representation Suffixes</name>
+      <section anchor="cbor-representation" numbered="true">
+        <name>CBOR Controller</name>
+        <t>When no representation suffix is present, the controller is a normal CDDL type. If the controller contains a CBOR serialization control such as <tt>.cbor</tt>, <tt>.prefp</tt>, or <tt>.dtrm</tt>, that control applies to the controller value after any reversible transformation has been reversed. It does not apply to the transformed carrier unless it is written on the carrier separately.</t>
+      </section>
+      <section anchor="abnf-representation" numbered="true">
+        <name>ABNF Text and Bytes</name>
+        <t>The <tt>.abnf</tt> suffix says that the controller describes an ABNF grammar represented as text. The <tt>.abnfb</tt> suffix says that the controller describes an ABNF grammar applied to bytes.</t>
+        <t>For a reversible compression annotation, an implementation that supports decompression MAY apply the ABNF grammar to the decompressed result. For <tt>.enc.abnf</tt>, <tt>.enc.abnfb</tt>, <tt>.hash.abnf</tt>, and <tt>.hash.abnfb</tt>, the suffix documents the logical transformed input; it does not make the unavailable reverse operation possible.</t>
+        <t>Implementations MAY expose a successful ABNF match trace or structured breakdown as diagnostic output. Such output is not part of the CBOR value and MUST NOT alter the carrier representation.</t>
+      </section>
+      <section anchor="raw-abnf" numbered="true">
+        <name>Raw ABNF Carriers</name>
+        <t>When <tt>any</tt> is the carrier on the left-hand side of <tt>.abnf</tt> or <tt>.abnfb</tt>, the operator applies to the complete raw value at that schema boundary. It MUST NOT introduce or imply a <tt>bstr</tt> wrapper. The <tt>.abnf</tt> form operates on the raw ABNF text value, and the <tt>.abnfb</tt> form operates on the raw byte sequence.</t>
+        <t>For example, a protocol record whose complete value is a binary ABNF-described packet can be declared as follows:</t>
+        <artwork><![CDATA[
+packet = any .abnfb packet-abnf
+packet-abnf = '
+  packet = header payload
+  header = %x45 %x00 2OCTET
+  payload = *OCTET
+'
+        ]]></artwork>
+        <t>This form is suitable for binary protocols, packet formats, and file structures. The value is not modeled as a CBOR byte string merely because the ABNF grammar operates on bytes.</t>
+      </section>
+      <section anchor="abnf-cddl-binding" numbered="true">
+        <name>ABNF and CDDL Field Bindings</name>
+        <t>An ABNF controller MAY contain a standalone CBORK binding comment that associates an ABNF production with a named CDDL rule:</t>
+        <artwork><![CDATA[
+;@ CBORK: CDDL field=somecddl
+        ]]></artwork>
+        <t>The binding comment MAY occur at the beginning, end, or any other location in the ABNF source where an ABNF comment is permitted. An ABNF parser treats the line as an ordinary comment, so the binding does not change the ABNF grammar or break existing ABNF parsing. A CBORK implementation collects the bindings independently of their position before validating the ABNF controller.</t>
+        <t>The name on the left of the equals sign MUST be an ABNF production name. The name on the right MUST be a CDDL rule name defined in the same CDDL document. CDDL declaration order is irrelevant, and the CDDL document's first rule remains the entry point. The CDDL rule MAY be an ordinary local alias for a type obtained through CDDL import or include; the ABNF comment itself does not perform imports, qualify names, or contain a CDDL expression.</t>
+        <t>When an ABNF production with a binding matches, the matched bytes MUST be interpreted as exactly one self-delimiting CBOR item and validated against the named CDDL rule. If the matched span is not exactly one valid CBOR item, or if the item does not satisfy the named rule, validation fails. ABNF productions without a binding remain ABNF-only fields.</t>
+        <t>For example, the following grammar describes a raw binary envelope with a CBOR field in its middle:</t>
+        <artwork><![CDATA[
+record = %x20 field %x03
+field = *OCTET
+
+;@ CBORK: CDDL field=somecddl
+        ]]></artwork>
+        <artwork><![CDATA[
+record = any .abnfb record-abnf
+somecddl = {
+  1: uint,
+  2: tstr,
+}
+        ]]></artwork>
+        <t>The ABNF remains the authoritative description of the envelope and field position. The binding adds the unambiguous CDDL meaning of the bytes matched by <tt>field</tt>. This allows CDDL to describe pure CDDL data when appropriate, and to validate selected fields inside binary structures that are not pure CDDL, without inventing a parallel ABNF metalanguage.</t>
+        <t>An implementation that does not recognize the CBORK binding preserves it as an ABNF comment and validates the ABNF grammar without the additional CDDL check.</t>
+      </section>
+    </section>
+    <section anchor="examples" numbered="true">
+      <name>Examples</name>
+      <artwork><![CDATA[
+; Encrypted textual plaintext; keys and cipher are supplied by the protocol.
+secret = bstr .enc.abnf secret-abnf
+secret-abnf = '\n  secret = 1*64VCHAR\n'
+
+; Encrypted binary plaintext.
+private-key = bstr .enc.abnfb private-key-abnf
+private-key-abnf = '\n  private-key = 32OCTET\n'
+
+; Digest of a value that cannot be recovered from the digest.
+commitment = bstr .hash.abnfb commitment-input-abnf
+commitment-input-abnf = '\n  commitment-input = 32OCTET\n'
+
+; Known and generic compression algorithms.
+compressed-data = bstr .compressed payload
+brotli-data = bstr .compressed.brotli.abnfb payload-abnf
+zstd-data = bstr .compressed.zstd payload
+      ]]></artwork>
+      <t>In the last two examples, an implementation may reverse the transformation only when it recognizes the algorithm and has the required decompression support. In the encryption and hash examples, an ABNF suffix does not require the implementation to inspect the carrier bytes as ABNF.</t>
+    </section>
+    <section anchor="subtyping" numbered="true">
+      <name>Subtype and Composition Rules</name>
+      <t>A transformation annotation narrows its carrier at the schema boundary. For example, <tt>bstr .enc T</tt> is a subtype of <tt>bstr</tt>, and <tt>bstr .compressed.brotli T</tt> is a subtype of <tt>bstr .compressed T</tt>.</t>
+      <t>Two named compression algorithms are not subtypes of one another. A specific algorithm is a subtype of the generic <tt>.compressed</tt> form. The generic form is not a subtype of any specific algorithm.</t>
+      <t><tt>.enc</tt> and <tt>.hash</tt> are distinct transformation families. Neither is a subtype of the other, of compression, or of a named compression algorithm.</t>
+      <t>The controller is compared when both operators describe the same transformation family and compatible algorithms. A representation suffix does not make an encrypted value a subtype of an unencrypted value; it only describes the controller.</t>
+      <t>For a nested bstr encoding, each transformation applies at its own carrier boundary. An outer encoding constraint MUST NOT be propagated into the bytes of an inner transformed bstr unless the schema explicitly introduces a reversible serialization control for that inner value.</t>
+    </section>
+    <section anchor="implementation" numbered="true">
+      <name>Implementation Guidance</name>
+      <t>A parser SHOULD represent a transformation annotation as structured components: family, optional algorithm, and optional representation. It SHOULD retain unknown components rather than rejecting an otherwise parseable CDDL document.</t>
+      <t>A validator SHOULD use the following order:</t>
+      <ol>
+        <li>Validate the carrier and constraints that are independent of the transformation.</li>
+        <li>Determine whether the transformation and algorithm are known.</li>
+        <li>If reversible processing is available, reverse the transformation and validate the controller.</li>
+        <li>If reverse processing is unavailable, retain the annotation, validate no unavailable controller claim, and issue a diagnostic warning.</li>
+      </ol>
+      <t>A renderer MAY show the controller, algorithm, and representation suffix in comments or other diagnostic output. Such output MUST remain distinguishable from the value itself.</t>
+    </section>
+    <section anchor="iana" numbered="true">
+      <name>IANA Considerations</name>
+      <t>This document requests the creation of a CDDL Transformation Algorithm registry.</t>
+      <t>Registry entries have the following fields:</t>
+      <ul>
+        <li>Algorithm identifier: a CDDL identifier used after <tt>.compressed.</tt> or a future transformation family.</li>
+        <li>Description: a short description of the transformation.</li>
+        <li>Family: the transformation family to which the identifier applies.</li>
+        <li>Reference: a stable specification or expert review reference.</li>
+      </ul>
+      <t>New algorithm identifiers require Specification Required policy. The identifier <tt>compressed</tt> is reserved for the generic algorithm-independent form and is not an algorithm registry entry.</t>
+    </section>
+    <section anchor="security" numbered="true">
+      <name>Security Considerations</name>
+      <t>Transformation annotations are not security proofs. An <tt>.enc</tt> annotation does not prove confidentiality, authenticity, nonce uniqueness, or correct algorithm selection. Implementations MUST NOT treat successful CDDL carrier validation as successful cryptographic verification.</t>
+      <t>An <tt>.hash</tt> annotation does not prove that a digest was calculated from a particular input unless the implementation has the input, algorithm, and domain-separation context needed to verify it.</t>
+      <t>Decompression can consume excessive CPU or memory. Implementations that reverse compression SHOULD enforce input, output, recursion, and execution limits.</t>
+      <t>Unknown algorithms and unsupported reverse transformations should produce explicit diagnostics so that an operator is not mistaken for a validated assertion.</t>
+    </section>
+    <section anchor="iana-code" numbered="true">
+      <name>Changes from Existing Extensions</name>
+      <t>This document provides the standards-track names for the previously deployed implementation extensions <tt>.x-enc</tt>, <tt>.x-hash</tt>, <tt>.x-compressed</tt>, <tt>.x-brotli</tt>, <tt>.x-zstd</tt>, <tt>.x-gzip</tt>, and <tt>.x-deflate</tt>.</t>
+      <t>Implementations MAY accept the old names for compatibility, but new schemas SHOULD use the names defined here. The mapping is:</t>
+      <artwork><![CDATA[
+.x-enc       -> .enc
+.x-hash      -> .hash
+.x-compressed -> .compressed
+.x-brotli    -> .compressed.brotli
+.x-zstd      -> .compressed.zstd
+.x-gzip      -> .compressed.gzip
+.x-deflate   -> .compressed.deflate
+      ]]></artwork>
+      <t>The same mapping applies when the old operator is followed by <tt>.abnf</tt> or <tt>.abnfb</tt>.</t>
+    </section>
+  </middle>
+  <back>
+    <references>
+      <name>Normative References</name>
+      <reference anchor="RFC8610" target="https://www.rfc-editor.org/rfc/rfc8610">
+        <front><title>Concise Data Definition Language (CDDL): A Notational Convention to Express Concise Data Formats</title><author initials="H." surname="Mcelroy" fullname="Henk Birkholz"/><author initials="C." surname="Bormann" fullname="Carsten Bormann"/><date year="2019" month="June"/></front>
+        <seriesInfo name="RFC" value="8610"/>
+      </reference>
+      <reference anchor="RFC8949" target="https://www.rfc-editor.org/rfc/rfc8949">
+        <front><title>Concise Binary Object Representation (CBOR)</title><author initials="C." surname="Bormann" fullname="Carsten Bormann"/><author initials="P." surname="Hoffman" fullname="Paul Hoffman"/><date year="2020" month="December"/></front>
+        <seriesInfo name="RFC" value="8949"/>
+      </reference>
+    </references>
+    <references>
+      <name>Informative References</name>
+      <reference anchor="RFC9052" target="https://www.rfc-editor.org/rfc/rfc9052">
+        <front><title>CBOR Object Signing and Encryption (COSE): Structures and Process</title><author initials="J." surname="Schaad" fullname="Jim Schaad"/><date year="2022" month="August"/></front>
+        <seriesInfo name="RFC" value="9052"/>
+      </reference>
+      <reference anchor="CBOR-SERIALIZATION" target="https://datatracker.ietf.org/doc/draft-ietf-cbor-serialization/">
+        <front><title>CBOR Serialization and Determinism</title><author initials="L." surname="Lundblade" fullname="L. Lundblade"/><date year="2026" month="April"/></front>
+        <seriesInfo name="Internet-Draft" value="draft-ietf-cbor-serialization-06"/>
+      </reference>
+      <reference anchor="CBOR-EDN-LITERALS" target="https://datatracker.ietf.org/doc/draft-ietf-cbor-edn-literals/">
+        <front><title>Concise Diagnostic Notation (CDN)</title><author initials="C." surname="Bormann" fullname="Carsten Bormann"/><date year="2026" month="May"/></front>
+        <seriesInfo name="Internet-Draft" value="draft-ietf-cbor-edn-literals-25"/>
+      </reference>
+    </references>
+  </back>
+</rfc>

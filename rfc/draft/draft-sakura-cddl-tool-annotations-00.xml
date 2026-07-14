@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rfc version="3" ipr="trust200902" submissionType="IETF" category="info" docName="draft-sakura-cddl-tool-annotations-00">
+  <front>
+    <title abbrev="CDDL Tool Annotations">Namespaced Tool Annotations for CDDL</title>
+    <author fullname="Sakura Industries LLC" initials="SI" surname="LLC" role="editor"/>
+    <date year="2026" month="July" day="13"/>
+    <area>art</area>
+    <workgroup>CBOR</workgroup>
+    <keyword>CDDL</keyword>
+    <keyword>tool annotations</keyword>
+    <keyword>directives</keyword>
+    <abstract>
+      <t>This document defines a convention for tool-specific annotations in Concise Data Definition Language (CDDL) source. A standalone comment beginning with <tt>;@</tt> carries a namespace, a colon, and a tool directive. The namespace allows tools to add source-level behavior without requiring a central standards registry for every tool.</t>
+      <t>Tools ignore annotations in namespaces they do not understand, or warn about them according to their diagnostic policy. A tool that understands a namespace treats an unknown or unsupported directive in that namespace as an error. This convention is intentionally separate from user-facing documentation comments beginning with <tt>;!</tt> and from silent maintenance comments beginning with <tt>;</tt>.</t>
+    </abstract>
+  </front>
+  <middle>
+    <section anchor="intro" numbered="true">
+      <name>Introduction</name>
+      <t>CDDL source is often processed by more than one compiler, validator, renderer, documentation generator, or editor. These tools sometimes need source-level instructions that are not part of the CDDL data model and are not appropriate as user-facing documentation.</t>
+      <t>The <tt>;@</tt> convention provides a namespaced comment channel for those instructions. A tool can recognize its own namespace while safely preserving or ignoring annotations intended for another tool.</t>
+      <t>CDDL also defines module directives for importing and including definitions. In the current module draft <xref target="CDDL-MODULES"/>, those directives use standalone <tt>;#</tt> comment lines, such as <tt>;# import</tt> and <tt>;# include</tt>. They are a separate standardized comment channel and MUST NOT be interpreted as namespaced <tt>;@</tt> annotations. This document uses the spelling and syntax of the module draft; <tt>!#</tt> is not the module-directive marker defined there.</t>
+      <t>This document defines a convention, not a mandatory global registry. Individual tools document the directives in their own namespace and define their own directive semantics.</t>
+    </section>
+    <section anchor="conventions" numbered="true">
+      <name>Conventions and Terminology</name>
+      <t>The key words <strong>MUST</strong>, <strong>MUST NOT</strong>, <strong>REQUIRED</strong>, <strong>SHALL</strong>, <strong>SHALL NOT</strong>, <strong>SHOULD</strong>, <strong>SHOULD NOT</strong>, <strong>RECOMMENDED</strong>, <strong>NOT RECOMMENDED</strong>, <strong>MAY</strong>, and <strong>OPTIONAL</strong> in this document are to be interpreted as described in BCP 14 when, and only when, they appear in all capitals.</t>
+      <t>An <em>annotation line</em> is a standalone source line whose first non-whitespace characters are <tt>;@</tt>. A <em>namespace</em> identifies the tool or tool family that owns the annotation. A <em>directive</em> is the namespace-specific instruction following the colon.</t>
+      <t>An annotation is not CDDL data and MUST NOT change the CBOR values accepted by a schema except through behavior explicitly implemented by the tool that owns the namespace.</t>
+    </section>
+    <section anchor="syntax" numbered="true">
+      <name>Syntax</name>
+      <t>An annotation line has the following conceptual form:</t>
+      <artwork><![CDATA[
+optional-leading-whitespace ;@ namespace: directive [arguments]
+      ]]></artwork>
+      <t>The namespace is a tool-selected identifier. It is RECOMMENDED that a namespace contain only ASCII letters, digits, and hyphens, begin with a letter, and be treated case-sensitively unless the owning tool specifies otherwise.</t>
+      <t>At least one whitespace character SHOULD separate <tt>;@</tt> from the namespace and at least one whitespace character SHOULD separate the colon from the directive. Tools MAY accept more compact forms for compatibility, but producers SHOULD use the displayed form.</t>
+      <t>The directive and its arguments are opaque to tools that do not own the namespace. The namespace owner defines the grammar, scope, and semantics of its directives.</t>
+    </section>
+    <section anchor="position" numbered="true">
+      <name>Source Position and Scope</name>
+      <t>Only a standalone <tt>;@</tt> line is an annotation line. A <tt>;@</tt> sequence appearing after CDDL source on the same line is an ordinary trailing comment and MUST NOT apply a tool directive.</t>
+      <t>Unless the namespace owner defines a different scope, a standalone annotation applies to the next relevant CDDL item, definition, or module-level compilation context. Tools MUST document the scope of each directive they define.</t>
+      <t>Annotations may occur inside multi-line CDDL arrays, maps, and groups. Their scope is interpreted by the owning tool; the annotation itself remains a comment and is not part of the CDDL type expression.</t>
+      <t>Tools that do not understand the namespace MUST preserve the source text when rewriting or forwarding the CDDL document, unless they explicitly document a lossy transformation.</t>
+    </section>
+    <section anchor="unknown" numbered="true">
+      <name>Unknown and Unsupported Annotations</name>
+      <t>A tool that does not recognize a namespace MUST ignore its annotations for semantic processing. It MAY emit a warning, particularly when the user requests strict or portability diagnostics.</t>
+      <t>A tool that recognizes the namespace but does not recognize the directive MUST report an error. Silently ignoring a misspelled directive in an owned namespace can cause the author to believe that a requested behavior was applied when it was not.</t>
+      <t>A tool that recognizes the directive but cannot support it in the current mode or version MUST report an unsupported-directive error. The diagnostic SHOULD identify the namespace, directive, source location, and reason for lack of support.</t>
+      <t>A tool MAY provide a compatibility mode that downgrades unknown or unsupported owned directives to warnings, but that mode SHOULD be explicit and SHOULD be unsuitable for conformance checks.</t>
+    </section>
+    <section anchor="cbork" numbered="true">
+      <name>Example: CBORK Directives</name>
+      <t>CBORK uses the <tt>CBORK</tt> namespace for directives that control compilation, module exposure, and source interpretation. The following examples illustrate the convention:</t>
+      <artwork><![CDATA[
+;@ CBORK: Library
+;@ CBORK: Export
+;@ CBORK: Extern name-a, name-b
+      ]]></artwork>
+      <t><tt>Library</tt> marks the source as a reusable library. <tt>Export</tt> marks the next applicable definition as part of the library's public surface. <tt>Extern</tt> declares names supplied by an external source or later compilation context.</t>
+      <t>These meanings are CBORK-specific. Another CDDL tool that does not implement the <tt>CBORK</tt> namespace ignores the annotations or warns, but does not treat them as invalid CDDL.</t>
+      <t>CBORK reports an error for an unknown directive in its own namespace, for example:</t>
+      <artwork><![CDATA[
+;@ CBORK: Libray
+      ]]></artwork>
+      <t>The misspelling is not silently ignored because CBORK owns the namespace and the directive is not supported.</t>
+    </section>
+    <section anchor="relationship" numbered="true">
+      <name>Relationship to Other Comment Forms</name>
+      <t>The three comment forms have intentionally different audiences:</t>
+      <ul>
+        <li><tt>;</tt> introduces an ordinary comment, normally a silent maintenance note.</li>
+        <li><tt>;!</tt> introduces structured, user-facing documentation that can be rendered and attached to CDDL items.</li>
+        <li><tt>;#</tt> introduces a CDDL module import or include directive as specified by <xref target="CDDL-MODULES"/>.</li>
+        <li><tt>;@</tt> introduces a namespaced instruction for a particular tool.</li>
+      </ul>
+      <t>A <tt>;@</tt> annotation is not part of the Markdown documentation model. It MUST NOT be included as documentation prose merely because it appears between documentation lines. Similarly, a <tt>;!</tt> line is not a tool directive.</t>
+    </section>
+    <section anchor="implementation" numbered="true">
+      <name>Implementation Guidance</name>
+      <t>Parsers SHOULD preserve the complete annotation text and its source location even when the consuming tool does not recognize the namespace. A structured representation SHOULD include at least the namespace, directive, arguments, source location, and whether the annotation was standalone or trailing.</t>
+      <t>Tools SHOULD process annotations after lexical classification has established that the marker is standalone. This prevents a trailing marker from silently changing the meaning of a CDDL line.</t>
+      <t>Tools SHOULD make unknown-namespace warnings configurable and SHOULD make errors for unknown owned directives visible in normal validation or compilation output.</t>
+    </section>
+    <section anchor="security" numbered="true">
+      <name>Security Considerations</name>
+      <t>Tool annotations can change compilation, validation, or code-generation behavior. Build systems MUST ensure that annotations are reviewed and processed by the intended tool before relying on generated output.</t>
+      <t>Unknown namespaces must not be interpreted as trusted instructions merely because they use the <tt>;@</tt> marker. Tools should treat the namespace as an ownership boundary and apply only directives explicitly supported by that tool.</t>
+    </section>
+  </middle>
+  <back>
+    <references>
+      <name>References</name>
+      <reference anchor="CDDL-MODULES" target="https://datatracker.ietf.org/doc/html/draft-ietf-cbor-cddl-modules-06">
+        <front><title>CDDL Module Structure</title><author initials="C." surname="Bormann" fullname="Carsten Bormann"/><author initials="B." surname="Moran" fullname="Barry Moran"/><date year="2026" month="March"/></front>
+        <seriesInfo name="Internet-Draft" value="draft-ietf-cbor-cddl-modules-06"/>
+      </reference>
+    </references>
+    <section anchor="iana-considerations">
+      <name>IANA Considerations</name>
+      <t>This document has no IANA actions. Namespaces are not registered by this convention; tools and tool communities select and document their own namespaces.</t>
+    </section>
+  </back>
+</rfc>
