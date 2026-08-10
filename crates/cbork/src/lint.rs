@@ -1097,9 +1097,10 @@ mod tests {
     /// Yes it can panic, which is why its only for tests
     fn repo_root() -> PathBuf {
         #[allow(clippy::expect_used, reason = "Allowed in tests")]
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
+        std::env::current_dir()
+            .expect("test working directory")
+            .ancestors()
+            .find(|path| path.join("Cargo.toml").is_file() && path.join("cddl").is_dir())
             .expect("workspace root")
             .to_path_buf()
     }

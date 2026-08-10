@@ -60,8 +60,8 @@ cbork validate --detailed schemas/message.cddl test/vectors/message-bad.cbor
 
 <!-- rumdl-enable MD040 -->
 
-`decode` answers "what bytes did the encoder produce?"
-`validate --detailed` answers "where do those bytes disagree with the schema?"
+`decode` answers "what bytes did the encoder produce?" `validate --detailed` answers "where do those bytes disagree with the
+schema?"
 
 ## Positive and negative vectors
 

@@ -18,7 +18,10 @@ use cbork_cddl_parser::{modules::Directive as ParserDirective, parse_cddl, parse
 use crate::{
     MetaData, WrappedNode,
     error::{CompileError, Diagnostic},
-    finalize::{detect_unreferenced_top_level_definitions, finalize_compiled},
+    finalize::{
+        detect_elidable_self_references, detect_unreferenced_top_level_definitions,
+        finalize_compiled,
+    },
     generic::expand_generics,
     marker::{collect_marker_misuse, is_trailing_marker_comment},
     preprocessor::{inject_directives, process_ast},
@@ -149,6 +152,7 @@ impl CompiledCDDL {
         }
         resolve_includes(&mut compiled, &mut visited)?;
         detect_unreferenced_top_level_definitions(&mut compiled);
+        detect_elidable_self_references(&mut compiled);
 
         expand_generics(&mut compiled.user_nodes, &mut compiled.warnings);
 

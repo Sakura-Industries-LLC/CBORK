@@ -991,6 +991,8 @@ mod tests {
             type_plugs: std::collections::HashMap::new(),
             cache: crate::resolver_cache::ResolverCache::default(),
             referenced_names: std::collections::HashSet::new(),
+            recursive_symbols: std::collections::HashSet::new(),
+            elidable_self: std::collections::HashSet::new(),
             render_diagnostics: std::cell::RefCell::new(Vec::new()),
         };
         let diff = build_schema_diff(&lhs, &rhs, &[], &resolution);

@@ -305,6 +305,7 @@ dtrmseq
 dtype
 eeff
 elems
+elidable
 epidictic
 eplace
 erge
@@ -541,6 +542,7 @@ standardised
 startrawdelim
 stdlib
 streamstring
+strongconnect
 subdiag
 subdiagnostic
 subdiagnostics

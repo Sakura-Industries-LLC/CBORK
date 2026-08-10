@@ -20,9 +20,10 @@ use cbork_cddl_compiler::{CompiledCDDL, Subdiag, SubdiagKind, dump_tree};
 /// Yes it can panic, which is why its only for tests
 fn repo_root() -> PathBuf {
     #[allow(clippy::expect_used, reason = "Allowed in tests")]
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
+    std::env::current_dir()
+        .expect("test working directory")
+        .ancestors()
+        .find(|path| path.join("Cargo.toml").is_file() && path.join("cddl").is_dir())
         .expect("workspace root")
         .to_path_buf()
 }
@@ -1325,8 +1326,9 @@ fn bug_018_imported_generic_within_namespace_resolution_vector() {
          got: {e030:#?}"
     );
     // The renderer inlines the resolved `cose.COSE_Encrypt0` body in
-    // the EFFECTIVE RHS subdiag.  The presence of `empty_or_serialized_map`
-    // and `header_map` (both reached transitively through `cose.Headers`)
+    // the EFFECTIVE RHS subdiag.  The presence of the expanded
+    // Headers body (with `protected`, `unprotected`, and the
+    // concrete COSE header label entries `1 =>`, `2 =>`, etc.)
     // proves the namespace resolution chain succeeded.
     let rhs_snippet = e030
         .related
@@ -1335,7 +1337,9 @@ fn bug_018_imported_generic_within_namespace_resolution_vector() {
         .map(|s| s.snippet.as_str())
         .expect("E030 must carry an RHS subdiag");
     assert!(
-        rhs_snippet.contains("empty_or_serialized_map") && rhs_snippet.contains("header_map"),
+        rhs_snippet.contains("protected:")
+            && rhs_snippet.contains("unprotected:")
+            && rhs_snippet.contains("ciphertext:"),
         "BUG-018 regression: RHS subdiag must be the inlined cose.COSE_Encrypt0 body, proving \
          the namespace resolution succeeded; got snippet:\n{rhs_snippet}"
     );

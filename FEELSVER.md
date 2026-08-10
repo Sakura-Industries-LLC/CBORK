@@ -132,8 +132,7 @@ Automated version-bumping tools (conventional commits, release-please, changelog
 SemVer, not worse.
 
 Under SemVer, these tools must forensically classify every commit as fix/feat/breaking,
-and the maintainer must then audit the tool's suggestions against the "was this *really* an API boundary change?"
-question.
+and the maintainer must then audit the tool's suggestions against the "was this *really* an API boundary change?" question.
 A commit tagged `feat!` because someone rewrote a CLI flag is technically not an API change at all.
 A commit tagged `fix` because someone bumped the minimum compiler version by two years has changed nothing public
 but will shatter CI pipelines.

@@ -175,7 +175,8 @@ impl fmt::Display for ByteLiteralBytes {
         &self,
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        write!(f, "{:?}", self.0)
+        // Render as a CDDL byte-string literal (`h'...'`, lowercase hex).
+        write!(f, "h'{}'", hex::encode(self.as_ref()))
     }
 }
 

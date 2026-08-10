@@ -46,7 +46,7 @@ mod within;
 pub use compiled::{CompiledCDDL, dump_tree};
 pub use concrete::{
     Concrete, ConcretePolicy, Line, LineKind, ResolutionMap, TargetSide, build_resolution,
-    file_is_library, render_cddl, render_subtree, render_to_string,
+    render_cddl, render_subtree, render_to_string,
 };
 pub use ctlop::{child_text, resolve_type2_leaf, validate_ctlop_semantics};
 pub use doc_block::{DocBinding, DocBlock, DocLine, DocScan, doc_block_range, scan_doc_blocks};

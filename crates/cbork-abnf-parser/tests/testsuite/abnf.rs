@@ -48,7 +48,7 @@ fn parse_abnf_files() {
 
         let result = parse_abnf(&content);
 
-        assert!(result.is_err(), "{:?} is expected to fail", &file_path);
+        assert!(result.is_err(), "{file_path:?} is expected to fail");
     }
 
     // summary

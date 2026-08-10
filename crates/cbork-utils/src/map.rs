@@ -532,7 +532,7 @@ mod tests {
         // "AA" comes before "AB" lexicographically
         assert!(key_a < key_b);
         assert!(key_b > key_a);
-        assert!(key_a == key_a);
+        assert_eq!(key_a, key_a);
 
         // Test 3: Identical entries (same key AND value)
         // Complete MapEntry equality requires both key and value to be identical

@@ -64,25 +64,101 @@ pub fn inject_directives(
     pairs: &[Pair<'_, cddl::Rule>],
     source_text: &str,
 ) -> anyhow::Result<Vec<WrappedNode>> {
+    // The pairs may come from a different input than `source_text`
+    // (the postlude is injected with an empty source string); the
+    // cursor must scan the pairs' actual input to stay in bounds.
+    let input = pairs.first().map_or("", |pair| pair.as_span().get_input());
+    let mut cursor = LineColCursor::new(input);
     let nodes = build_nodes(
         source_path,
         pairs
             .iter()
             .filter(|pair| matches!(pair.as_rule(), cddl::Rule::line | cddl::Rule::COMMENT))
             .cloned(),
+        &mut cursor,
     )?;
     inject_directives_into_nodes(nodes, source_text)
+}
+
+/// Tracks line/column positions while walking pest pairs in source
+/// order.
+///
+/// pest's `Position::line_col()` is O(position) per call, which makes
+/// node construction quadratic for large inputs (a deeply nested
+/// 94 KB schema took ~3 s in `build_nodes`). Walking the source forward
+/// once, byte by byte, computes every line/column in O(n) total with
+/// the same semantics as pest (CRLF counts as one newline; columns
+/// count characters).
+/// Walks the source forward while pest pairs are consumed in source
+/// order, computing (line, column) for every node start in O(n) total.
+struct LineColCursor<'a> {
+    /// The full input the pairs were parsed from.
+    source: &'a str,
+    /// Byte offset the cursor has advanced to.
+    pos: usize,
+    /// 1-based line at `pos`.
+    line: usize,
+    /// 1-based column at `pos`.
+    column: usize,
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::string_slice,
+    reason = "Counters track a single forward pass; `target` is a char boundary from pest"
+)]
+impl<'a> LineColCursor<'a> {
+    /// Create a cursor at the start of `source`.
+    fn new(source: &'a str) -> Self {
+        Self {
+            source,
+            pos: 0,
+            line: 1,
+            column: 1,
+        }
+    }
+
+    /// Advance to `target` (a char boundary) and return its 1-based
+    /// (line, column).
+    fn advance_to(
+        &mut self,
+        target: usize,
+    ) -> (usize, usize) {
+        let slice = &self.source[self.pos..target];
+        let mut chars = slice.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\r' => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                        self.line += 1;
+                        self.column = 1;
+                    } else {
+                        self.column += 1;
+                    }
+                },
+                '\n' => {
+                    self.line += 1;
+                    self.column = 1;
+                },
+                _ => self.column += 1,
+            }
+        }
+        self.pos = target;
+        (self.line, self.column)
+    }
 }
 
 /// Build a recursive `RuleLine` node from a top-level `line` pair.
 fn build_line_node(
     source_path: &std::path::Path,
     pair: Pair<'_, cddl::Rule>,
+    cursor: &mut LineColCursor<'_>,
 ) -> anyhow::Result<WrappedNode> {
     let span = pair.as_span();
-    let (line, column) = span.start_pos().line_col();
+    let (line, column) = cursor.advance_to(span.start());
     let text = pair.as_str().to_owned();
-    let children = build_children(source_path, pair.into_inner())?;
+    let children = build_children(source_path, pair.into_inner(), cursor)?;
 
     Ok(WrappedNode::RuleLine {
         text,
@@ -97,13 +173,14 @@ fn build_line_node(
 fn build_nodes<'a, I>(
     source_path: &std::path::Path,
     pairs: I,
+    cursor: &mut LineColCursor<'_>,
 ) -> anyhow::Result<Vec<WrappedNode>>
 where
     I: IntoIterator<Item = Pair<'a, cddl::Rule>>,
 {
     pairs
         .into_iter()
-        .map(|pair| build_node(source_path, pair))
+        .map(|pair| build_node(source_path, pair, cursor))
         .collect()
 }
 
@@ -111,22 +188,24 @@ where
 fn build_children(
     source_path: &std::path::Path,
     pairs: pest::iterators::Pairs<'_, cddl::Rule>,
+    cursor: &mut LineColCursor<'_>,
 ) -> anyhow::Result<Vec<WrappedNode>> {
-    build_nodes(source_path, pairs)
+    build_nodes(source_path, pairs, cursor)
 }
 
 /// Convert a single nested pest pair into a wrapped node.
 fn build_node(
     source_path: &std::path::Path,
     pair: Pair<'_, cddl::Rule>,
+    cursor: &mut LineColCursor<'_>,
 ) -> anyhow::Result<WrappedNode> {
     let rule = pair.as_rule();
     let span = pair.as_span();
-    let (line, column) = span.start_pos().line_col();
+    let (line, column) = cursor.advance_to(span.start());
     let text = pair.as_str().to_owned();
 
     Ok(match rule {
-        cddl::Rule::line => build_line_node(source_path, pair)?,
+        cddl::Rule::line => build_line_node(source_path, pair, cursor)?,
         cddl::Rule::COMMENT => {
             WrappedNode::Comment {
                 text,
@@ -141,7 +220,7 @@ fn build_node(
                 text,
                 span: span.start()..span.end(),
                 origin: SourceOrigin::new(source_path.to_path_buf(), line, column),
-                children: build_children(source_path, pair.into_inner())?,
+                children: build_children(source_path, pair.into_inner(), cursor)?,
                 metadata: Vec::new(),
             }
         },

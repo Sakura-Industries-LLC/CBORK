@@ -12,7 +12,7 @@
 //! constants folded, structural types inlined, and socket/group
 //! plug augmentations inlined into the maps that use them.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use cbork_cddl_compiler::{CompiledCDDL, build_resolution, render_to_string};
 
@@ -23,9 +23,10 @@ use cbork_cddl_compiler::{CompiledCDDL, build_resolution, render_to_string};
 /// Yes it can panic, which is why its only for tests
 fn repo_root() -> PathBuf {
     #[allow(clippy::expect_used, reason = "Allowed in tests")]
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
+    std::env::current_dir()
+        .expect("test working directory")
+        .ancestors()
+        .find(|path| path.join("Cargo.toml").is_file() && path.join("cddl").is_dir())
         .expect("workspace root")
         .to_path_buf()
 }
@@ -48,15 +49,6 @@ fn render_concrete(compiled: &CompiledCDDL) -> String {
         &compiled.complete_nodes,
         &res,
         &cbork_cddl_compiler::ConcretePolicy::for_render(),
-    )
-}
-
-fn render_library(compiled: &CompiledCDDL) -> String {
-    let res = build_resolution(&compiled.complete_nodes);
-    render_to_string(
-        &compiled.complete_nodes,
-        &res,
-        &cbork_cddl_compiler::ConcretePolicy::for_render().with_library(true),
     )
 }
 
@@ -83,25 +75,261 @@ fn render_concrete_fold_vector() {
 }
 
 #[test]
-fn render_library_preserves_constants() {
-    // Library mode (the `;@ CBORK: Library` directive triggers it
-    // automatically) should keep the named constant definitions
-    // verbatim so a downstream file can re-include them.
+fn render_library_folds_unreachable_constants() {
+    // Library-preserving rendering was removed: a `;@ CBORK: Library`
+    // schema renders like any other schema, folding named constants
+    // into their use sites instead of keeping them verbatim.
     let compiled = compile("cddl/vectors/project/positive/render_library_preserves_constants.cddl");
-    let cddl = render_library(&compiled);
+    let cddl = render_concrete(&compiled);
     assert!(
-        cddl.contains("cose-alg = 1"),
-        "expected cose-alg to be preserved in library mode:\n{cddl}"
+        !cddl.contains("cose-alg = 1"),
+        "unreachable constant should be folded, not preserved:\n{cddl}"
     );
     assert!(
-        cddl.contains("A256GCM = 3"),
-        "expected A256GCM to be preserved in library mode:\n{cddl}"
+        !cddl.contains("A256GCM = 3"),
+        "unreachable constant should be folded, not preserved:\n{cddl}"
+    );
+}
+
+#[test]
+fn render_rfc8610_emits_only_reachable_concrete_cddl() {
+    // Regression for plan-021: rendering a `;@ CBORK: Library` schema
+    // must not retain unreachable library definitions. Only the root
+    // rule and its reachable closure may be emitted, so the result
+    // lints clean and round-trips unchanged.
+    let compiled = compile("cddl/rfc-std/rfc8610.cddl");
+    let policy = cbork_cddl_compiler::ConcretePolicy::for_render().with_comments(false);
+    let res = build_resolution(&compiled.complete_nodes);
+    let cddl = render_to_string(&compiled.complete_nodes, &res, &policy);
+
+    // Library helpers that are only reachable via inlining must not be
+    // emitted as separate top-level definitions. The `uuidv4-abnf`
+    // family is the exception: the `.abnfb` ctlop operands reference
+    // them symbolically (a ctlop expression cannot be inlined into a
+    // ctlop operand), so they are legitimately retained.
+    for name in ["buuid", "buuid-all", "buuidv4"] {
+        assert!(
+            !cddl
+                .lines()
+                .any(|line| line.starts_with(name) && line.contains('=')),
+            "unreachable library definition `{name}` retained:\n{cddl}"
+        );
+    }
+    assert!(
+        cddl.lines().any(|line| line.starts_with("uuidv4-abnf =")),
+        "`uuidv4-abnf` must be retained for the symbolic `.abnfb` operand:\n{cddl}"
+    );
+    assert!(
+        cddl.contains(".abnfb uuidv4-abnf"),
+        "the `.abnfb` ctlop operand must stay symbolic:\n{cddl}"
+    );
+
+    // The result must lint clean: recompiling it yields no E020.
+    let second = compile_vec("rfc8610_roundtrip", &cddl);
+    assert!(
+        !second
+            .warnings
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E020"),
+        "rendered rfc8610 must lint clean:\n{}",
+        second
+            .warnings
+            .iter()
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // And a second render pass must be byte-identical.
+    let second_res = build_resolution(&second.complete_nodes);
+    let rerendered = render_to_string(&second.complete_nodes, &second_res, &policy);
+    assert_eq!(
+        cddl, rerendered,
+        "render output must be stable after a second parse/render pass"
+    );
+}
+
+#[test]
+fn render_rfc8727_cycle_aware_and_self_contained() {
+    // Regression for plan-021 item 2: IODEF (rfc8727) has six mutually
+    // recursive definitions. Rendering must not expand them (the naive
+    // expansion blew up to ~83k lines): references to recursive
+    // component members stay symbolic, their definitions are retained
+    // exactly once, acyclic content is fully inlined, and the output
+    // lints clean and round-trips byte-identically.
+    let compiled = compile("cddl/rfc-std/rfc8727.cddl");
+    let policy = cbork_cddl_compiler::ConcretePolicy::for_render().with_comments(false);
+    let res = build_resolution(&compiled.complete_nodes);
+    let cddl = render_to_string(&compiled.complete_nodes, &res, &policy);
+
+    // The recursive cluster is retained exactly once per member, and
+    // references to the members stay symbolic (`+ Contact`).
+    for name in [
+        "Incident",
+        "Contact",
+        "EventData",
+        "Indicator",
+        "Observable",
+    ] {
+        assert_eq!(
+            cddl.matches(&format!("{name} =")).count(),
+            1,
+            "recursive definition `{name}` must be retained exactly once:\n{cddl}"
+        );
+        assert!(
+            cddl.contains(&format!("+ {name}")),
+            "recursive reference `+ {name}` must stay symbolic:\n{cddl}"
+        );
+    }
+
+    // No re-expansion blowup: the rendered document stays bounded.
+    assert!(
+        cddl.lines().count() < 2000,
+        "rendered rfc8727 must stay bounded (got {} lines):\n{cddl}",
+        cddl.lines().count()
+    );
+
+    // Acyclic content is concrete: member keys fold and the `lang`
+    // choice renders as a real choice, not the old `[ ]` corruption.
+    // The ctlop arm is parenthesized (ctlops have no order of
+    // evaluation).
+    assert!(
+        cddl.contains("? -23 => (\"\" / (text .regexp"),
+        "member keys must fold and `lang` must render as a choice:\n{cddl}"
+    );
+    assert!(
+        !cddl.contains("? iodef-lang =>"),
+        "`iodef-lang` key must be folded to its constant:\n{cddl}"
+    );
+
+    // Self-contained: recompiling the output yields no E016/E020.
+    let second = compile_vec("rfc8727_roundtrip", &cddl);
+    assert!(
+        !second
+            .warnings
+            .iter()
+            .any(|d| d.code == "E016" || d.code == "E020"),
+        "rendered rfc8727 must lint clean:\n{}",
+        second
+            .warnings
+            .iter()
+            .map(|d| format!("{} {}", d.code, d.message))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // Byte-identical second render pass.
+    let second_res = build_resolution(&second.complete_nodes);
+    let rerendered = render_to_string(&second.complete_nodes, &second_res, &policy);
+    assert_eq!(
+        cddl, rerendered,
+        "render output must be stable after a second parse/render pass"
+    );
+}
+
+#[test]
+fn render_rfc8990_within_preserves_operands_and_ranges() {
+    // Regression for plan-021 item 3: GRASP (rfc8990) puts a type plug
+    // (`message`, extended with `/=`) on the LHS of a `.within` and uses
+    // ranges (`MESSAGE_TYPE = 0..255`) inside the constraint. The render
+    // must preserve both: ranges must not collapse to their lower bound,
+    // the within-LHS plug must stay symbolic (inlining it changes how
+    // the within-checker evaluates the constraint), type-augment rules
+    // must be emitted concretely, and the output must lint clean and
+    // round-trip byte-identically.
+    let compiled = compile("cddl/rfc-std/rfc8990-cleaned.cddl");
+    let policy = cbork_cddl_compiler::ConcretePolicy::for_render().with_comments(false);
+    let res = build_resolution(&compiled.complete_nodes);
+    let cddl = render_to_string(&compiled.complete_nodes, &res, &policy);
+
+    // The within-LHS plug stays symbolic and its augment lines are
+    // emitted concretely. The within-arm is parenthesized (a ctlop
+    // expression in a choice must be braced).
+    assert!(
+        cddl.contains("rfc8990 = (message .within"),
+        "within-LHS plug must stay symbolic:\n{cddl}"
+    );
+    assert!(
+        cddl.lines().any(|l| l.starts_with("message /= [")),
+        "type-augment rules must be emitted concretely:\n{cddl}"
+    );
+
+    // Ranges survive (no collapse to the lower bound).
+    assert!(
+        cddl.contains("0 .. 255") && cddl.contains("0 .. 4294967295"),
+        "ranges must not collapse to their lower bound:\n{cddl}"
+    );
+
+    // Self-contained: recompiling the output yields no E016/E020/E030.
+    let second = compile_vec("rfc8990_roundtrip", &cddl);
+    assert!(
+        !second
+            .warnings
+            .iter()
+            .any(|d| d.code == "E016" || d.code == "E020" || d.code == "E030"),
+        "rendered rfc8990 must lint clean:\n{}",
+        second
+            .warnings
+            .iter()
+            .map(|d| format!("{} {}", d.code, d.message))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // Byte-identical second render pass.
+    let second_res = build_resolution(&second.complete_nodes);
+    let rerendered = render_to_string(&second.complete_nodes, &second_res, &policy);
+    assert_eq!(
+        cddl, rerendered,
+        "render output must be stable after a second parse/render pass"
+    );
+}
+
+#[test]
+fn render_rfc9052_parenthesizes_choice_member_keys() {
+    // Regression for plan-021 item 4: a member key that renders as a
+    // top-level choice must be parenthesized (`* (int / tstr) => any`).
+    // Without the parens the `/` is parsed as a group choice and the
+    // emitted CDDL is ambiguous (a parse error). The render must be
+    // lint-clean and round-trip byte-identically.
+    let compiled = compile("cddl/rfc-std/rfc9052.cddl");
+    let policy = cbork_cddl_compiler::ConcretePolicy::for_render().with_comments(false);
+    let res = build_resolution(&compiled.complete_nodes);
+    let cddl = render_to_string(&compiled.complete_nodes, &res, &policy);
+
+    // The inlined `label` (int / tstr) catch-all key keeps its parens.
+    assert!(
+        cddl.contains("* (int / tstr) => any"),
+        "choice member keys must stay parenthesized:\n{cddl}"
+    );
+
+    // Self-contained: recompiling the output yields no diagnostics.
+    let second = compile_vec("rfc9052_roundtrip", &cddl);
+    assert!(
+        !second
+            .warnings
+            .iter()
+            .any(|d| d.code == "E016" || d.code == "E020" || d.code == "E030"),
+        "rendered rfc9052 must lint clean:\n{}",
+        second
+            .warnings
+            .iter()
+            .map(|d| format!("{} {}", d.code, d.message))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // Byte-identical second render pass.
+    let second_res = build_resolution(&second.complete_nodes);
+    let rerendered = render_to_string(&second.complete_nodes, &second_res, &policy);
+    assert_eq!(
+        cddl, rerendered,
+        "render output must be stable after a second parse/render pass"
     );
 }
 
 #[test]
 fn render_complex_structure() {
-    // In concrete mode only the first top-level rule is emitted.
     // The named type references `bstr` and `int` are folded to their
     // CBOR tag equivalents (#2 and #0/#1) inside the rendered rule.
     // The `.size` ctlop, the `32` bound, and the choice `/` all
@@ -196,6 +424,73 @@ fn render_folds_named_constants_in_group_keys_and_values() {
 }
 
 #[test]
+#[allow(
+    clippy::string_slice,
+    reason = "The comment scanner slices only at char_indices boundaries"
+)]
+fn render_groups_inlined_member_rhs_choices() {
+    let src = "i2p-location = ( h'1726cf46 2c66 4914 b8ec 205e6dc22dee' => i2p-address / [ +i2p-address ] ) \
+        i2p-address = bytes .size 32 / bytes .size 35 / bytes\n";
+    let compiled = compile_vec("render_member_rhs_choice", src);
+    let rendered = render_concrete(&compiled);
+    assert!(
+        rendered.contains("=> ((bytes .size 32) / (bytes .size 35) / bytes / [+ ((bytes .size 32) / (bytes .size 35) / bytes) ])")
+            && rendered.contains("[+ ((bytes .size 32) / (bytes .size 35) / bytes) ]"),
+        "inlined member RHS choices must remain bound to `=>` with braced ctlop arms:\n{rendered}"
+    );
+
+    let second_pass = compile_vec("render_member_rhs_choice_second_pass", &rendered);
+    let rerendered = render_concrete(&second_pass);
+    // The first pass keeps the source's parenthesized arm nesting; the
+    // second pass normalizes it. Assert the converged (second-pass)
+    // form is stable from then on.
+    let third_pass = compile_vec("render_member_rhs_choice_third_pass", &rerendered);
+    let third_pass_render = render_concrete(&third_pass);
+    let without_comments = |text: &str| {
+        text.lines()
+            .map(|line| {
+                let mut in_single = false;
+                let mut in_double = false;
+                let mut escaped = false;
+                let end = line
+                    .char_indices()
+                    .find_map(|(index, character)| {
+                        if in_double {
+                            if escaped {
+                                escaped = false;
+                            } else if character == '\\' {
+                                escaped = true;
+                            } else if character == '"' {
+                                in_double = false;
+                            }
+                        } else if in_single {
+                            if character == '\'' {
+                                in_single = false;
+                            }
+                        } else if character == '"' {
+                            in_double = true;
+                        } else if character == '\'' {
+                            in_single = true;
+                        } else if character == ';' {
+                            return Some(index);
+                        }
+                        None
+                    })
+                    .unwrap_or(line.len());
+                line[..end].trim_end()
+            })
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(
+        without_comments(&rerendered),
+        without_comments(&third_pass_render),
+        "render output must be stable after the second parse/render pass"
+    );
+}
+
+#[test]
 fn render_inlines_structural_type_references() {
     // A reference to a structural type should be inlined into the
     // rule that uses it. Put the referencing rule first so concrete
@@ -280,11 +575,11 @@ fn render_pqsig_fixture_keeps_nested_effective_view_indented() {
     let compiled = compile("test/pqsig/doc/pqsig.cddl");
     let cddl = render_concrete(&compiled);
     assert!(
-        cddl.contains("pq-hybrid = any .dtrm (\n  #6.33000([\n      0,"),
+        cddl.contains("pq-hybrid = any .dtrm (\n  #6.33000(([\n        0, ; from signature"),
         "expected tagged array contents to stay nested:\n{cddl}"
     );
     assert!(
-        cddl.contains("] / [ ; from pq-hybrid-sig-generic"),
+        cddl.contains("]) / ([ ; from pq-hybrid-sig-generic"),
         "expected choice separator before provenance comment:\n{cddl}"
     );
     assert!(
@@ -303,9 +598,13 @@ fn render_generic_within_substitutes_occurrence_params() {
         "cddl/vectors/project/positive/valid_generic_within_substitutes_occurrence_params.cddl",
     );
     let cddl = render_concrete(&compiled);
+    // The occurrence parameter is substituted with the concrete name
+    // (`Null-COSE-Signature`), which resolves to its definition (an
+    // empty array) and is inlined: `+ Null-COSE-Signature` becomes
+    // `+ [ ]`.
     assert!(
-        cddl.contains("signatures: [\n    + Null-COSE-Signature\n  ]"),
-        "expected occurrence parameter to be substituted:\n{cddl}"
+        cddl.contains("signatures: [\n    + [ ]\n  ]"),
+        "expected occurrence parameter to be substituted and inlined:\n{cddl}"
     );
     assert!(
         !cddl.contains("headers")

@@ -192,7 +192,21 @@ impl fmt::Display for TextLiteralBytes {
         &self,
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        write!(f, "{:?}", self.0)
+        // Render as a CDDL text literal. The raw bytes are emitted with
+        // JSON-style escaping, which CDDL strings share (RFC 8610 §4.2).
+        write!(f, "\"")?;
+        for &b in &self.0 {
+            match b {
+                b'"' => write!(f, "\\\"")?,
+                b'\\' => write!(f, "\\\\")?,
+                b'\n' => write!(f, "\\n")?,
+                b'\r' => write!(f, "\\r")?,
+                b'\t' => write!(f, "\\t")?,
+                0x20..=0x7E => write!(f, "{}", b as char)?,
+                _ => write!(f, "\\u{{{b:x}}}")?,
+            }
+        }
+        write!(f, "\"")
     }
 }
 

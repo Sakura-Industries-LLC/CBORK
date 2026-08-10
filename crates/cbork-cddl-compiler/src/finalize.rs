@@ -1249,14 +1249,11 @@ fn bare_typename_in_grpent(children: &[WrappedNode]) -> Option<String> {
                 return None;
             },
             WrappedNode::Syntax { rule, .. } if rule == "type" => {
-                if let Some(name) = single_typename_in_type(child) {
-                    if typename.is_some() && typename.as_deref() != Some(name.as_str()) {
-                        return None;
-                    }
-                    typename = Some(name);
-                } else {
+                let name = single_typename_in_type(child)?;
+                if typename.is_some() && typename.as_deref() != Some(name.as_str()) {
                     return None;
                 }
+                typename = Some(name);
             },
             _ => {},
         }
@@ -1673,6 +1670,16 @@ fn collect_named_import_non_prunable_definition_names(
     let is_prunable = inherited_prunable
         || node.metadata().contains(&MetaData::Prunable)
         || (node_name.is_some() && !selected_by_import);
+
+    // A named import of a socket (for example `$$service-data`) selects
+    // the augmentation rule, whose RHS names the concrete plug body.  That
+    // RHS is the dependency that must remain reachable even though the
+    // augmentation is not itself a normal definition root.
+    if selected_by_import && let WrappedNode::RuleLine { .. } = node {
+        let mut references = HashSet::new();
+        collect_rhs_references(node, &mut references);
+        names.extend(references);
+    }
 
     match node {
         WrappedNode::RuleLine { children, .. }
@@ -2959,6 +2966,68 @@ struct RetainedDefinition {
 /// imported without an alias, but the consumer's direct surface
 /// does not reference either root, so the plain-vs-generic collision
 /// is not actionable.
+/// Detect definitions whose RHS top-level choice contains a provably
+/// bare self-arm together with at least one other arm
+/// (`x = x / int`). The self-arm contributes no structure and the
+/// concrete renderer elides it, so the source should be simplified;
+/// emit a warning (`E031`) so authors can fix the definition.
+pub(crate) fn detect_elidable_self_references(compiled: &mut CompiledCDDL) {
+    let mut warnings = Vec::new();
+    for node in &compiled.user_nodes {
+        let WrappedNode::RuleLine {
+            children,
+            origin,
+            span,
+            ..
+        } = node
+        else {
+            continue;
+        };
+        let Some(head) = rule_head_from_children(children) else {
+            continue;
+        };
+        if head.assignment != AssignmentKind::Define {
+            continue;
+        }
+        let Some(rhs) = crate::concrete::find_rhs(children) else {
+            continue;
+        };
+        let WrappedNode::Syntax { children: tc, .. } = rhs else {
+            continue;
+        };
+        if crate::concrete::syntax_rule(rhs) != Some("type") {
+            continue;
+        }
+        let arms: Vec<&WrappedNode> = tc
+            .iter()
+            .filter(|c| matches!(c, WrappedNode::Syntax { rule, .. } if rule == "type1"))
+            .collect();
+        if arms.len() < 2 {
+            continue;
+        }
+        if arms.iter().any(|arm| {
+            crate::concrete::arm_is_bare_name(arm).as_deref() == Some(head.name.as_str())
+        }) {
+            warnings.push(Diagnostic {
+                code: "E031",
+                level: DiagnosticLevel::Warning,
+                message: format!(
+                    "self-referential choice arm `{}` in `{} = ...` is redundant: the reference is unguarded (it adds no structure) and the renderer elides it",
+                    head.name, head.name
+                ),
+                source_file: Some(origin.source_path.clone()),
+                span: Some(span.clone()),
+                previous_origin: None,
+                related: Vec::new(),
+            });
+        }
+    }
+    compiled.warnings.extend(warnings);
+}
+
+/// Drop plain-vs-generic definition collisions where the pair is not
+/// actionable (the consumer's direct surface does not reference either
+/// side; see the doc comment on the caller).
 pub(crate) fn detect_plain_generic_collisions(
     nodes: &[WrappedNode],
     warnings: &mut Vec<crate::Diagnostic>,

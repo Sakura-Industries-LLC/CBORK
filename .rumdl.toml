@@ -72,6 +72,7 @@ punctuation = ".,;:!?。，；：！？"
 style = "consistent"
 allowed-languages = []
 unknown-language-action = "error"
+custom-languages = ["cddl"]
 
 [MD043]
 headings = ["+"]

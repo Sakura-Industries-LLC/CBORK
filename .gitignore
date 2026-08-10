@@ -43,3 +43,5 @@ tools/target/
 .cache/
 extension/zed/grammars/
 __pycache__
+tmp/
+.moon/workspace-cache/

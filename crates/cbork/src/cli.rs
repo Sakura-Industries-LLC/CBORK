@@ -620,9 +620,9 @@ stub_command!(Lsp, "Start the CDDL language server.");
 #[bpaf(command)]
 #[allow(clippy::struct_excessive_bools)]
 struct Render {
-    /// Preserve library exports and named constants instead of folding them away.
-    #[bpaf(long)]
-    library: bool,
+    /// Suppress source and provenance comments for machine-readable output.
+    #[bpaf(long("no-comments"))]
+    no_comments: bool,
 
     /// Emit the effective CDDL as a JSON string for tools and scripts.
     #[bpaf(long)]
@@ -636,7 +636,7 @@ struct Render {
 impl Render {
     /// Execute the render command.
     fn exec(self) -> bool {
-        render::exec(&self.path, self.library, self.json)
+        render::exec(&self.path, self.json, self.no_comments)
     }
 }
 

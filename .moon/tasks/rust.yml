@@ -21,13 +21,13 @@ tasks:
     command: "cargo"
     args:
       - "deny"
+      - "--config"
+      - "deny.toml"
       - "--manifest-path"
       - "$projectRoot/Cargo.toml"
       - "check"
       - "licenses"
       - "bans"
-      - "-c"
-      - "deny.toml"
     options:
       runFromWorkspaceRoot: true
       runInCI: true
@@ -41,7 +41,7 @@ tasks:
     command: "bash"
     args:
       - "-c"
-      - 'cargo deny --manifest-path "$projectRoot/Cargo.toml" check advisories -c deny.toml || true'
+      - 'cargo deny --config deny.toml --manifest-path "$projectRoot/Cargo.toml" check advisories || true'
     options:
       cache: false
       runFromWorkspaceRoot: true
@@ -124,6 +124,7 @@ tasks:
     args:
       - "nextest"
       - "run"
+      - "--release"
     options:
       runInCI: true
     inputs:
