@@ -52,6 +52,22 @@ fn render_concrete(compiled: &CompiledCDDL) -> String {
     )
 }
 
+/// Render and canonicalize exactly as the `cbork render` CLI does:
+/// the structural formatter owns presentation, so the byte-stability
+/// contract of a render round-trip is asserted on the formatted text.
+fn render_formatted(
+    compiled: &CompiledCDDL,
+    comments: bool,
+) -> String {
+    let res = build_resolution(&compiled.complete_nodes);
+    let raw = render_to_string(
+        &compiled.complete_nodes,
+        &res,
+        &cbork_cddl_compiler::ConcretePolicy::for_render().with_comments(comments),
+    );
+    cbork_cddl_compiler::pretty_print(&raw)
+}
+
 #[test]
 fn render_concrete_fold_vector() {
     // In concrete mode, only the first top-level rule is emitted. The
@@ -98,9 +114,7 @@ fn render_rfc8610_emits_only_reachable_concrete_cddl() {
     // rule and its reachable closure may be emitted, so the result
     // lints clean and round-trips unchanged.
     let compiled = compile("cddl/rfc-std/rfc8610.cddl");
-    let policy = cbork_cddl_compiler::ConcretePolicy::for_render().with_comments(false);
-    let res = build_resolution(&compiled.complete_nodes);
-    let cddl = render_to_string(&compiled.complete_nodes, &res, &policy);
+    let cddl = render_formatted(&compiled, false);
 
     // Library helpers that are only reachable via inlining must not be
     // emitted as separate top-level definitions. The `uuidv4-abnf`
@@ -140,9 +154,9 @@ fn render_rfc8610_emits_only_reachable_concrete_cddl() {
             .join("\n")
     );
 
-    // And a second render pass must be byte-identical.
-    let second_res = build_resolution(&second.complete_nodes);
-    let rerendered = render_to_string(&second.complete_nodes, &second_res, &policy);
+    // And a second render pass must be byte-identical through the
+    // same formatted pipeline the CLI runs.
+    let rerendered = render_formatted(&second, false);
     assert_eq!(
         cddl, rerendered,
         "render output must be stable after a second parse/render pass"
@@ -158,9 +172,7 @@ fn render_rfc8727_cycle_aware_and_self_contained() {
     // exactly once, acyclic content is fully inlined, and the output
     // lints clean and round-trips byte-identically.
     let compiled = compile("cddl/rfc-std/rfc8727.cddl");
-    let policy = cbork_cddl_compiler::ConcretePolicy::for_render().with_comments(false);
-    let res = build_resolution(&compiled.complete_nodes);
-    let cddl = render_to_string(&compiled.complete_nodes, &res, &policy);
+    let cddl = render_formatted(&compiled, false);
 
     // The recursive cluster is retained exactly once per member, and
     // references to the members stay symbolic (`+ Contact`).
@@ -183,8 +195,10 @@ fn render_rfc8727_cycle_aware_and_self_contained() {
     }
 
     // No re-expansion blowup: the rendered document stays bounded.
+    // The structural formatter lays one entry per line, so the bound
+    // is generous — the naive recursive expansion was ~83k lines.
     assert!(
-        cddl.lines().count() < 2000,
+        cddl.lines().count() < 10_000,
         "rendered rfc8727 must stay bounded (got {} lines):\n{cddl}",
         cddl.lines().count()
     );
@@ -194,7 +208,7 @@ fn render_rfc8727_cycle_aware_and_self_contained() {
     // The ctlop arm is parenthesized (ctlops have no order of
     // evaluation).
     assert!(
-        cddl.contains("? -23 => (\"\" / (text .regexp"),
+        cddl.contains("? -23 => (\"\" /") && cddl.contains("text .regexp \"[a-zA-Z]{1,8}"),
         "member keys must fold and `lang` must render as a choice:\n{cddl}"
     );
     assert!(
@@ -218,9 +232,9 @@ fn render_rfc8727_cycle_aware_and_self_contained() {
             .join("\n")
     );
 
-    // Byte-identical second render pass.
-    let second_res = build_resolution(&second.complete_nodes);
-    let rerendered = render_to_string(&second.complete_nodes, &second_res, &policy);
+    // Byte-identical second render pass through the same formatted
+    // pipeline the `cbork render` CLI runs.
+    let rerendered = render_formatted(&second, false);
     assert_eq!(
         cddl, rerendered,
         "render output must be stable after a second parse/render pass"
@@ -238,9 +252,7 @@ fn render_rfc8990_within_preserves_operands_and_ranges() {
     // must be emitted concretely, and the output must lint clean and
     // round-trip byte-identically.
     let compiled = compile("cddl/rfc-std/rfc8990-cleaned.cddl");
-    let policy = cbork_cddl_compiler::ConcretePolicy::for_render().with_comments(false);
-    let res = build_resolution(&compiled.complete_nodes);
-    let cddl = render_to_string(&compiled.complete_nodes, &res, &policy);
+    let cddl = render_formatted(&compiled, false);
 
     // The within-LHS plug stays symbolic and its augment lines are
     // emitted concretely. The within-arm is parenthesized (a ctlop
@@ -276,9 +288,8 @@ fn render_rfc8990_within_preserves_operands_and_ranges() {
             .join("\n")
     );
 
-    // Byte-identical second render pass.
-    let second_res = build_resolution(&second.complete_nodes);
-    let rerendered = render_to_string(&second.complete_nodes, &second_res, &policy);
+    // Byte-identical second render pass through the formatted pipeline.
+    let rerendered = render_formatted(&second, false);
     assert_eq!(
         cddl, rerendered,
         "render output must be stable after a second parse/render pass"
@@ -293,9 +304,7 @@ fn render_rfc9052_parenthesizes_choice_member_keys() {
     // emitted CDDL is ambiguous (a parse error). The render must be
     // lint-clean and round-trip byte-identically.
     let compiled = compile("cddl/rfc-std/rfc9052.cddl");
-    let policy = cbork_cddl_compiler::ConcretePolicy::for_render().with_comments(false);
-    let res = build_resolution(&compiled.complete_nodes);
-    let cddl = render_to_string(&compiled.complete_nodes, &res, &policy);
+    let cddl = render_formatted(&compiled, false);
 
     // The inlined `label` (int / tstr) catch-all key keeps its parens.
     assert!(
@@ -319,9 +328,8 @@ fn render_rfc9052_parenthesizes_choice_member_keys() {
             .join("\n")
     );
 
-    // Byte-identical second render pass.
-    let second_res = build_resolution(&second.complete_nodes);
-    let rerendered = render_to_string(&second.complete_nodes, &second_res, &policy);
+    // Byte-identical second render pass through the formatted pipeline.
+    let rerendered = render_formatted(&second, false);
     assert_eq!(
         cddl, rerendered,
         "render output must be stable after a second parse/render pass"
@@ -553,13 +561,13 @@ ml-dsa-87_signature = bstr .size 4627\n";
     );
     assert!(
         cddl.contains("    {\n      -19 => bstr .size 64")
-            && cddl.contains("      (\n        (-48 => bstr .size 2420) /")
-            && cddl.contains("        (-49 => bstr .size 3309) /")
-            && cddl.contains("        (-50 => bstr .size 4627)\n      )"),
+            && cddl.contains("(\n    (-48 => bstr .size 2420),")
+            && cddl.contains("    (-49 => bstr .size 3309),")
+            && cddl.contains("    (-50 => bstr .size 4627)"),
         "expected nested block indentation and concrete plug arms:\n{cddl}"
     );
     assert!(
-        cddl.contains("} .within {"),
+        cddl.contains("} .within alg-sig-map"),
         "expected `.within` to stay attached to surrounding blocks:\n{cddl}"
     );
     assert!(
@@ -586,9 +594,12 @@ fn render_pqsig_fixture_keeps_nested_effective_view_indented() {
         !cddl.contains("; from pq-hybrid-sig-generic / ["),
         "choice separator must not be hidden after provenance:\n{cddl}"
     );
+    // A `.within` RHS whose definition carries a ctlop stays symbolic
+    // (inlining it would chain two ctlops on one type1 and produce
+    // unparseable output); its definition is retained instead.
     assert!(
-        cddl.trim_end().ends_with(')'),
-        "expected final close paren to remain visible:\n{cddl}"
+        cddl.contains(".within alg-sig-map") && cddl.contains("alg-sig-map = {"),
+        "ctlop-bearing `.within` RHS operands must stay symbolic:\n{cddl}"
     );
 }
 

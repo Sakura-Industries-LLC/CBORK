@@ -871,6 +871,33 @@ fn resolve_grpchoice_with_delimiter(
         } = child
             && rule == "grpent"
         {
+            // A parenthesized group member (`{ (a => int, b => text) }`)
+            // flattens into the enclosing group: its entries merge, they
+            // do not become a single nested entry. This is the shape the
+            // concrete renderer emits when it inlines a bare group
+            // reference inside a map or array.
+            if let Some(group) = entry_children
+                .iter()
+                .find(|c| matches!(c, WrappedNode::Syntax { rule: r, .. } if r == "group"))
+            {
+                // Only a `//`-free group (a single grpchoice) flattens
+                // safely: `//`-joined alternatives would drop entries.
+                if let Some(grpchoice) = sole_grpchoice_child(group) {
+                    let inner = resolve_grpchoice_with_delimiter(grpchoice, delimiter);
+                    match inner {
+                        ResolvedType::Map { entries } => {
+                            map_entries.extend(entries);
+                            is_map = true;
+                            continue;
+                        },
+                        ResolvedType::Array { elements } => {
+                            array_elements.extend(elements);
+                            continue;
+                        },
+                        _ => {},
+                    }
+                }
+            }
             if entry_has_map_separator(entry_children, recognizes_colon) {
                 if let Some(entry) = resolve_map_entry(child) {
                     map_entries.push(entry);
@@ -895,6 +922,26 @@ fn resolve_grpchoice_with_delimiter(
         ResolvedType::Array {
             elements: array_elements,
         }
+    }
+}
+
+/// Return the single `grpchoice` child of a group-shaped node, or
+/// `None` when the group has `//`-joined alternatives (multiple
+/// grpchoices) that must not be flattened.
+fn sole_grpchoice_child(node: &WrappedNode) -> Option<&WrappedNode> {
+    match node {
+        WrappedNode::Syntax { children, .. } => {
+            let grpchoices: Vec<&WrappedNode> = children
+                .iter()
+                .filter(|c| matches!(c, WrappedNode::Syntax { rule: r, .. } if r == "grpchoice"))
+                .collect();
+            if grpchoices.len() == 1 {
+                grpchoices.first().copied()
+            } else {
+                None
+            }
+        },
+        _ => None,
     }
 }
 

@@ -331,6 +331,7 @@ grandkids
 groupcomm
 groupname
 grpchoice
+grpchoices
 grpent
 grpents
 gzip
@@ -420,6 +421,7 @@ mmdef
 mqtt
 multimaps
 multipartnumeric
+multiset
 multivalued
 myctl
 mymodule
@@ -480,6 +482,8 @@ psychurgy
 punct
 pyproject
 pyprojects
+qname
+qnode
 rangeop
 rangeops
 rawchars
@@ -582,6 +586,7 @@ uints
 unaliased
 uninfracted
 uninstantiated
+unparseable
 unplaster
 unrecognised
 unrenamed

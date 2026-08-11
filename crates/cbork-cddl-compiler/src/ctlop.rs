@@ -1131,13 +1131,15 @@ fn validate_numeric_family(
     ])
 }
 
-/// Validate `.json`, which emits text for JSON values.
+/// Validate `.json`, which emits text for JSON values. The RHS is the
+/// JSON structure template — a map (or any type) — so `Group` is
+/// accepted; a named template resolves to `Unknown` and also passes.
 fn validate_json_family(
     lhs_family: OperandFamily,
     rhs_family: OperandFamily,
 ) -> bool {
     family_matches(lhs_family, &[OperandFamily::Text])
-        && family_matches(rhs_family, &[OperandFamily::Any])
+        && family_matches(rhs_family, &[OperandFamily::Any, OperandFamily::Group])
 }
 
 /// Validate `.size`, which constrains byte length or integer width.

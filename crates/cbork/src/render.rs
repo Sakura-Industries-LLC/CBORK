@@ -47,6 +47,11 @@ pub(crate) fn exec(
     let policy = build_policy(no_comments);
     let resolution = build_resolution(&compiled.complete_nodes);
     let rendered = render_to_string(&compiled.complete_nodes, &resolution, &policy);
+    // Pretty-print the emitted document so the output is byte-stable
+    // across repeated renders no matter which internal path produced
+    // it. The formatter is pure: it only changes spacing and line
+    // breaks, never the CDDL content.
+    let rendered = cbork_cddl_compiler::pretty_print(&rendered);
 
     if json {
         let json = format_json(&rendered);

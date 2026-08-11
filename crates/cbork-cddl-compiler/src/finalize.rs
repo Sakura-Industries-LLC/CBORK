@@ -1555,8 +1555,9 @@ struct PrunedTree {
 /// Remove prunable definitions that are not reachable from retained roots.
 fn prune_unreachable_prunable_definitions(nodes: &[WrappedNode]) -> PrunedTree {
     let definitions = collect_definition_nodes(nodes);
+    let all_nodes_by_name = collect_all_definition_nodes(nodes);
     let roots = collect_non_prunable_definition_names(nodes);
-    let reachable = reachable_definition_names(&definitions, roots);
+    let reachable = reachable_definition_names(&definitions, &all_nodes_by_name, roots);
     let mut pruned_names = HashSet::new();
     let mut pruned_keys: HashSet<DefinitionKey> = HashSet::new();
     let retained = prune_nodes_with_keys(
@@ -1701,8 +1702,14 @@ fn collect_named_import_non_prunable_definition_names(
 }
 
 /// Compute the closure of definitions referenced by the retained roots.
+///
+/// `all_nodes_by_name` maps every rule name to ALL its definition
+/// nodes (a socket augmented by several `/= ` lines has one entry per
+/// arm); every arm's references participate in the walk, not just the
+/// first arm that survived [`collect_definition_nodes`].
 fn reachable_definition_names(
     definitions: &HashMap<String, WrappedNode>,
+    all_nodes_by_name: &HashMap<String, Vec<WrappedNode>>,
     roots: HashSet<String>,
 ) -> HashSet<String> {
     let mut reachable = HashSet::new();
@@ -1713,14 +1720,18 @@ fn reachable_definition_names(
             continue;
         }
 
-        let Some(definition) = definitions.get(&name) else {
-            continue;
-        };
-
         let mut references = HashSet::new();
-        collect_rhs_references(definition, &mut references);
+        if let Some(nodes) = all_nodes_by_name.get(&name) {
+            for node in nodes {
+                collect_rhs_references(node, &mut references);
+            }
+        } else if let Some(definition) = definitions.get(&name) {
+            collect_rhs_references(definition, &mut references);
+        }
         for reference in references {
-            if definitions.contains_key(&reference) && !reachable.contains(&reference) {
+            if (definitions.contains_key(&reference) || all_nodes_by_name.contains_key(&reference))
+                && !reachable.contains(&reference)
+            {
                 stack.push(reference);
             }
         }
@@ -2207,7 +2218,7 @@ fn collect_rhs_references_node_filtered(
             children,
             ..
         } => {
-            if rule == "typename" || rule == "groupname" {
+            if rule == "typename" || rule == "groupname" || rule == "type_socket" {
                 if *lhs_seen {
                     let name = text.trim();
                     if !exclude.contains(name) {
@@ -2769,6 +2780,40 @@ fn collect_definition_names_node(
         | WrappedNode::Syntax { children, .. } => {
             for child in children {
                 collect_definition_names_node(child, names);
+            }
+        },
+        WrappedNode::Comment { .. }
+        | WrappedNode::ModuleStart { .. }
+        | WrappedNode::ModuleEnd { .. } => {},
+    }
+}
+
+/// Collect EVERY definition node per rule name, keeping all duplicate
+/// arms (multiple `/= ` augment lines for one socket, shadowed names).
+/// The reachability walk needs every arm's references, while
+/// [`collect_definition_nodes`] keeps only the first.
+fn collect_all_definition_nodes(nodes: &[WrappedNode]) -> HashMap<String, Vec<WrappedNode>> {
+    let mut defs: HashMap<String, Vec<WrappedNode>> = HashMap::new();
+    for node in nodes {
+        collect_all_definition_nodes_nested(node, &mut defs);
+    }
+    defs
+}
+
+/// Recursive helper for [`collect_all_definition_nodes`].
+fn collect_all_definition_nodes_nested(
+    node: &WrappedNode,
+    defs: &mut HashMap<String, Vec<WrappedNode>>,
+) {
+    match node {
+        WrappedNode::RuleLine { children, .. }
+        | WrappedNode::Directive { children, .. }
+        | WrappedNode::Syntax { children, .. } => {
+            if let Some(name) = top_level_rule_name(node) {
+                defs.entry(name).or_default().push(node.clone());
+            }
+            for child in children {
+                collect_all_definition_nodes_nested(child, defs);
             }
         },
         WrappedNode::Comment { .. }

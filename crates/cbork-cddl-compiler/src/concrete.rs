@@ -34,7 +34,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt::Write as _,
 };
 
@@ -721,6 +721,68 @@ fn type1_is_ctlop_expression(node: &WrappedNode) -> bool {
     })
 }
 
+/// True if a type-shaped node is a ctlop/rangeop expression at its own
+/// top level (`bstr .cbor x`, `0 .. 255`, `(bstr .cbor x)`). Unlike a
+/// deep subtree scan, this does not fire for a ctlop nested inside a
+/// choice arm or map body (`(bytes .size 4) / (bytes .size 16)`,
+/// `+ ({ ... .regexp ... } / text)`), which must render as ordinary
+/// structure.
+fn top_level_ctlop_expression(node: &WrappedNode) -> bool {
+    let Some(children) = node_children(node) else {
+        return false;
+    };
+    match syntax_rule(node) {
+        Some("type") => {
+            let type1s: Vec<&WrappedNode> = children
+                .iter()
+                .filter(|c| syntax_rule(c) == Some("type1"))
+                .collect();
+            type1s.len() == 1
+                && type1s
+                    .first()
+                    .is_some_and(|t1| top_level_ctlop_expression(t1))
+        },
+        Some("type1") => {
+            if type1_is_ctlop_expression(node) {
+                return true;
+            }
+            // A single parenthesized operand (`(bstr .cbor x)`) hides
+            // the ctlop one level deeper; see through exactly one
+            // paren level, no further.
+            let type2s: Vec<&WrappedNode> = children
+                .iter()
+                .filter(|c| syntax_rule(c) == Some("type2"))
+                .collect();
+            type2s.len() == 1
+                && type2s
+                    .first()
+                    .and_then(|t2| paren_type_inner(t2))
+                    .is_some_and(top_level_ctlop_expression)
+        },
+        _ => false,
+    }
+}
+
+/// If `node` is a `(...)`-wrapped type2, return its inner type node.
+fn paren_type_inner(node: &WrappedNode) -> Option<&WrappedNode> {
+    let text = text_of(node).trim();
+    if !(text.starts_with('(') && text.ends_with(')')) {
+        return None;
+    }
+    let children = node_children(node)?;
+    children
+        .iter()
+        .find(|c| matches!(c, WrappedNode::Syntax { rule, .. } if rule == "type" || rule == "type1" || rule == "type2"))
+}
+
+/// Return the syntax children of a `Syntax` node, if any.
+fn node_children(node: &WrappedNode) -> Option<&[WrappedNode]> {
+    match node {
+        WrappedNode::Syntax { children, .. } => Some(children),
+        _ => None,
+    }
+}
+
 impl RenderCx<'_> {
     /// True if a choice arm renders as a ctlop/rangeop expression:
     /// either the arm itself is one, or it is a bare reference to a
@@ -1152,22 +1214,103 @@ pub fn render_cddl(
     // `symbolic_refs`.  Those definitions must remain in the document or
     // the intermediate lint reports `E016` undefined references.  Retain
     // them, iterating to a fixed point because a retained definition can
-    // itself reference further definitions symbolically.
-    let mut emitted: HashSet<String> = HashSet::new();
-    if let Some(first) = first_name.as_deref() {
-        emitted.insert(first.to_owned());
+    // itself reference further definitions symbolically. Each retained
+    // definition is rendered into its own buffer and appended in
+    // name-sorted order at the end, so the retention layout does not
+    // depend on the iteration in which a reference was first recorded
+    // (which varies with how the source document is shaped).
+    let retained = retain_referenced_definitions(&mut cx);
+    let retained_out = retained.into_values().collect::<String>();
+    let mut sink = Concrete::new();
+    for line in retained_out.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let spaces = line.chars().take_while(|c| *c == ' ').count();
+        sink.push(Line {
+            kind: LineKind::RuleLine,
+            text: line.trim_start().to_owned(),
+            indent: spaces / 2,
+            origin: None,
+        });
     }
+    out.lines_mut().extend(sink.lines().iter().cloned());
+    out
+}
+
+/// Output-based reachability: render every definition recorded as a
+/// bare (symbolic) reference so the document stays self-contained.
+///
+/// The first render pass inlines everything it can; anything emitted
+/// as a bare name is recorded in `symbolic_refs`. Those definitions
+/// must remain in the document or the intermediate lint reports `E016`
+/// undefined references. This retains them, iterating to a fixed point
+/// because a retained definition can itself reference further
+/// definitions symbolically. Each retained definition is rendered into
+/// its own buffer and returned in name-sorted order, so the layout
+/// does not depend on the iteration in which a reference was first
+/// recorded (which varies with how the source document is shaped).
+fn retain_referenced_definitions(cx: &mut RenderCx<'_>) -> BTreeMap<String, String> {
+    let mut retained: BTreeMap<String, String> = BTreeMap::new();
+    let mut emitted_augments: HashSet<String> = HashSet::new();
     loop {
         let mut progressed = false;
-        let mut pending: Vec<String> = cx
+        let pending: Vec<String> = cx
             .symbolic_refs
             .iter()
-            .filter(|name| !emitted.contains(*name))
+            .filter(|name| !retained.contains_key(*name))
             .cloned()
             .collect();
-        pending.sort();
         for name in pending {
-            let Some(def_node) = cx.resolution.definitions.get(&name) else {
+            // A reference recorded bare (an unqualified name inside an
+            // imported generic body, which the alias wrap leaves
+            // untouched) may resolve to a qualified definition
+            // (`global-attributes` → `cst.global-attributes`).
+            let def_node = cx.resolution.definitions.get(&name).or_else(|| {
+                let suffix = format!(".{name}");
+                cx.resolution
+                    .definitions
+                    .iter()
+                    .find(|(k, _)| k.ends_with(&suffix))
+                    .map(|(_, v)| v)
+            });
+            let Some(def_node) = def_node else {
+                // A symbolic reference to a type plug (`$eid` kept
+                // symbolic as a `.within` LHS) resolves through its
+                // `/= ` augment lines, which live in `type_plugs`;
+                // retain them or the intermediate lint cannot resolve
+                // the socket (`E030`).
+                let augments = cx.resolution.type_plugs.get(&name).or_else(|| {
+                    let suffix = format!(".{name}");
+                    cx.resolution
+                        .type_plugs
+                        .iter()
+                        .find(|(k, _)| k.ends_with(&suffix))
+                        .map(|(_, v)| v)
+                });
+                if let Some(augments) = augments {
+                    let mut body = Concrete::new();
+                    for augment in augments {
+                        let WrappedNode::RuleLine { children, .. } = augment else {
+                            continue;
+                        };
+                        let Some(head) = rule_head_from_children(children) else {
+                            continue;
+                        };
+                        // Every augment arm is emitted (the socket's
+                        // choice set is the union of all `/= ` lines),
+                        // unless the file-level emission already placed
+                        // it.
+                        if !emitted_augments.insert(augment_identity(augment)) {
+                            continue;
+                        }
+                        render_type_augment(augment, &head, cx, 0, &mut body);
+                    }
+                    let body = body.to_cddl();
+                    if !body.is_empty() && retained.insert(name.clone(), body).is_none() {
+                        progressed = true;
+                    }
+                }
                 continue;
             };
             let WrappedNode::RuleLine { children, .. } = def_node else {
@@ -1176,9 +1319,6 @@ pub fn render_cddl(
             let Some(head) = rule_head_from_children(children) else {
                 continue;
             };
-            if head.assignment != AssignmentKind::Define {
-                continue;
-            }
             if def_node
                 .metadata()
                 .iter()
@@ -1186,17 +1326,35 @@ pub fn render_cddl(
             {
                 continue;
             }
-            if !emitted.insert(name) {
-                continue;
+            match head.assignment {
+                AssignmentKind::Define => {
+                    let mut body = Concrete::new();
+                    render_define(def_node, &head, cx, 0, &mut body, false);
+                    let body = body.to_cddl();
+                    if !body.is_empty() && retained.insert(name.clone(), body).is_none() {
+                        progressed = true;
+                    }
+                },
+                // A symbolic reference to a type plug (`$eid` kept
+                // symbolic as a `.within` LHS) needs its `/= ` augment
+                // lines retained, or the intermediate lint cannot
+                // resolve the socket (`E030`).
+                AssignmentKind::TypeAugment => {
+                    let mut body = Concrete::new();
+                    render_type_augment(def_node, &head, cx, 0, &mut body);
+                    let body = body.to_cddl();
+                    if !body.is_empty() && retained.insert(name.clone(), body).is_none() {
+                        progressed = true;
+                    }
+                },
+                AssignmentKind::GroupAugment => {},
             }
-            render_define(def_node, &head, &mut cx, 0, &mut out);
-            progressed = true;
         }
         if !progressed {
             break;
         }
     }
-    out
+    retained
 }
 
 /// Find the name of the first top-level `Define` rule. The first rule
@@ -1255,6 +1413,69 @@ pub fn render_to_string(
 // Top-level rendering
 // ---------------------------------------------------------------------------
 
+/// A stable identity for a socket augment rule, used to avoid emitting
+/// the same augment twice during the retention fixed-point.
+fn augment_identity(node: &WrappedNode) -> String {
+    match node {
+        WrappedNode::RuleLine { text, origin, .. } => {
+            format!("{text}#{}:{}", origin.line, origin.column)
+        },
+        _ => String::new(),
+    }
+}
+
+/// Emit a `name /= type` augment rule with its RHS rendered concretely.
+/// Verbatim source text would reference definitions that concrete mode
+/// drops (E016); the concrete RHS keeps the line self-contained.
+fn render_type_augment(
+    node: &WrappedNode,
+    head: &RuleHead,
+    cx: &mut RenderCx<'_>,
+    indent: usize,
+    out: &mut Concrete,
+) {
+    let WrappedNode::RuleLine {
+        children, origin, ..
+    } = node
+    else {
+        return;
+    };
+    let rhs = find_rhs(children);
+    {
+        let mut head_text = String::new();
+        let _ = write!(&mut head_text, "{} /= ", head.name);
+        out.push(Line {
+            kind: LineKind::RuleLine,
+            text: head_text,
+            indent,
+            origin: Some(origin.clone()),
+        });
+    }
+    if let Some(rhs_node) = rhs {
+        let rhs_text = text_of(rhs_node).trim().to_owned();
+        let body_start = out.len();
+        render_pretty_rhs(cx, rhs_node, indent.saturating_add(1), &rhs_text, out);
+        if out.len().saturating_sub(body_start) >= 1
+            && let Some(first_body) = out.lines().get(body_start)
+        {
+            let first_body_text = first_body.text.clone();
+            let body_tail: Vec<Line> = out
+                .lines()
+                .get(body_start.saturating_add(1)..)
+                .unwrap_or_default()
+                .to_vec();
+            out.lines_mut().truncate(body_start);
+            if let Some(head) = out.lines_mut().last_mut() {
+                head.text.push_str(&first_body_text);
+            }
+            for mut tail_line in body_tail {
+                tail_line.indent = tail_line.indent.saturating_sub(1);
+                out.push(tail_line);
+            }
+        }
+    }
+}
+
 /// Walk one top-level node, deciding whether to skip it, keep it
 /// verbatim, or render with substitutions.
 #[allow(
@@ -1269,64 +1490,25 @@ fn render_top(
     out: &mut Concrete,
 ) {
     match node {
-        WrappedNode::RuleLine {
-            children, origin, ..
-        } => {
+        WrappedNode::RuleLine { children, .. } => {
             let Some(head) = rule_head_from_children(children) else {
                 return;
             };
             match head.assignment {
-                AssignmentKind::GroupAugment => {
-                    // `//=` augmentations are socket-plug extensions; they
-                    // are expanded in place at the plug use site. They
-                    // are never emitted as separate top-level lines.
-                },
-                AssignmentKind::TypeAugment => {
-                    // `name /= type` — render the RHS concretely so the
-                    // emitted line is self-contained. Verbatim source
-                    // text would reference definitions that concrete
-                    // mode drops (E016).
-                    let rhs = find_rhs(children);
-                    {
-                        let mut head_text = String::new();
-                        let _ = write!(&mut head_text, "{} /= ", head.name);
-                        out.push(Line {
-                            kind: LineKind::RuleLine,
-                            text: head_text,
-                            indent,
-                            origin: Some(origin.clone()),
-                        });
-                    }
-                    if let Some(rhs_node) = rhs {
-                        let rhs_text = text_of(rhs_node).trim().to_owned();
-                        let body_start = out.len();
-                        render_pretty_rhs(cx, rhs_node, indent.saturating_add(1), &rhs_text, out);
-                        if out.len().saturating_sub(body_start) >= 1
-                            && let Some(first_body) = out.lines().get(body_start)
-                        {
-                            let first_body_text = first_body.text.clone();
-                            let body_tail: Vec<Line> = out
-                                .lines()
-                                .get(body_start.saturating_add(1)..)
-                                .unwrap_or_default()
-                                .to_vec();
-                            out.lines_mut().truncate(body_start);
-                            if let Some(head) = out.lines_mut().last_mut() {
-                                head.text.push_str(&first_body_text);
-                            }
-                            for mut tail_line in body_tail {
-                                tail_line.indent = tail_line.indent.saturating_sub(1);
-                                out.push(tail_line);
-                            }
-                        }
-                    }
+                AssignmentKind::GroupAugment | AssignmentKind::TypeAugment => {
+                    // `//=`/`/=` augmentations are socket-plug extensions;
+                    // they are expanded in place at the plug use site or
+                    // emitted by the output-based retention pass
+                    // (name-sorted, like retained definitions) so their
+                    // position does not depend on whether the rule came
+                    // from the file's own tree or an imported module.
                 },
                 AssignmentKind::Define => {
                     let is_first = first_name == Some(head.name.as_str());
 
                     if is_first {
                         // Always emit the first rule.
-                        render_define(node, &head, cx, indent, out);
+                        render_define(node, &head, cx, indent, out, is_first);
                     } else {
                         // Concrete mode: the rule is inlined wherever it
                         // is used. Drop the separate top-level line.
@@ -1335,10 +1517,20 @@ fn render_top(
             }
         },
         WrappedNode::Comment { text, origin, .. } => {
-            if !cx.policy.emit_comments {
+            let body = text.trim();
+            // `;@ CBORK:` directives are semantically meaningful (the
+            // Library marker and Extern declarations change how the
+            // document is compiled), so they survive even in
+            // no-comments mode — the re-lint of the rendered document
+            // needs them to recognize extern names. They are emitted
+            // once (the same marker can appear on several nodes when a
+            // library imports another library carrying it).
+            if !cx.policy.emit_comments && !body.starts_with(";@ CBORK:") {
                 return;
             }
-            let body = text.trim();
+            if body.starts_with(";@ CBORK:") && !cx.emitted_directives.insert(body.to_owned()) {
+                return;
+            }
             if !body.is_empty() {
                 out.push(Line {
                     kind: LineKind::Comment,
@@ -1369,19 +1561,27 @@ fn render_top(
 }
 
 /// Render a `name = type` rule with substitutions applied.
+///
+/// `is_root` is true when this is the document's first define (the
+/// rendered subject); a root that shadows a postlude or imported name
+/// (and is therefore flagged redundant) must still render — the
+/// round-trip's second pass would otherwise emit nothing for it.
 fn render_define(
     node: &WrappedNode,
     head: &RuleHead,
     cx: &mut RenderCx<'_>,
     indent: usize,
     out: &mut Concrete,
+    is_root: bool,
 ) {
-    if node.metadata().iter().any(|m| {
-        matches!(
-            m,
-            crate::MetaData::RedundantDefinition | crate::MetaData::ConflictingDefinition
-        )
-    }) {
+    if !is_root
+        && node.metadata().iter().any(|m| {
+            matches!(
+                m,
+                crate::MetaData::RedundantDefinition | crate::MetaData::ConflictingDefinition
+            )
+        })
+    {
         return;
     }
 
@@ -1830,6 +2030,58 @@ fn append_choice_separator(lines: &mut [PrettyLine]) {
     }
 }
 
+/// True if `text` contains a ctlop (`.name`) at bracket depth zero,
+/// outside strings. Used to decide whether a rendered operand needs
+/// parentheses when it is joined by another control operator.
+fn has_top_level_ctlop(text: &str) -> bool {
+    let mut depth = 0usize;
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut escaped = false;
+    let mut prev_was_space = false;
+    for byte in text.bytes() {
+        if escaped {
+            escaped = false;
+            prev_was_space = false;
+            continue;
+        }
+        if in_double {
+            if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_double = false;
+            }
+            prev_was_space = false;
+            continue;
+        }
+        if in_single {
+            if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'\'' {
+                in_single = false;
+            }
+            prev_was_space = false;
+            continue;
+        }
+        match byte {
+            b'"' => in_double = true,
+            b'\'' => in_single = true,
+            b'(' | b'[' | b'{' => {
+                depth = depth.saturating_add(1);
+                prev_was_space = false;
+            },
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                prev_was_space = false;
+            },
+            b' ' | b'\t' | b'\n' => prev_was_space = true,
+            b'.' if depth == 0 && prev_was_space => return true,
+            _ => prev_was_space = false,
+        }
+    }
+    false
+}
+
 /// Return true when source text contains a top-level `/` separator.
 fn has_top_level_choice_separator(text: &str) -> bool {
     let mut depth = 0_usize;
@@ -1850,13 +2102,11 @@ fn render_pretty_lines(
     rhs_node: &WrappedNode,
     source_text: &str,
 ) -> Vec<PrettyLine> {
-    // Special case: `.within` chain. The node may be a type-level node
-    // whose source text contains `.within` — detect by scanning.
+    // Special case: `.within` chain — detect by scanning the text.
     if let Some(within_pos) = find_within_split(source_text) {
         // When the `.within` is one arm of a multi-arm choice, render
-        // every arm separately so the sibling arms survive (`A .within B
-        // / C / D` must keep C and D). The within-arm re-enters this
-        // branch through its own type1 text.
+        // every arm separately so the sibling arms survive (`A .within
+        // B / C / D` keeps C and D).
         if let WrappedNode::Syntax { rule, children, .. } = rhs_node
             && rule == "type"
         {
@@ -1891,24 +2141,24 @@ fn render_pretty_lines(
             cx.within_lhs = true;
             let mut lhs_lines = render_pretty_lines(cx, lhs, text_of(lhs));
             cx.within_lhs = previous_within_lhs;
-            // A `.within` LHS that renders as a top-level choice must be
-            // parenthesized, or re-parsing the output binds the `.within`
-            // to the last arm only (`A / B .within R` == `A / (B .within R)`).
-            let lhs_flat = lhs_lines
-                .iter()
-                .map(|l| l.text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            if RenderCx::contains_top_level_choice(&lhs_flat) {
-                if let Some(first) = lhs_lines.first_mut() {
-                    first.text = format!("({}", first.text);
-                }
-                if let Some(last) = lhs_lines.last_mut() {
-                    last.text.push(')');
-                }
-            }
+            // A `.within` LHS that renders as a top-level choice or a
+            // ctlop-bearing operand must be parenthesized: without the
+            // parens the operator binds the last arm/operand only
+            // (`A / B .within R`; `bstr .dtrm {...} .within ...`
+            // chains two ctlops on one type1 and fails the grammar).
+            wrap_within_lhs(&mut lhs_lines);
             let rhs_lines = if let Some(rn) = rhs_node_ast {
-                render_pretty_lines(cx, rn, text_of(rn))
+                // The `.within` RHS is a ctlop operand; a named operand
+                // whose definition carries a ctlop stays symbolic
+                // (inlining it would chain two ctlops per type1).
+                if let Some(name) = arm_is_bare_name(rn)
+                    && cx.name_resolves_to_ctlop_expression(&name)
+                {
+                    cx.record_symbolic_ref(&name);
+                    vec![line(0, name.clone())]
+                } else {
+                    render_pretty_lines(cx, rn, text_of(rn))
+                }
             } else {
                 // Same byte-safety argument as the LHS fallback above.
                 let (_, rhs_src) = source_text.split_at(within_pos);
@@ -2026,7 +2276,21 @@ fn render_type_choice_arms(
         // A ctlop/rangeop expression used as a choice arm must be
         // parenthesized (`(text .regexp "x") / "y"`): ctlops have no
         // order of evaluation, so the operand scope must be explicit.
-        if multi_arm && cx.arm_renders_ctlop_expression(t1) && !arm_lines.is_empty() {
+        // The check runs on the rendered arm so an inlined named
+        // reference that renders as a ctlop expression braces
+        // identically to a literal.
+        let arm_flat = arm_lines
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let arm_bare =
+            !arm_flat.trim().is_empty() && arm_flat.trim().chars().all(is_reference_name_char);
+        if multi_arm
+            && !arm_lines.is_empty()
+            && !arm_bare
+            && (cx.arm_renders_ctlop_expression(t1) || has_top_level_ctlop(&arm_flat))
+        {
             if let Some(first) = arm_lines.first_mut() {
                 first.text = format!("({}", first.text);
             }
@@ -2237,6 +2501,11 @@ fn render_type1_lines(
     } else {
         render_pretty_lines(cx, right, text_of(right))
     };
+    // A ctlop RHS that renders as a top-level choice must be
+    // parenthesized (`bstr .bits (A / B)`): without the parens the `/`
+    // escapes the operator on re-parse (`bstr .bits A / B` binds the
+    // ctlop to `A` only).
+    let right_lines = wrap_choice_operand_lines(right_lines);
     {
         // A ctlop LHS that renders as a top-level choice must be
         // parenthesized: the operator binds the whole operand, and
@@ -2259,6 +2528,47 @@ fn render_type1_lines(
     join_control_lines(left_lines.as_mut_slice(), right_lines, &op)
 }
 
+/// Wrap rendered lines in parentheses when their flattened text is a
+/// top-level choice (a ctlop operand must not let `/` escape it).
+fn wrap_choice_operand_lines(mut lines: Vec<PrettyLine>) -> Vec<PrettyLine> {
+    let flat = lines
+        .iter()
+        .map(|l| l.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if RenderCx::contains_top_level_choice(&flat)
+        && !(flat.trim_start().starts_with('(') && flat.trim_end().ends_with(')'))
+        && let Some(first) = lines.first_mut()
+    {
+        first.text = format!("({}", first.text);
+        if let Some(last) = lines.last_mut() {
+            last.text.push(')');
+        }
+    }
+    lines
+}
+
+/// Parenthesize a `.within` LHS that renders as a top-level choice or
+/// a ctlop-bearing operand (see the call site for the grammar reason).
+fn wrap_within_lhs(lines: &mut [PrettyLine]) {
+    let flat = lines
+        .iter()
+        .map(|l| l.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if RenderCx::contains_top_level_choice(&flat)
+        || (has_top_level_ctlop(&flat)
+            && !(flat.trim_start().starts_with('(') && flat.trim_end().ends_with(')')))
+    {
+        if let Some(first) = lines.first_mut() {
+            first.text = format!("({}", first.text);
+        }
+        if let Some(last) = lines.last_mut() {
+            last.text.push(')');
+        }
+    }
+}
+
 /// Render `type2` tags and parenthesized choices as structured lines.
 fn render_type2_lines(
     cx: &mut RenderCx<'_>,
@@ -2272,6 +2582,7 @@ fn render_type2_lines(
         let inner = children.iter().find(|c| {
             matches!(c, WrappedNode::Syntax { rule, .. } if rule == "type" || rule == "type1" || rule == "type2")
         })?;
+        let tag = cx.resolve_tag_head(&tag, &mut None, &mut HashSet::new());
         let mut lines = render_pretty_lines(cx, inner, text_of(inner));
         if let Some(first) = lines.first_mut() {
             first.text = format!("{tag}({}", first.text);
@@ -2310,10 +2621,10 @@ fn render_grpent_lines(
     };
     if let Some(plug_name) = RenderCx::find_socket_plug_name(children)
         && !plug_name.is_empty()
-        && let Some(plugs) = cx.resolution.socket_plugs.get(&plug_name)
+        && let Some(plugs) = cx.socket_plugs_for(&plug_name)
         && !plugs.is_empty()
     {
-        return Some(render_plug_choice_lines(cx, plugs));
+        return Some(render_plug_choice_lines(cx, &plugs));
     }
     None
 }
@@ -2369,7 +2680,11 @@ fn render_group_entry_lines(
         && find_group_child(entry).is_some()
     {
         let first_char = text_of(entry).trim().chars().next();
-        if matches!(first_char, Some('{' | '[')) {
+        // An entry that is a block followed by a top-level ctlop
+        // (`[ ... ] .within [ ... ]`) is not a pure block; the
+        // brace-block renderer would drop the ctlop continuation.
+        let block_continues = find_within_split(text_of(entry).trim()).is_some();
+        if matches!(first_char, Some('{' | '[')) && !block_continues {
             return render_brace_block_lines(cx, entry);
         }
     }
@@ -2765,11 +3080,27 @@ fn render_plug_choice_lines(
     plugs: &[WrappedNode],
 ) -> Vec<PrettyLine> {
     let mut lines = vec![line(0, "(")];
+    let mut members: Vec<PrettyLine> = Vec::new();
+    let mut all_members = true;
     let mut plugs = plugs.iter().peekable();
     while let Some(plug) = plugs.next() {
         let rendered = render_plug_arm(cx, plug);
-        let suffix = if plugs.peek().is_none() { "" } else { " /" };
-        lines.push(line(1, format!("{rendered}{suffix}")));
+        let is_member = rendered.trim_start().starts_with('(');
+        if !is_member {
+            all_members = false;
+        }
+        members.push(line(1, rendered));
+        if plugs.peek().is_none() {
+            break;
+        }
+    }
+    let sep = if all_members { ", " } else { " /" };
+    let last = members.len().saturating_sub(1);
+    for (i, mut rendered_line) in members.into_iter().enumerate() {
+        if i != last {
+            rendered_line.text.push_str(sep);
+        }
+        lines.push(rendered_line);
     }
     lines.push(line(0, ")"));
     lines
@@ -3047,6 +3378,10 @@ struct RenderCx<'a> {
     /// Top-level emission retains the definitions for these names so
     /// the rendered document is self-contained.
     symbolic_refs: HashSet<String>,
+    /// `;@ CBORK:` directive comments already emitted (deduplicated:
+    /// the same directive can appear on several nodes when a library
+    /// imports another library carrying the same marker).
+    emitted_directives: HashSet<String>,
     /// The definition whose RHS is currently being rendered, when any.
     /// Used to elide provably bare self-arms (`x = x / int`).
     current_def: Option<String>,
@@ -3081,6 +3416,7 @@ impl<'a> RenderCx<'a> {
             policy,
             in_progress: HashSet::new(),
             symbolic_refs: HashSet::new(),
+            emitted_directives: HashSet::new(),
             current_def: None,
             ctlop_rhs: false,
             choice_arm: false,
@@ -3096,6 +3432,75 @@ impl<'a> RenderCx<'a> {
         name: &str,
     ) {
         self.symbolic_refs.insert(name.to_owned());
+    }
+
+    /// Look up a socket's plug arms, falling back to the qualified
+    /// suffix (`payload-or-evidence` → `cst.payload-or-evidence` for
+    /// references inside imported generic bodies that the alias wrap
+    /// leaves bare).
+    fn socket_plugs_for(
+        &self,
+        name: &str,
+    ) -> Option<Vec<WrappedNode>> {
+        self.resolution.socket_plugs.get(name).cloned().or_else(|| {
+            let suffix = format!(".{name}");
+            self.resolution
+                .socket_plugs
+                .iter()
+                .find(|(k, _)| k.ends_with(&suffix))
+                .map(|(_, v)| v.clone())
+        })
+    }
+
+    /// Look up a type plug's augment arms with the same qualified
+    /// suffix fallback as [`RenderCx::socket_plugs_for`].
+    fn type_plugs_for(
+        &self,
+        name: &str,
+    ) -> Option<Vec<WrappedNode>> {
+        self.resolution.type_plugs.get(name).cloned().or_else(|| {
+            let suffix = format!(".{name}");
+            self.resolution
+                .type_plugs
+                .iter()
+                .find(|(k, _)| k.ends_with(&suffix))
+                .map(|(_, v)| v.clone())
+        })
+    }
+
+    /// Whether `name` resolves to a plug under its qualified suffix.
+    fn qualified_plug(
+        &self,
+        name: &str,
+    ) -> Option<String> {
+        let suffix = format!(".{name}");
+        self.resolution
+            .socket_plugs
+            .keys()
+            .chain(self.resolution.type_plugs.keys())
+            .find(|k| k.ends_with(&suffix))
+            .cloned()
+    }
+
+    /// Resolve a `#6.<name>` tag argument. The argument is a type
+    /// expression; a bare name goes through the reference machinery so
+    /// it is folded to a literal or recorded for retention instead of
+    /// being emitted verbatim (`#6.<TAG_FOR_THIS_SEMANTICS>` → E016).
+    fn resolve_tag_head(
+        &mut self,
+        tag: &str,
+        prov: &mut Option<(String, String)>,
+        visited: &mut HashSet<String>,
+    ) -> String {
+        let Some(inner) = tag.strip_prefix("#6.<").and_then(|s| s.strip_suffix('>')) else {
+            return tag.to_owned();
+        };
+        let trimmed = inner.trim();
+        if !trimmed.is_empty() && trimmed.chars().all(is_reference_name_char) {
+            let (rendered, _) = self.render_named_reference(trimmed, prov, visited);
+            return format!("#6.<{rendered}>");
+        }
+        tag.to_owned()
     }
 
     /// Record that a recursive group reference was hit while inlining
@@ -3238,7 +3643,10 @@ impl<'a> RenderCx<'a> {
                     .unwrap_or_default();
                 self.choice_arm = previous_choice_arm;
                 // Parenthesize ctlop/rangeop arms (see the pretty path).
-                if multi_arm && self.arm_renders_ctlop_expression(c) {
+                // The check runs on the RENDERED arm so an inlined
+                // named reference that renders as a ctlop expression
+                // (`bstr .bits &(...)`) braces identically to a literal.
+                if multi_arm && (self.arm_renders_ctlop_expression(c) || has_top_level_ctlop(&r)) {
                     r = format!("({r})");
                 }
                 if prov.is_none() {
@@ -3248,6 +3656,62 @@ impl<'a> RenderCx<'a> {
             })
             .collect();
         (parts.join(" / "), None)
+    }
+
+    /// Whether `name`'s definition (or a bare-name alias chain) has a
+    /// ctlop/rangeop RHS, meaning it cannot be inlined into a ctlop
+    /// operand position (the grammar allows one ctlop per type1).
+    fn name_resolves_to_ctlop_expression(
+        &self,
+        name: &str,
+    ) -> bool {
+        let mut current = name.to_owned();
+        let mut steps = 0_usize;
+        while steps < 32 {
+            steps = steps.saturating_add(1);
+            let Some(def_node) = self.resolution.definitions.get(&current) else {
+                return false;
+            };
+            let WrappedNode::RuleLine { children, .. } = def_node else {
+                return false;
+            };
+            let Some(rhs) = find_rhs(children) else {
+                return false;
+            };
+            if rhs_is_ctlop_expression(rhs) {
+                return true;
+            }
+            let Some(next) = arm_is_bare_name(rhs) else {
+                return false;
+            };
+            current = next;
+        }
+        false
+    }
+
+    /// Render a parenthesized ctlop expression (`(uint .le 16)`),
+    /// keeping the parens unless the operator was dropped during
+    /// rendering.
+    fn render_parenthesized_ctlop(
+        &mut self,
+        inner: &WrappedNode,
+        prov: &mut Option<(String, String)>,
+        visited: &mut HashSet<String>,
+    ) -> (String, Option<(String, String)>) {
+        let (inner_text, p) = self.render_with_inlining_inner(inner, prov, visited);
+        if prov.is_none() {
+            *prov = p;
+        }
+        let flat = inner_text.trim();
+        // `.feature` flags render as their LHS only; when the rendered
+        // inner carries no operator, the parens are redundant and are
+        // dropped so the render of a literal `(uint .feature "x")`
+        // matches the re-render of `(uint)`.
+        if flat.contains('/') || flat.contains('\n') || flat.contains("..") || flat.contains(" .") {
+            (format!("({inner_text})"), None)
+        } else {
+            (inner_text, None)
+        }
     }
 
     /// Render a `type1` (may contain a ctlop, a rangeop, or be a
@@ -3274,6 +3738,15 @@ impl<'a> RenderCx<'a> {
                 },
                 _ => {},
             }
+        }
+        // A generic-argument substitution can nest a `type1` inside a
+        // `type1` (`message<"sleep", 1..100>` substitutes the arg into
+        // the reference's type1 position); tolerate it by recursing.
+        if type2s.is_empty()
+            && let Some(WrappedNode::Syntax { children: ic, .. }) =
+                children.iter().find(|c| syntax_rule(c) == Some("type1"))
+        {
+            return self.render_type1(ic, prov, visited);
         }
         let first = *type2s.first()?;
         if let Some(op) = operator {
@@ -3305,20 +3778,34 @@ impl<'a> RenderCx<'a> {
                     // A named `.det` operand resolves like any other
                     // reference (inlined, or kept symbolic and
                     // retained); the raw text would drop the definition.
-                    flatten_multiline_string(&self.render_named_reference(&name, prov, visited).0)
+                    // A definition whose RHS is itself a ctlop
+                    // expression stays symbolic — inlining it would
+                    // chain two ctlops on one type1 (`A .det B .det C`).
+                    if self.name_resolves_to_ctlop_expression(&name) {
+                        self.record_symbolic_ref(&name);
+                        name
+                    } else {
+                        flatten_multiline_string(
+                            &self.render_named_reference(&name, prov, visited).0,
+                        )
+                    }
                 } else {
                     flatten_multiline_string(text_of(hi).trim())
                 }
             } else {
                 let mut rendered = self.render_type2_inline(hi, prov, visited).0;
                 self.ctlop_rhs = previous_ctlop_rhs;
-                // An inlined operand renders multi-line while the
-                // literal form is single-line; flatten so the round
-                // trip is byte-stable.
-                if rendered.contains('\n') {
-                    let flat = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
-                    let flat = normalize_block_spacing(&flat);
-                    rendered = dedent_paren_spacing(&flat);
+                // A ctlop RHS that renders as a top-level choice must be
+                // parenthesized: the operator binds the whole operand
+                // (`bstr .cbor (A / B)`), and without the parens the
+                // `/` escapes the operator on re-parse (`bstr .cbor A /
+                // B` binds the ctlop to `A` only) — and the render
+                // would depend on whether the operand came from an
+                // inlined definition or literal source.
+                if Self::contains_top_level_choice(&rendered)
+                    && !(rendered.starts_with('(') && rendered.ends_with(')'))
+                {
+                    rendered = format!("({rendered})");
                 }
                 rendered
             };
@@ -3337,6 +3824,16 @@ impl<'a> RenderCx<'a> {
         visited: &mut HashSet<String>,
     ) -> (String, Option<(String, String)>) {
         if text.trim_start().starts_with("&(") {
+            // Keep the enum verbatim (it may carry per-entry comments);
+            // the pretty printer reformats it. Record any definition
+            // names the verbatim text still references so the
+            // retention pass keeps them.
+            record_embedded_references(
+                &mut self.symbolic_refs,
+                text,
+                &self.resolution.definitions,
+                &self.resolution.type_plugs,
+            );
             return (simplify_singleton_enum_key(text), None);
         }
 
@@ -3344,10 +3841,13 @@ impl<'a> RenderCx<'a> {
             let inner = children.iter().find(|c| {
                 matches!(c, WrappedNode::Syntax { rule, .. } if rule == "type" || rule == "type1" || rule == "type2")
             });
-            let inner_text = match inner {
-                Some(inner_node) => self.render_with_inlining_inner(inner_node, prov, visited).0,
-                None => String::new(),
-            };
+            let inner_text = inner
+                .map(|inner_node| self.render_with_inlining_inner(inner_node, prov, visited).0)
+                .unwrap_or_default();
+            // A `#6.<name>(...)` tag argument is a type expression;
+            // resolve a bare name so the reference is folded or
+            // recorded for retention (`#6.<TAG_FOR_THIS_SEMANTICS>`).
+            let tag = self.resolve_tag_head(&tag, prov, visited);
             // `leading_tag` already includes the leading `#`, so do not add one here.
             return (format!("{tag}({inner_text})"), None);
         }
@@ -3381,16 +3881,18 @@ impl<'a> RenderCx<'a> {
                 if prov.is_none() {
                     *prov = p;
                 }
-                let wrapped = format!("{open}{inner_text}{close}");
                 // A single-line literal block must use the same bracket
                 // spacing as the flattened form of an inlined block, or
                 // the two renderings disagree (`{...}` vs `{ ... }`).
-                let wrapped = if inner_text.contains('\n') {
-                    wrapped
-                } else {
-                    dedent_paren_spacing(&normalize_block_spacing(&wrapped))
-                };
-                return (wrapped, None);
+                let wrapped = format!("{open}{inner_text}{close}");
+                return (
+                    if inner_text.contains('\n') {
+                        wrapped
+                    } else {
+                        dedent_paren_spacing(&normalize_block_spacing(&wrapped))
+                    },
+                    None,
+                );
             }
         }
 
@@ -3403,11 +3905,7 @@ impl<'a> RenderCx<'a> {
             && trimmed.ends_with(')')
             && rhs_is_ctlop_expression(inner)
         {
-            let (inner_text, p) = self.render_with_inlining_inner(inner, prov, visited);
-            if prov.is_none() {
-                *prov = p;
-            }
-            return (format!("({inner_text})"), None);
+            return self.render_parenthesized_ctlop(inner, prov, visited);
         }
 
         if let Some(brackets) = detect_group_brackets(children) {
@@ -3525,21 +4023,22 @@ impl<'a> RenderCx<'a> {
         if self.policy.target == TargetSide::Full
             && self.within_lhs
             && (self.resolution.type_plugs.contains_key(name)
-                || self.resolution.socket_plugs.contains_key(name))
+                || self.resolution.socket_plugs.contains_key(name)
+                || self.qualified_plug(name).is_some())
         {
             self.record_symbolic_ref(name);
             return (name.to_owned(), None);
         }
-        if let Some(plugs) = self.resolution.socket_plugs.get(name)
+        if let Some(plugs) = self.socket_plugs_for(name)
             && !plugs.is_empty()
         {
-            return self.render_plug_choice(plugs, prov, visited);
+            return self.render_plug_choice(&plugs, prov, visited);
         }
 
-        if let Some(plugs) = self.resolution.type_plugs.get(name)
+        if let Some(plugs) = self.type_plugs_for(name)
             && !plugs.is_empty()
         {
-            return self.render_type_plug_choice(plugs, prov, visited);
+            return self.render_type_plug_choice(&plugs, prov, visited);
         }
 
         if name.starts_with('$') {
@@ -3592,14 +4091,18 @@ impl<'a> RenderCx<'a> {
         // consumer's tree, but the `.within` RHS references them
         // by their library-local bare names because it IS the
         // library's own source.
-        if def_node.is_none() && (self.policy.effective_mode || self.force_inline) {
+        let mut qualified_name = name.to_owned();
+        if def_node.is_none() {
             let suffix = format!(".{name}");
-            def_node = self
+            if let Some((qname, qnode)) = self
                 .resolution
                 .definitions
                 .iter()
                 .find(|(k, _)| k.ends_with(&suffix))
-                .map(|(_, v)| v);
+            {
+                qualified_name = qname.clone();
+                def_node = Some(qnode);
+            }
         }
 
         if let Some(def_node) = def_node
@@ -3612,8 +4115,11 @@ impl<'a> RenderCx<'a> {
 
         visited.remove(name);
         self.in_progress.remove(name);
-        self.record_symbolic_ref(name);
-        (name.to_owned(), None)
+        // When the reference resolved through its qualified suffix,
+        // record and emit the qualified name so the retained definition
+        // matches the reference in the output.
+        self.record_symbolic_ref(&qualified_name);
+        (qualified_name, None)
     }
 
     /// Inline a definition by rendering its RHS with the LHS's name
@@ -3751,10 +4257,10 @@ impl<'a> RenderCx<'a> {
         // expanded to a `/`-joined choice of plug bodies.
         if let Some(plug_name) = Self::find_socket_plug_name(children)
             && !plug_name.is_empty()
-            && let Some(plugs) = self.resolution.socket_plugs.get(&plug_name)
+            && let Some(plugs) = self.socket_plugs_for(&plug_name)
             && !plugs.is_empty()
         {
-            return self.render_plug_choice(plugs, prov, visited);
+            return self.render_plug_choice(&plugs, prov, visited);
         }
 
         // A grpent that wraps a `group` child (`( ... )` shape)
@@ -3855,6 +4361,7 @@ impl<'a> RenderCx<'a> {
             };
             if let Some(close) = block_close
                 && right_trimmed.chars().rev().find(|c| !c.is_whitespace()) == Some(close)
+                && block_ends_value(right_trimmed, close)
             {
                 // A block value must use the same flattened single-line
                 // body the keyed-block renderer sees, laid out with one
@@ -3862,8 +4369,9 @@ impl<'a> RenderCx<'a> {
                 // the value came from an inlined definition (pretty path)
                 // or literal source (string path), and the round-trip is
                 // unstable. A choice whose first arm is a block
-                // (`{ ... } / text`) is not a pure block and falls
-                // through to the choice flattening below.
+                // (`{ ... } / text`) or a ctlop-joined block
+                // (`[ ... ] .within [ ... ]`) is not a pure block and
+                // falls through to the choice flattening below.
                 let open = if close == ']' { '[' } else { '{' };
                 let inner = right_trimmed
                     .get(1..right_trimmed.len().saturating_sub(1))
@@ -3891,12 +4399,15 @@ impl<'a> RenderCx<'a> {
                     None,
                 );
             }
-            if Self::contains_top_level_choice(&right) || right.contains('\n') {
-                // The inlined body is pretty-printed multi-line, but the
-                // literal form of the same choice is rendered on a single
-                // line; flatten so the round-trip is byte-stable, and
-                // normalize bracket spacing so both forms agree on
-                // `{ ... }` / `[ ... ]`.
+            if Self::contains_top_level_choice(&right) {
+                // A member value that is a top-level choice must be
+                // parenthesized (`key: (A / B)`); without the parens
+                // the `/` is parsed as a group choice and the entry is
+                // ambiguous. Flatten multi-line inlined choices so the
+                // output matches the literal form. The structural
+                // formatter owns whitespace canonicalization, so a
+                // multi-line ctlop value (`key: { ... } .and { ... }`)
+                // needs no wrap here.
                 let flat = right.split_whitespace().collect::<Vec<_>>().join(" ");
                 let flat = normalize_block_spacing(&flat);
                 let flat = dedent_paren_spacing(&flat);
@@ -3948,6 +4459,7 @@ impl<'a> RenderCx<'a> {
                 .as_deref()
                 .filter(|s| !s.is_empty())
                 .map_or(String::new(), |s| format!("{s} "));
+
             // The occurrence must wrap a pure bare name. A loose name
             // scan would misread `+ { -17 => text, ... }` as a bare
             // reference to the first map key (`-17`). The structure
@@ -4007,15 +4519,33 @@ impl<'a> RenderCx<'a> {
             }
         }
 
-        // A single type1 child that is a ctlop/rangeop expression
-        // (`bstr .cbor x`) must render through the type1 path (with the
+        // A single type child that is a ctlop/rangeop expression
+        // (`bstr .cbor x`) must render through the type path (with the
         // ctlop-operand rule applied), not as raw source text that
         // would leave the operand name unresolved.
         if type_children.len() == 1
             && let Some(t1) = type_children.first()
-            && type1_is_ctlop_expression(t1)
+            && top_level_ctlop_expression(t1)
         {
-            return self.render_with_inlining_inner(t1, prov, visited);
+            let rendered = self.render_with_inlining_inner(t1, prov, visited).0;
+            // The rendered expression may itself be a top-level choice
+            // (the ctlop can sit nested inside a map body); re-wrap so
+            // the `/` separators stay inside, and keep the occurrence
+            // that applies to the whole entry. A result that is
+            // already fully parenthesized is not re-wrapped, or
+            // re-rendering accumulates parens.
+            let rendered = if Self::contains_top_level_choice(&rendered)
+                && !(rendered.starts_with('(') && rendered.ends_with(')'))
+            {
+                format!("({rendered})")
+            } else {
+                rendered
+            };
+            let prefix = occur_text
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map_or(String::new(), |s| format!("{s} "));
+            return (format!("{prefix}{rendered}"), None);
         }
 
         // Single bare typename reference: a grpent whose trimmed text
@@ -4042,7 +4572,17 @@ impl<'a> RenderCx<'a> {
             }
         }
 
-        (text_of(node).trim().to_owned(), None)
+        // A verbatim fallback must still record any definition name it
+        // emits raw, or the retained set misses it (`bstr / #6.24(bstr)
+        // / (bstr .cbor admin-record)` keeps `admin-record` symbolic).
+        let raw_text = text_of(node).trim();
+        record_embedded_references(
+            &mut self.symbolic_refs,
+            raw_text,
+            &self.resolution.definitions,
+            &self.resolution.type_plugs,
+        );
+        (raw_text.to_owned(), None)
     }
 
     /// Render a `memberkey` (the `key =>` or `key :` half of a
@@ -4085,6 +4625,16 @@ impl<'a> RenderCx<'a> {
             let flat = normalize_block_spacing(&flat);
             let flat = dedent_paren_spacing(&flat);
             format!("({flat})")
+        } else if rendered_key.contains('\n') {
+            // A key with an inlined block operand (`bytes .oid [\n 2,\n
+            // 5,\n ...\n]`) must flatten to the single-line literal
+            // form, or a re-render of the emitted document collapses it
+            // and the round-trip differs.
+            let flat = rendered_key
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            dedent_paren_spacing(&normalize_block_spacing(&flat))
         } else {
             rendered_key
         };
@@ -4170,26 +4720,35 @@ impl<'a> RenderCx<'a> {
         prov: &mut Option<(String, String)>,
         visited: &mut HashSet<String>,
     ) -> (String, Option<(String, String)>) {
-        let parts: Vec<String> = plugs
-            .iter()
-            .filter_map(|plug| {
-                let WrappedNode::RuleLine { children, .. } = plug else {
-                    return None;
-                };
-                let rhs = find_rhs(children)?;
-                if let Some(inner) = find_parenthesized_grpent(rhs)
-                    && let WrappedNode::Syntax { children: gc, .. } = inner
-                {
-                    let rendered = self.render_grpent(inner, gc, prov, visited).0;
-                    return Some(format!("({rendered})"));
-                }
-                Some(self.render_with_inlining_inner(rhs, prov, visited).0)
-            })
-            .collect();
+        let mut parts: Vec<String> = Vec::new();
+        let mut all_members = true;
+        for plug in plugs {
+            let WrappedNode::RuleLine { children, .. } = plug else {
+                continue;
+            };
+            let Some(rhs) = find_rhs(children) else {
+                continue;
+            };
+            if let Some(inner) = find_parenthesized_grpent(rhs)
+                && let WrappedNode::Syntax { children: gc, .. } = inner
+            {
+                let rendered = self.render_grpent(inner, gc, prov, visited).0;
+                parts.push(format!("({rendered})"));
+            } else {
+                all_members = false;
+                parts.push(self.render_with_inlining_inner(rhs, prov, visited).0);
+            }
+        }
         match parts.len() {
             0 => (String::new(), None),
             1 => (parts.into_iter().next().unwrap_or_default(), None),
-            _ => (format!("({})", parts.join(" / ")), None),
+            _ => {
+                // Member-shaped arms (`(key => value)`) are group
+                // entries and must be comma-separated; `/` between
+                // members is not accepted by the grammar.
+                let sep = if all_members { ", " } else { " / " };
+                (format!("({})", parts.join(sep)), None)
+            },
         }
     }
 
@@ -4276,6 +4835,87 @@ fn constant_to_cddl(state: &EntryState) -> Option<String> {
 // ---------------------------------------------------------------------------
 // Tree-shape helpers
 // ---------------------------------------------------------------------------
+
+/// True if the text is a single block (`[ ... ]` / `{ ... }`) that
+/// closes at the very end — i.e. there is no trailing `.within`, choice
+/// arm, or other continuation after the matching bracket.
+fn block_ends_value(
+    text: &str,
+    _close: char,
+) -> bool {
+    let mut depth = 0usize;
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut escaped = false;
+    for (i, byte) in text.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_double {
+            if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_double = false;
+            }
+            continue;
+        }
+        if in_single {
+            if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'\'' {
+                in_single = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_double = true,
+            b'\'' => in_single = true,
+            b'[' | b'{' => depth = depth.saturating_add(1),
+            b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return text
+                        .get(i.saturating_add(1)..)
+                        .is_some_and(|rest| rest.trim().is_empty());
+                }
+            },
+            _ => {},
+        }
+    }
+    false
+}
+
+/// Record every definition name that appears as a bare token in `text`
+/// (a verbatim-emitted entry), so the retention pass keeps it.
+fn record_embedded_references(
+    symbolic_refs: &mut HashSet<String>,
+    text: &str,
+    definitions: &HashMap<String, WrappedNode>,
+    type_plugs: &HashMap<String, Vec<WrappedNode>>,
+) {
+    let is_name_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '$');
+    let mut start: Option<usize> = None;
+    for (i, &byte) in text.as_bytes().iter().enumerate() {
+        let c = byte as char;
+        if is_name_char(c) {
+            if start.is_none() {
+                start = Some(i);
+            }
+        } else if let Some(s) = start.take()
+            && let Some(name) = text.get(s..i)
+            && (definitions.contains_key(name) || type_plugs.contains_key(name))
+        {
+            symbolic_refs.insert(name.to_owned());
+        }
+    }
+    if let Some(s) = start
+        && let Some(name) = text.get(s..)
+        && (definitions.contains_key(name) || type_plugs.contains_key(name))
+    {
+        symbolic_refs.insert(name.to_owned());
+    }
+}
 
 /// Find the RHS type-like node in a `RuleLine`'s children.
 pub(crate) fn find_rhs(children: &[WrappedNode]) -> Option<&WrappedNode> {
@@ -4651,8 +5291,8 @@ mod tests {
         );
         let normalized = cddl.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            normalized.contains("(a => int) / (b => int)"),
-            "expected inline plug choice:\n{cddl}"
+            normalized.contains("(a => int), (b => int)"),
+            "expected comma-separated inline plug members:\n{cddl}"
         );
     }
 

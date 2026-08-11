@@ -29,6 +29,7 @@ pub mod literals;
 mod marker;
 mod node;
 mod preprocessor;
+mod pretty;
 mod rangeop;
 mod resolver;
 mod resolver_cache;
@@ -65,6 +66,7 @@ pub use marker::{
 };
 pub use node::{MetaData, SourceOrigin, WrappedNode};
 pub use preprocessor::{inject_directives, process_ast};
+pub use pretty::pretty_print;
 pub use resolver::resolve_includes;
 pub use resolver_cache::{CacheWriteError, EntryState, ResolverCache};
 pub use semantic::resolve_constants;
