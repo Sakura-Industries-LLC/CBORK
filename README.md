@@ -14,7 +14,7 @@ and the supporting parser and shared-utility crates.
 ## Versioning
 
 This project does **not** use [Semantic Versioning][semver].
-See [FEELSVER.md](FEELSVER.md) for the versioning policy.
+See [PRAGVER.md](PRAGVER.md) for the versioning policy.
 
 ## Workspace
 
@@ -425,7 +425,7 @@ The tree-sitter grammar under `extension/zed/grammars/cddl/` is a separate subpr
 (its own container toolchain; see its `AGENTS.md`).
 
 [podman]: https://podman.io/
-[sakura-dev-tools]: https://codeberg.org/SakuraIndustries/sakura-dev-tools
+[sakura-dev-tools]: https://github.com/Sakura-Industries-LLC/CBORK
 
 ## Testing and validation
 

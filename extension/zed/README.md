@@ -6,7 +6,7 @@ A [Zed](https://zed.dev/) editor extension that adds CDDL syntax support and edi
 
 This extension provides the language client integration that makes CDDL editing in Zed work:
 
-* **Grammar** — pulled at install time from [`codeberg.org/SakuraIndustries/tree-sitter-cddl`][grammar-repo]
+* **Grammar** — pulled at install time from [`github.com/Sakura-Industries-LLC/tree-sitter-cddl`][grammar-repo]
   (the `extension.toml` `[grammars.cddl]` section pins the source repo and ref).
   The grammar source is *not* vendored into this repository;
   the `grammars/` directory is gitignored and populated by the Zed extension loader on first install.
@@ -33,4 +33,4 @@ See [`LICENSE`](LICENSE) in this directory for the full text.
 The grammar that the extension pulls at install time is licensed under `MIT OR Apache-2.0` upstream;
 that license travels with the grammar and is not affected by the license on this directory.
 
-[grammar-repo]: https://codeberg.org/SakuraIndustries/tree-sitter-cddl
+[grammar-repo]: https://github.com/Sakura-Industries-LLC/tree-sitter-cddl

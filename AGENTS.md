@@ -71,7 +71,7 @@ It applies to the entire repository unless a more specific `AGENTS.md` exists in
 * The tree-sitter grammar under `extension/zed/grammars/cddl/` is *not* part of
   this repository's source — the `grammars/` directory is gitignored and the
   grammar is pulled at extension install time from
-  `https://codeberg.org/SakuraIndustries/tree-sitter-cddl.git` (see
+  `https://github.com/Sakura-Industries-LLC/tree-sitter-cddl.git` (see
   `extension/zed/extension.toml` `[grammars.cddl]`).
 * Files committed under `extension/zed/` (the manifest, the LICENSE, and the
   language client config in `languages/cddl/`) are licensed under
@@ -84,7 +84,7 @@ The minimum local tooling is:
 
 * [`just`](https://github.com/casey/just) — the task runner
 * [Podman](https://podman.io/) — the container runtime
-* the [`sakura-dev-tools`](https://codeberg.org/SakuraIndustries/sakura-dev-tools)
+* the [`sakura-dev-tools`](https://github.com/Sakura-Industries-LLC/CBORK)
   build image, which provides `moon`, `rustup`/`cargo`, `cargo deny`,
   `cargo-nextest`, `rumdl`, and `cspell` (the `just` recipes build it on demand)
 
