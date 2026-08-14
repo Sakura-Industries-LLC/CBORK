@@ -7,5 +7,5 @@ description = "CDDL syntax support and editor integrations for CBORK"
 repository = "https://github.com/Sakura-Industries-LLC/cbork"
 
 [grammars.cddl]
-repository = "https://codeberg.org/SakuraIndustries/tree-sitter-cddl.git"
+repository = "https://github.com/Sakura-Industries-LLC/tree-sitter-cddl.git"
 rev = "main"

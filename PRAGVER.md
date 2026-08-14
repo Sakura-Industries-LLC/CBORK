@@ -1,23 +1,23 @@
 ---
 version: 1.0.0
-source: https://codeberg.org/SakuraIndustries/FeelsVer.git
+source: https://github.com/Sakura-Industries-LLC/pragver
 license: https://creativecommons.org/licenses/by-sa/4.0/
 ---
 
-# FEELSVER
+# Pragmatic Versioning (PragVer)
 
 ## The Release Strategy for Pragmatic Engineers
 
 Three-tier version numbering (`MAJOR.MINOR.PATCH`) predates SemVer by at least 30 years.
 SemVer did not invent this shape, it attached a specific, narrow contract to it.
 
-FeelsVer uses the same version shape that the software industry has always used to communicate release magnitude,
+PragVer uses the same version shape that the software industry has always used to communicate release magnitude,
 and that tooling already knows how to parse.
 
 This project explicitly rejects **Semantic Versioning (SemVer)**.
 We do not use it, we do not believe in it, and we treat it as an industry farce.
 
-Instead, this repository utilizes **FeelsVer** (Intuitive Versioning).
+Instead, this repository uses **Pragmatic Versioning (PragVer)**.
 We increment version numbers based on engineering intuition, judgement, internal roadmap milestones, and collective code density.
 
 ---
@@ -59,7 +59,7 @@ This is a technical impossibility for several fundamental reasons:
    Nobody agrees, and the answers are always domain-specific post-hoc justifications
    for whatever bump the maintainer already wanted to make.
 
-   FeelsVer does not have this problem because the version number describes the *release*, not one arbitrarily privileged surface.
+   PragVer does not have this problem because the version number describes the *release*, not one arbitrarily privileged surface.
    If the UI was remade, that release is big.
    If the toolchain bumped, that release carries structural weight.
    The maintainer makes a holistic judgment.
@@ -74,7 +74,7 @@ This is a technical impossibility for several fundamental reasons:
    Almost nobody should have been using them.
    The maintainer is forced into a false choice: signal danger that doesn't exist, or break a social contract.
 
-   FeelsVer sidesteps this entirely.
+   PragVer sidesteps this entirely.
    The maintainer judges the practical impact, not the technical classification.
 
 We take the view that breakage is breakage regardless of WHY it occurs.
@@ -85,7 +85,7 @@ We prefer honesty.
 
 ---
 
-## How FeelsVer Works
+## How PragVer Works
 
 Our version increments reflect the **architectural weight** of a release as evaluated by the project founders.
 
@@ -94,6 +94,11 @@ we refuse to let the codebase lock us into permanent stagnation either.
 
 We use the same version string shape as SemVer (`MAJOR.MINOR.PATCH`) for tooling compatibility.
 We do not use the same guarantees.
+
+In terms of permitted release policies, SemVer is a strict subset of PragVer:
+every SemVer-compliant versioning decision is also permitted by PragVer, but PragVer permits decisions that SemVer forbids.
+For example, PragVer permits a maintainer to make a minor bump for a behavior or toolchain change that may break downstream users,
+even when the declared API shape is unchanged.
 
 These fields communicate maintainer judgment about release weight.
 They are not compatibility proofs.
@@ -126,10 +131,20 @@ alter diagnostics, or evolve downstream behavior at any version boundary when en
 
 ---
 
-## FeelsVer and Release Tooling
+## PragVer and Release Tooling
 
-Automated version-bumping tools (conventional commits, release-please, changelog generators) work better under FeelsVer than under
+Automated version-bumping tools (conventional commits, release-please, changelog generators) work better under PragVer than under
 SemVer, not worse.
+
+PragVer-compatible tooling behaves in its default mode exactly as SemVer-compatible tooling does.
+It parses the same version shape, resolves normal dependency ranges the same way, and applies ordinary automatic updates.
+The difference is not mechanical behavior.
+PragVer-compatible tooling acknowledges that this process is best effort, not a guarantee that an update is safe for every consumer.
+
+When a user needs a particular version,
+PragVer-compatible tooling provides an explicit way to force that version anywhere in the dependency tree,
+including a transitive dependency and a version outside the normal automatic update range.
+This makes the exception visible and intentional instead of pretending that a default range can prove compatibility.
 
 Under SemVer, these tools must forensically classify every commit as fix/feat/breaking,
 and the maintainer must then audit the tool's suggestions against the "was this *really* an API boundary change?" question.
@@ -137,7 +152,7 @@ A commit tagged `feat!` because someone rewrote a CLI flag is technically not an
 A commit tagged `fix` because someone bumped the minimum compiler version by two years has changed nothing public
 but will shatter CI pipelines.
 
-Under FeelsVer, you let the tool suggest a bump based on commit conventions as a rough signal, and then you apply human judgment.
+Under PragVer, you let the tool suggest a bump based on commit conventions as a rough signal, and then you apply human judgment.
 You are not auditing whether each commit technically touched a public API boundary.
 You are asking: does this release *feel* like a patch, a milestone, or a new era?
 The tooling helps surface the raw data; the maintainer applies the weight.
