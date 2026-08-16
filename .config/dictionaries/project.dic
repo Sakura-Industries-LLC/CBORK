@@ -2,6 +2,7 @@ ABNF
 ABNFROB
 ACROPHONIC
 ALDR
+ALPHA
 Alexey
 Amsüss
 Anders
@@ -13,6 +14,7 @@ BCHAR
 BDIGIT
 BINDIG
 BINSTALL
+BIT
 Bareword
 Berners
 Bibliothekstr
@@ -30,9 +32,13 @@ Bradner
 CBOR
 CDDL
 CDNI
+CHAR
 CIPHERTEXT
 COSE
+CR
+CRLF
 CTAP
+CTL
 Caro
 Carsten
 Caswell
@@ -40,6 +46,7 @@ Cordell
 Cplusplus
 Crocker
 Ctlop
+DIGIT
 DNTLS
 DQUOTE
 DSDL
@@ -71,6 +78,7 @@ Gütschow
 HEXDIG
 HEXDIGA
 HMAC
+HTAB
 Hallam
 Hartke
 Haverty
@@ -99,7 +107,9 @@ Klyne
 Korver
 Kucherawy
 Kyzivat
+LF
 LNCS
+LWSP
 Leiba
 Lepinski
 Lhotka
@@ -130,6 +140,7 @@ Niven
 Nystrom
 O'Donoghue
 OCSP
+OCTET
 ODIGIT
 OSCORE
 Occil
@@ -168,6 +179,7 @@ SESC
 SIGACT
 SIGPLAN
 SIPHASH
+SP
 SPKI
 SQUOTE
 STRUCTUREDINFO
@@ -195,10 +207,12 @@ Tsou
 UBJSON
 Universitaet
 Universität
+VCHAR
 Vadim
 Vigano
 Vyncke
 WPANs
+WSP
 Wahlstroem
 Wilshire
 Wmissing
