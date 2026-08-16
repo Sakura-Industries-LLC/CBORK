@@ -2098,6 +2098,60 @@ fn source_relative_path(
         .collect()
 }
 
+/// RFC 5234 Appendix B.1 core rules, implicitly available to every ABNF
+/// grammar. They are appended to `.abnf`/`.abnfb` patterns that do not
+/// define the same names themselves, so patterns referencing core rules
+/// such as `OCTET` validate.
+const RFC_5234_CORE_RULES: &[(&str, &str)] = &[
+    ("ALPHA", "ALPHA   = %x41-5A / %x61-7A"),
+    ("BIT", "BIT     = \"0\" / \"1\""),
+    ("CHAR", "CHAR    = %x01-7F"),
+    ("CR", "CR      = %x0D"),
+    ("CRLF", "CRLF    = CR LF"),
+    ("CTL", "CTL     = %x00-1F / %x7F"),
+    ("DIGIT", "DIGIT   = %x30-39"),
+    ("DQUOTE", "DQUOTE  = %x22"),
+    (
+        "HEXDIG",
+        "HEXDIG  = DIGIT / \"A\" / \"B\" / \"C\" / \"D\" / \"E\" / \"F\"",
+    ),
+    ("HTAB", "HTAB    = %x09"),
+    ("LF", "LF      = %x0A"),
+    ("LWSP", "LWSP    = *(WSP / CRLF WSP)"),
+    ("OCTET", "OCTET   = %x00-FF"),
+    ("SP", "SP      = %x20"),
+    ("VCHAR", "VCHAR   = %x21-7E"),
+    ("WSP", "WSP     = SP / HTAB"),
+];
+
+/// Append the RFC 5234 core rules the pattern does not already define.
+///
+/// Returns the original pattern when it parses cleanly with no missing
+/// core rules, or a combined source otherwise. A parse failure of the
+/// pattern itself falls back to the original so the caller reports the
+/// genuine ABNF syntax error.
+fn abnf_pattern_with_core_rules(pattern: &str) -> Option<String> {
+    let parsed = parse_abnf(pattern).ok()?;
+    let defined: std::collections::HashSet<&str> = parsed
+        .rules()
+        .iter()
+        .map(|rule| rule.name().as_str())
+        .collect();
+    let missing: Vec<&str> = RFC_5234_CORE_RULES
+        .iter()
+        .filter(|(name, _)| !defined.contains(name))
+        .map(|(_, source)| *source)
+        .collect();
+    if missing.is_empty() {
+        return Some(pattern.to_owned());
+    }
+    let mut combined = pattern.to_owned();
+    combined.push('\n');
+    combined.push_str(&missing.join("\n"));
+    combined.push('\n');
+    Some(combined)
+}
+
 /// Validate a `regexp` control operator.
 fn validate_regex_rhs(
     compiled: &CompiledCDDL,
@@ -2238,7 +2292,8 @@ fn validate_abnf_rhs(
         format!("{pattern}\n")
     };
 
-    let Ok(document) = parse_abnf(&pattern) else {
+    let combined = abnf_pattern_with_core_rules(&pattern).unwrap_or_else(|| pattern.clone());
+    let Ok(document) = parse_abnf(&combined) else {
         issues.push(ValidationIssue::new(
             path.clone(),
             "valid ABNF",
@@ -2404,7 +2459,7 @@ fn resolve_text_rhs_for_abnf_with_det(
     if let Some(text) = resolve_text_rhs(compiled, node) {
         return Some((text, false));
     }
-    if let Some(text) = parse_text_from_node(node) {
+    if let Some(text) = parse_text_or_bytes_from_node(node) {
         return Some((text, false));
     }
 
@@ -2424,6 +2479,32 @@ fn resolve_text_rhs_for_abnf_with_det(
                 && let Some((text, _)) = resolve_text_rhs_for_abnf_with_det(compiled, child)
             {
                 return Some((text, false));
+            }
+        }
+    }
+
+    // A named text rule reference (e.g. `bstr .abnfb uuidv4-abnf`
+    // where `uuidv4-abnf = "UUIDv4" .det '...'`). The resolver cache
+    // only holds plain-literal rules (composed `.det` RHSs are not
+    // cached), so follow the definition and resolve its RHS
+    // recursively.
+    if rule == "type2" {
+        for child in children {
+            if let WrappedNode::Syntax {
+                rule: child_rule,
+                text,
+                ..
+            } = child
+                && matches!(child_rule.as_str(), "typename" | "groupname")
+                && let Some(definition) =
+                    find_definition_node(&compiled.complete_nodes, text.trim())
+                && let WrappedNode::RuleLine {
+                    children: def_children,
+                    ..
+                } = definition
+                && let Some(def_rhs) = find_rhs_node(def_children)
+            {
+                return resolve_text_rhs_for_abnf_with_det(compiled, def_rhs);
             }
         }
     }
@@ -5907,6 +5988,41 @@ fn parse_value_literal(node: &WrappedNode) -> Option<EntryState> {
     None
 }
 
+/// Find the definition `RuleLine` for a rule name in the compiled AST.
+fn find_definition_node<'a>(
+    nodes: &'a [WrappedNode],
+    name: &str,
+) -> Option<&'a WrappedNode> {
+    for node in nodes {
+        match node {
+            WrappedNode::RuleLine { text, children, .. } => {
+                let trimmed = text.trim_start();
+                if let Some(rest) = trimmed.strip_prefix(name) {
+                    let boundary_ok = rest.is_empty()
+                        || rest.starts_with(' ')
+                        || rest.starts_with('\t')
+                        || rest.starts_with('=');
+                    if boundary_ok {
+                        return Some(node);
+                    }
+                }
+                if let Some(found) = find_definition_node(children, name) {
+                    return Some(found);
+                }
+            },
+            WrappedNode::Syntax { children, .. } | WrappedNode::Directive { children, .. } => {
+                if let Some(found) = find_definition_node(children, name) {
+                    return Some(found);
+                }
+            },
+            WrappedNode::Comment { .. }
+            | WrappedNode::ModuleStart { .. }
+            | WrappedNode::ModuleEnd { .. } => {},
+        }
+    }
+    None
+}
+
 /// Resolve the RHS of a control operator to text if possible.
 fn resolve_text_rhs(
     compiled: &CompiledCDDL,
@@ -5983,6 +6099,20 @@ fn parse_text_from_node(node: &WrappedNode) -> Option<String> {
         return None;
     };
     String::from_utf8(text.as_ref().to_vec()).ok()
+}
+
+/// Parse a literal node into its UTF-8 text form, accepting both text
+/// and byte-string literals.
+///
+/// CDDL carries `.abnf`/`.abnfb` sources in double-quoted text literals
+/// or single-quoted byte-string literals (`"UUIDv4" .det '...'`); the
+/// ABNF RHS resolver needs both to decode to text.
+fn parse_text_or_bytes_from_node(node: &WrappedNode) -> Option<String> {
+    match parse_value_literal(node)? {
+        EntryState::Text(text) => String::from_utf8(text.as_ref().to_vec()).ok(),
+        EntryState::Bytes(bytes) => String::from_utf8(bytes.as_ref().to_vec()).ok(),
+        _ => None,
+    }
 }
 
 /// Convert a resolved entry state into a CBOR value for equality comparison.
@@ -8289,5 +8419,82 @@ headers = ( protected: bstr .size 0, unprotected: {} )
         // fall back to raw bytes.
         let rendered = crate::decode::render_document(&document, false, false, false, limits);
         assert!(rendered.contains("h'01"), "{rendered}");
+    }
+
+    #[test]
+    fn validate_svcrec_imported_direct_buuidv4_key() {
+        // Isolation: direct map with the IMPORTED rfc8610 buuidv4 key
+        // (bstr .abnfb uuidv4-abnf), same vector key bytes.
+        let dir = write_temp_dir_tree(&["svcrec_import_direct"]);
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b"root = { buuidv4 => any }\n;# import buuidv4 from rfc8610\n",
+        );
+        let cbor = [
+            0xA1, 0x50, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0x4C, 0xDE, 0x8F, 0x01, 0x23, 0x45,
+            0x67, 0x89, 0xAB, 0xCD, 0x78, 0x24, 0x65, 0x78, 0x61, 0x6D, 0x70, 0x6C, 0x65, 0x20,
+            0x67, 0x65, 0x6E, 0x65, 0x72, 0x69, 0x63, 0x20, 0x73, 0x65, 0x72, 0x76, 0x69, 0x63,
+            0x65, 0x20, 0x64, 0x61, 0x74, 0x61, 0x20, 0x70, 0x61, 0x79, 0x6C, 0x6F, 0x61, 0x64,
+        ];
+        let cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        assert!(
+            exec(
+                &schema,
+                Some(&cbor_path),
+                false,
+                false,
+                false,
+                Some("root"),
+                true,
+            ),
+            "imported buuidv4 key must match the 16-byte UUIDv4 key"
+        );
+    }
+
+    #[test]
+    fn validate_svcrec_imported_generic_service_data_vector() {
+        // Exact dntls-libs svcrec cross-verify scenario:
+        //   generic-service-data-vector = { generic-service-data }
+        //   generic-service-data = ( buuidv4 => any )      (via ./generic.cddl)
+        //   buuidv4 = bstr .abnfb uuidv4-abnf             (via rfc8610 import)
+        // vector: { h'0123456789ab4cde8f0123456789abcd' : "example generic service data payload"
+        // }
+        let dir = write_temp_dir_tree(&["svcrec_import_repro"]);
+        write_cddl(
+            &dir,
+            "generic.cddl",
+            b"generic-service-data = ( buuidv4 => any )\n;# import buuidv4 from rfc8610\n",
+        );
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b"generic-service-data-vector = { generic-service-data }\n;# import \"./generic.cddl\"\n",
+        );
+        // Serialized bytes copied from the dntls-libs svcrec vector
+        // `libs/svcrec/vectors/generic.cbor` (public test vector, not a
+        // secret DNTLS detail): a single-entry map keyed by a 16-byte
+        // UUIDv4 bstr with a text payload.
+        let cbor = [
+            0xA1, 0x50, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0x4C, 0xDE, 0x8F, 0x01, 0x23, 0x45,
+            0x67, 0x89, 0xAB, 0xCD, 0x78, 0x24, 0x65, 0x78, 0x61, 0x6D, 0x70, 0x6C, 0x65, 0x20,
+            0x67, 0x65, 0x6E, 0x65, 0x72, 0x69, 0x63, 0x20, 0x73, 0x65, 0x72, 0x76, 0x69, 0x63,
+            0x65, 0x20, 0x64, 0x61, 0x74, 0x61, 0x20, 0x70, 0x61, 0x79, 0x6C, 0x6F, 0x61, 0x64,
+        ];
+        let cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        assert!(
+            exec(
+                &schema,
+                Some(&cbor_path),
+                false,
+                false,
+                false,
+                Some("generic-service-data-vector"),
+                true,
+            ),
+            "svcrec generic-service-data vector must validate"
+        );
     }
 }
