@@ -1592,12 +1592,40 @@ fn validate_ctlop_value(
             let expected =
                 resolve_integer_rhs(compiled, rhs).or_else(|| parse_integer_from_node(rhs));
             let Some(expected) = expected else {
-                issues.push(ValidationIssue::new(
-                    path.clone(),
-                    "an integer size",
-                    format!("{value}"),
-                    Some("size RHS did not resolve to an integer".to_owned()),
-                ));
+                // The RHS is not a plain integer (e.g.
+                // `bstr .size (uint .le 16)`). Treat it as a constraint
+                // on the length value: the value's size must be accepted
+                // by the RHS type expression.
+                let actual = value_len(value);
+                let Some(actual) = actual else {
+                    issues.push(ValidationIssue::new(
+                        path.clone(),
+                        "a size",
+                        format!("{value}"),
+                        Some("value has no size".to_owned()),
+                    ));
+                    return;
+                };
+                let length_value = Value::Integer((actual as u64).into());
+                let mut size_issues = Vec::new();
+                let mut size_path = path.clone();
+                validate_schema_node(
+                    compiled,
+                    definitions,
+                    rhs,
+                    &length_value,
+                    &mut size_path,
+                    &mut size_issues,
+                );
+                if !size_issues.is_empty() {
+                    issues.push(ValidationIssue::new(
+                        path.clone(),
+                        "a size constraint",
+                        format!("size {actual}"),
+                        Some("size constraint failed".to_owned()),
+                    ));
+                    issues.extend(size_issues);
+                }
                 return;
             };
 
@@ -8495,6 +8523,44 @@ headers = ( protected: bstr .size 0, unprotected: {} )
                 true,
             ),
             "svcrec generic-service-data vector must validate"
+        );
+    }
+
+    #[test]
+    fn validate_svcrec_ip_location_literal_key() {
+        // dntls-libs svcrec cross-verify scenario for a literal
+        // byte-string UUID map key with whitespace-separated hex:
+        //   ip-location-vector = { h'ddb83814 5a37 4d0c 960e 8593d48c30fc' => [
+        // +ip-address-or-prefix ] }   # import rfc9164
+        // Serialized bytes copied from `libs/svcrec/vectors/ip-location.cbor`
+        // (public interop vector): a single-entry map keyed by the fixed
+        // ip-location UUID carrying an RFC 9164 address array.
+        let dir = write_temp_dir_tree(&["svcrec_ip_location"]);
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b"ip-location-vector = { h'ddb83814 5a37 4d0c 960e 8593d48c30fc' => [ +ip-address-or-prefix ] }\n;# import rfc9164\n",
+        );
+        let cbor = [
+            0xA1, 0x50, 0xDD, 0xB8, 0x38, 0x14, 0x5A, 0x37, 0x4D, 0x0C, 0x96, 0x0E, 0x85, 0x93,
+            0xD4, 0x8C, 0x30, 0xFC, 0x84, 0xD8, 0x34, 0x44, 0xC0, 0x00, 0x02, 0x01, 0xD8, 0x36,
+            0x50, 0x20, 0x01, 0x0D, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x01, 0xD8, 0x34, 0x82, 0x44, 0xC0, 0x00, 0x02, 0x01, 0x18, 0x18, 0xD8,
+            0x36, 0x82, 0x18, 0x40, 0x42, 0x20, 0x01,
+        ];
+        let cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        assert!(
+            exec(
+                &schema,
+                Some(&cbor_path),
+                false,
+                false,
+                false,
+                Some("ip-location-vector"),
+                true,
+            ),
+            "ip-location literal byte-string key must match the fixed UUID key"
         );
     }
 }

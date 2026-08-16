@@ -61,7 +61,14 @@ impl ByteLiteralBytes {
         )]
         {
             if text.starts_with(b"h'") && text.ends_with(b"'") {
-                let bytes = decode_hex(&text[2..(text.len() - 1)])?;
+                // The CDDL grammar allows whitespace between hex pairs
+                // (`HEX_PAIR = S HEXDIG S HEXDIG S`), e.g.
+                // `h'ddb83814 5a37 4d0c 960e 8593d48c30fc'`. Strip it
+                // before decoding so spaced literals match.
+                let content = &text[2..(text.len() - 1)];
+                let mut filtered = Vec::with_capacity(content.len());
+                filtered.extend(content.iter().copied().filter(|b| !b.is_ascii_whitespace()));
+                let bytes = decode_hex(&filtered)?;
                 Ok(ByteLiteralBytes::from_bytes(bytes))
             } else if text.starts_with(b"b64'") && text.ends_with(b"'") {
                 let bytes = decode_b64u(&text[4..(text.len() - 1)])?;
@@ -357,6 +364,16 @@ mod tests {
     fn parse_hex_byte_literal() {
         let value = ByteLiteralBytes::parse(b"h'48656c6c6f'").unwrap();
         assert_eq!(value.as_ref(), b"Hello");
+    }
+
+    #[test]
+    fn parse_spaced_hex_byte_literal() {
+        // The CDDL grammar permits whitespace between hex pairs.
+        let value = ByteLiteralBytes::parse(b"h'ddb83814 5a37 4d0c 960e 8593d48c30fc'").unwrap();
+        assert_eq!(value.as_ref(), &[
+            0xDD, 0xB8, 0x38, 0x14, 0x5A, 0x37, 0x4D, 0x0C, 0x96, 0x0E, 0x85, 0x93, 0xD4, 0x8C,
+            0x30, 0xFC
+        ]);
     }
 
     #[test]
