@@ -46,6 +46,7 @@ payload-abnf = '\n  payload = 32OCTET\n'
       <artwork><![CDATA[
 transformation = ".enc"
                 / ".hash"
+                / ".sign"
                 / ".compressed"
                 / ".compressed." algorithm
 algorithm      = cddl-identifier
@@ -53,9 +54,9 @@ representation = ".abnf" / ".abnfb"
 annotation     = transformation [ representation ]
                 / transformation representation
       ]]></artwork>
-      <t>In the CDDL source syntax, the complete annotation is written as one control-operator name. Examples include <tt>.enc</tt>, <tt>.enc.abnf</tt>, <tt>.hash.abnfb</tt>, <tt>.compressed.brotli</tt>, and <tt>.compressed.zstd.abnfb</tt>.</t>
+      <t>In the CDDL source syntax, the complete annotation is written as one control-operator name. Examples include <tt>.enc</tt>, <tt>.enc.abnf</tt>, <tt>.hash.abnfb</tt>, <tt>.sign</tt>, <tt>.compressed.brotli</tt>, and <tt>.compressed.zstd.abnfb</tt>.</t>
       <t>The algorithm component is an identifier selected from the registry defined by this document or from a future specification. An implementation that does not recognize the algorithm component MUST preserve the annotation and SHOULD emit a warning. It MUST NOT silently claim that the transformation was reversed.</t>
-      <t>The generic <tt>.enc</tt> and <tt>.hash</tt> forms do not identify an algorithm. They are useful when the algorithm is specified by an enclosing protocol or by out-of-band context.</t>
+      <t>The generic <tt>.enc</tt>, <tt>.hash</tt>, and <tt>.sign</tt> forms do not identify an algorithm. They are useful when the algorithm is specified by an enclosing protocol or by out-of-band context.</t>
     </section>
     <section anchor="semantics" numbered="true">
       <name>Transformation Semantics</name>
@@ -70,6 +71,12 @@ annotation     = transformation [ representation ]
         <t>The primary purpose of the <tt>.hash</tt> family is to authoritatively document the logical input represented by a digest carrier. It records that input schema next to the wire representation instead of relying on loose prose or an external Markdown document. The annotation indicates that the carrier is a digest or hash result derived from the logical value described by the controller.</t>
         <t>A hash is generally not reversible. An implementation without the input value and algorithm context MUST treat the controller as documentation and MUST validate only the carrier and independent constraints. It MUST NOT attempt to parse the digest bytes as the controller representation merely because the controller has an ABNF or CBOR suffix.</t>
         <t>An implementation that has the required input and hash algorithm MAY calculate and compare the expected result. Such verification is an additional semantic check and is not implied by parsing the CDDL annotation.</t>
+      </section>
+      <section anchor="signature" numbered="true">
+        <name>Signatures</name>
+        <t>The <tt>.sign</tt> family documents a signature carrier whose controller is the logical pre-image covered by the signature. The controller is the value to be signed; the signature bytes are carried by the value on the left-hand side. A schema using <tt>bstr .sign T</tt> therefore says that the byte string is a signature over a value described by <tt>T</tt>.</t>
+        <t>The signature carrier MUST NOT be interpreted as the controller or as a serialization of the controller. The controller identifies the signed pre-image, while the signature itself is stored in the carrier. An implementation MUST preserve this distinction when the controller has an <tt>.cbor</tt>, <tt>.dtrm</tt>, or ABNF representation suffix.</t>
+        <t>Signature verification requires the signature algorithm, public key, associated parameters, and any protocol-specific domain-separation or context data. Without those inputs, an implementation MUST treat the controller as documentation and MUST validate only the carrier and independent constraints. Parsing or validating the controller does not constitute signature verification.</t>
       </section>
       <section anchor="compression" numbered="true">
         <name>Compression</name>
@@ -157,7 +164,7 @@ zstd-data = bstr .compressed.zstd payload
       <name>Subtype and Composition Rules</name>
       <t>A transformation annotation narrows its carrier at the schema boundary. For example, <tt>bstr .enc T</tt> is a subtype of <tt>bstr</tt>, and <tt>bstr .compressed.brotli T</tt> is a subtype of <tt>bstr .compressed T</tt>.</t>
       <t>Two named compression algorithms are not subtypes of one another. A specific algorithm is a subtype of the generic <tt>.compressed</tt> form. The generic form is not a subtype of any specific algorithm.</t>
-      <t><tt>.enc</tt> and <tt>.hash</tt> are distinct transformation families. Neither is a subtype of the other, of compression, or of a named compression algorithm.</t>
+      <t><tt>.enc</tt>, <tt>.hash</tt>, and <tt>.sign</tt> are distinct transformation families. None is a subtype of another, of compression, or of a named compression algorithm.</t>
       <t>The controller is compared when both operators describe the same transformation family and compatible algorithms. A representation suffix does not make an encrypted value a subtype of an unencrypted value; it only describes the controller.</t>
       <t>For a nested bstr encoding, each transformation applies at its own carrier boundary. An outer encoding constraint MUST NOT be propagated into the bytes of an inner transformed bstr unless the schema explicitly introduces a reversible serialization control for that inner value.</t>
     </section>
@@ -194,11 +201,12 @@ zstd-data = bstr .compressed.zstd payload
     </section>
     <section anchor="iana-code" numbered="true">
       <name>Changes from Existing Extensions</name>
-      <t>This document provides the standards-track names for the previously deployed implementation extensions <tt>.x-enc</tt>, <tt>.x-hash</tt>, <tt>.x-compressed</tt>, <tt>.x-brotli</tt>, <tt>.x-zstd</tt>, <tt>.x-gzip</tt>, and <tt>.x-deflate</tt>.</t>
+      <t>This document provides the standards-track names for the previously deployed implementation extensions <tt>.x-enc</tt>, <tt>.x-hash</tt>, <tt>.x-sign</tt>, <tt>.x-compressed</tt>, <tt>.x-brotli</tt>, <tt>.x-zstd</tt>, <tt>.x-gzip</tt>, and <tt>.x-deflate</tt>.</t>
       <t>Implementations MAY accept the old names for compatibility, but new schemas SHOULD use the names defined here. The mapping is:</t>
       <artwork><![CDATA[
 .x-enc       -> .enc
 .x-hash      -> .hash
+.x-sign      -> .sign
 .x-compressed -> .compressed
 .x-brotli    -> .compressed.brotli
 .x-zstd      -> .compressed.zstd

@@ -5140,6 +5140,36 @@ fn validate_map_group_body(
                             path,
                             issues,
                         )
+                    } else if let Some(name) = grpent_bare_reference_name(body) {
+                        // A `grpent` that is a bare group/type reference
+                        // (`foo = Bar` or a socket plug RHS such as
+                        // `$$socket //= SomeGroup`) contributes the named
+                        // group's map entries. Route through the named
+                        // group resolver so socket plugs and group rules
+                        // validate their entries.
+                        validate_named_map_group(
+                            compiled,
+                            definitions,
+                            &name,
+                            entries,
+                            used,
+                            path,
+                            issues,
+                        )
+                    } else if find_memberkey(body).is_some() {
+                        // A single map-entry `grpent` body
+                        // (`foo = key => value`): match one CBOR map
+                        // entry against the member key and validate its
+                        // key and value schemas.
+                        validate_single_entry_map_group(
+                            compiled,
+                            definitions,
+                            body,
+                            entries,
+                            used,
+                            path,
+                            issues,
+                        )
                     } else {
                         false
                     }
@@ -5199,6 +5229,108 @@ fn validate_map_group_body(
     }
 
     false
+}
+
+/// If a `grpent` body is a bare group/type reference (no member key, no
+/// parenthesized group) such as `foo = Bar` or a socket plug RHS
+/// `$$socket //= SomeGroup`, return the referenced name.
+fn grpent_bare_reference_name(node: &WrappedNode) -> Option<String> {
+    let WrappedNode::Syntax { rule, children, .. } = node else {
+        return None;
+    };
+    if rule != "grpent" {
+        return None;
+    }
+    // A bare group/type reference has no member key; a member-keyed
+    // grpent is a map entry, not a group reference.
+    if children
+        .iter()
+        .any(|child| matches!(child, WrappedNode::Syntax { rule, .. } if rule == "memberkey"))
+    {
+        return None;
+    }
+    find_single_typename(children)
+}
+
+/// Find the single `groupname`/`typename` reference in a bare grpent
+/// body, descending through `type`/`type1`/`type2` wrappers.
+fn find_single_typename(children: &[WrappedNode]) -> Option<String> {
+    for child in children {
+        match child {
+            WrappedNode::Syntax { rule, text, .. }
+                if matches!(rule.as_str(), "groupname" | "typename") =>
+            {
+                return Some(text.trim().to_owned());
+            },
+            WrappedNode::Syntax {
+                children: inner, ..
+            } => {
+                if let Some(name) = find_single_typename(inner) {
+                    return Some(name);
+                }
+            },
+            _ => {},
+        }
+    }
+    None
+}
+
+/// Validate a `grpent` that is a single map entry (`key => value` or
+/// `key: value`) against the CBOR map entries, matching one entry and
+/// validating its key and value schemas.
+fn validate_single_entry_map_group(
+    compiled: &CompiledCDDL,
+    definitions: &HashMap<String, &WrappedNode>,
+    grpent: &WrappedNode,
+    entries: &[MapEntry],
+    used: &mut [bool],
+    path: &[PathStep],
+    issues: &mut Vec<ValidationIssue>,
+) -> bool {
+    let Some(memberkey) = find_memberkey(grpent) else {
+        return false;
+    };
+    let Some(body) = find_grpent_body(grpent) else {
+        return false;
+    };
+    let Some((entry_index, entry)) =
+        find_matching_map_entry(compiled, definitions, Some(memberkey), entries, used)
+    else {
+        issues.push(ValidationIssue::new(
+            path.to_owned(),
+            "a matching map entry",
+            "no match",
+            Some("required map entry was missing".to_owned()),
+        ));
+        return false;
+    };
+
+    let mut key_path = path.to_owned();
+    key_path.push(PathStep::MapKey(entry_index));
+    let mut value_path = path.to_owned();
+    value_path.push(PathStep::MapValue(entry_index));
+    record_schema_note_once(&key_path, schema_summary(memberkey));
+    validate_schema_node(
+        compiled,
+        definitions,
+        memberkey,
+        &entry.key,
+        &mut key_path,
+        issues,
+    );
+    record_schema_note_once(&value_path, schema_summary(body));
+    validate_schema_node(
+        compiled,
+        definitions,
+        body,
+        &entry.value,
+        &mut value_path,
+        issues,
+    );
+    if let Some(slot) = used.get_mut(entry_index) {
+        *slot = true;
+    }
+    issues.is_empty()
 }
 
 /// Validate a concrete `group` node in map-entry context.
@@ -5735,6 +5867,12 @@ fn simple_value_code(value: &Value) -> Option<u8> {
 }
 
 /// Parse a literal value node into an entry state.
+///
+/// The node may be the literal itself (`value`, `bytes`, `text`, `uint`,
+/// `int`, `intfloat`, `number`) or a `type2`/`type` wrapper whose direct
+/// child is a `value` (for example a byte-string member key written
+/// `h'...' => T`). Recurse through the `value` wrapper so literals in
+/// either shape resolve.
 fn parse_value_literal(node: &WrappedNode) -> Option<EntryState> {
     let WrappedNode::Syntax { children, .. } = node else {
         return None;
@@ -5742,6 +5880,7 @@ fn parse_value_literal(node: &WrappedNode) -> Option<EntryState> {
     for child in children {
         if let WrappedNode::Syntax { rule, text, .. } = child {
             return match rule.as_str() {
+                "value" => parse_value_literal(child),
                 "uint" | "int" => text.trim().parse::<i128>().ok().map(EntryState::Integer),
                 "intfloat" | "number" => {
                     let trimmed = text.trim();
@@ -6318,6 +6457,156 @@ one-pq-private-key //= (-50 => bstr .size 32)
         cbor.extend([0x62; 32]);
 
         let issues = validate_schema_bytes("map_group_socket_entry.cddl", schema, &cbor);
+
+        assert!(issues.is_empty(), "{issues:#?}");
+    }
+
+    #[test]
+    fn validate_accepts_named_bstr_type_memberkey() {
+        // RFC 8610 §3.5.2: an unquoted identifier on the LHS of `=>` is a
+        // TYPE, not a bareword literal. `buuidv4 => any` must match a map
+        // whose key is a 16-byte bstr by validating the key against the
+        // `buuidv4` rule — never by comparing the key to the literal text
+        // "buuidv4". This is the dntls-libs svcrec service-data shape.
+        let schema = br"
+root = { buuidv4 => any }
+buuidv4 = bstr .size 16
+";
+        let mut cbor = vec![0xA1, 0x50];
+        cbor.extend([
+            0x55, 0x0E, 0x84, 0x00, 0xE2, 0x9B, 0x41, 0xD4, 0xA7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
+        ]);
+        cbor.push(0x00);
+
+        let issues = validate_schema_bytes("named_bstr_type_memberkey.cddl", schema, &cbor);
+
+        assert!(issues.is_empty(), "{issues:#?}");
+    }
+
+    #[test]
+    fn validate_rejects_text_key_for_named_type_memberkey() {
+        // Negative control: `buuidv4 => any` is a type key. A literal
+        // text key "buuidv4" is NOT a 16-byte bstr, so it must not match.
+        let schema = br"
+root = { buuidv4 => any }
+buuidv4 = bstr .size 16
+";
+        let cbor = [0xA1, 0x67, b'b', b'u', b'u', b'i', b'd', b'v', b'4', 0x00];
+
+        let issues = validate_schema_bytes("text_key_for_type_memberkey.cddl", schema, &cbor);
+
+        assert!(
+            !issues.is_empty(),
+            "text key must not match a bstr type key"
+        );
+    }
+
+    #[test]
+    fn validate_bareword_memberkey_still_matches_text_key() {
+        // Regression: the `:` form with an unquoted identifier is a
+        // literal text-string key (bareword), unchanged by the type-key
+        // fix.
+        let schema = br"
+root = { foo: uint }
+";
+        let cbor = [0xA1, 0x63, b'f', b'o', b'o', 0x01];
+
+        let issues = validate_schema_bytes("bareword_memberkey_text.cddl", schema, &cbor);
+
+        assert!(issues.is_empty(), "{issues:#?}");
+    }
+
+    #[test]
+    fn validate_bareword_memberkey_does_not_match_bstr_key() {
+        // Negative control for the `:` form: `foo: uint` is the literal
+        // text key "foo"; a bstr key must not match it.
+        let schema = br"
+root = { foo: uint }
+";
+        let mut cbor = vec![0xA1, 0x41, 0x00];
+        cbor.push(0x01);
+
+        let issues = validate_schema_bytes("bareword_memberkey_bstr.cddl", schema, &cbor);
+
+        assert!(
+            !issues.is_empty(),
+            "bstr key must not match a bareword text key"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_socket_plug_bstr_literal_key() {
+        // Faithful dntls-libs svcrec shape for kinds with a concrete
+        // binary UUID key, e.g.
+        //   nostr-service = ( h'fd7c8fb4 4201 4bcd b2b6 a4a2e1e4c046' => data )
+        // The `h'...'` member key is a literal byte-string value (not a
+        // bareword), and must match a 16-byte bstr map key through the
+        // `$$service-data` socket plug chain.
+        let schema = br"
+root = { * $$service-data }
+$$service-data //= nostr-service
+nostr-service = ( h'fd7c8fb442014bcdb2b6a4a2e1e4c046' => any )
+";
+        let mut cbor = vec![0xA1, 0x50];
+        cbor.extend([
+            0xFD, 0x7C, 0x8F, 0xB4, 0x42, 0x01, 0x4B, 0xCD, 0xB2, 0xB6, 0xA4, 0xA2, 0xE1, 0xE4,
+            0xC0, 0x46,
+        ]);
+        cbor.push(0x00);
+
+        let issues = validate_schema_bytes("svcrec_bstr_literal_plug.cddl", schema, &cbor);
+
+        assert!(issues.is_empty(), "{issues:#?}");
+    }
+
+    #[test]
+    fn validate_accepts_socket_plug_named_bstr_type_key() {
+        // Faithful dntls-libs svcrec shape:
+        //   service-record-data = { * $$service-data }
+        //   $$service-data //= generic-service-data
+        //   generic-service-data = ( buuidv4 => any )
+        // The socket plug contributes a map entry whose key is a
+        // 16-byte bstr validated against the `buuidv4` type.
+        let schema = br"
+root = { * $$service-data }
+$$service-data //= generic-service-data
+generic-service-data = ( buuidv4 => any )
+buuidv4 = bstr .size 16
+";
+        let mut cbor = vec![0xA1, 0x50];
+        cbor.extend([
+            0x55, 0x0E, 0x84, 0x00, 0xE2, 0x9B, 0x41, 0xD4, 0xA7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
+        ]);
+        cbor.push(0x00);
+
+        let issues = validate_schema_bytes("svcrec_socket_plug.cddl", schema, &cbor);
+
+        assert!(issues.is_empty(), "{issues:#?}");
+    }
+
+    #[test]
+    fn validate_accepts_socket_plug_within_generic_record() {
+        // Faithful dntls-libs svcrec shape including the `.within`
+        // guard: service-record-data = { * $$service-data } .within
+        // generic-service-record, where generic-service-record admits
+        // any generic-service-data entry.
+        let schema = br"
+root = { * $$service-data } .within generic-service-record
+generic-service-record = { * generic-service-data }
+$$service-data //= generic-service-data
+generic-service-data = ( buuidv4 => any )
+buuidv4 = bstr .size 16
+";
+        let mut cbor = vec![0xA1, 0x50];
+        cbor.extend([
+            0x55, 0x0E, 0x84, 0x00, 0xE2, 0x9B, 0x41, 0xD4, 0xA7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
+        ]);
+        cbor.push(0x00);
+
+        let issues = validate_schema_bytes("svcrec_within_generic_record.cddl", schema, &cbor);
 
         assert!(issues.is_empty(), "{issues:#?}");
     }

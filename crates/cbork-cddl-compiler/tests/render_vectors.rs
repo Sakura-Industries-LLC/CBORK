@@ -579,6 +579,7 @@ ml-dsa-87_signature = bstr .size 4627\n";
 }
 
 #[test]
+#[ignore = "requires the ephemeral test/ directory (dntls-pqsig fixture), which is not stable repo data"]
 fn render_pqsig_fixture_keeps_nested_effective_view_indented() {
     let compiled = compile("test/pqsig/doc/pqsig.cddl");
     let cddl = render_concrete(&compiled);

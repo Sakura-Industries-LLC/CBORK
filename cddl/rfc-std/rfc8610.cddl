@@ -45,7 +45,7 @@ uuidv4-abnf = "UUIDv4" .det '
                random-c-and-variant
     random-a              = 6OCTET
     version-and-random-b  = %x40-4F OCTET
-    random-c-and-bariant  = %x80-BF 7OCTET
+    random-c-and-variant  = %x80-BF 7OCTET
 '
 
 uuidv7-abnf = "UUIDv7" .det '

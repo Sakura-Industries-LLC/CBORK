@@ -3669,6 +3669,7 @@ rule = 1
     // dntls-cose-defs.cddl. We use the detailed dump so the
     // CDN-comment breakdown is exercised end-to-end.
     #[test]
+    #[ignore = "requires the ephemeral test/ directory (dntls-core fixtures); not stable repo data and would embed proprietary dntls types"]
     fn cli_validate_dntls_mlkem768_x25519_public_key_succeeds() {
         let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
