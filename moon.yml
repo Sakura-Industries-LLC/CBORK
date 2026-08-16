@@ -123,7 +123,6 @@ tasks:
     inputs:
       - "/scripts/**/*.sh"
       - "/cddl/**/*.cddl"
-      - "/test/**/*.cddl"
 
   markdown-fix:
     command: "rumdl"
