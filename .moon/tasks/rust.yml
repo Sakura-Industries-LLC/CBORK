@@ -43,7 +43,6 @@ tasks:
       - "-c"
       - 'cargo deny --config deny.toml --manifest-path "$projectRoot/Cargo.toml" check advisories || true'
     options:
-      cache: false
       runFromWorkspaceRoot: true
       runInCI: true
     inputs:

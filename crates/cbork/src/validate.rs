@@ -1148,6 +1148,71 @@ fn validate_type_choice(
     ));
 }
 
+/// Validate a value against a numeric range (`lo..hi` / `lo...hi`)
+/// expressed as a `rangeop` between two `type2` leaves.
+fn validate_range_value(
+    compiled: &CompiledCDDL,
+    lhs: &WrappedNode,
+    rangeop: &str,
+    rhs: &WrappedNode,
+    value: &Value,
+    path: &mut Vec<PathStep>,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let exclusive = rangeop == "...";
+    let lhs_state = resolve_type2_leaf(lhs, &compiled.resolved_types);
+    let rhs_state = resolve_type2_leaf(rhs, &compiled.resolved_types);
+    match (lhs_state, rhs_state) {
+        (Some(EntryState::Integer(lo)), Some(EntryState::Integer(hi))) => {
+            validate_state(
+                &EntryState::RangeInt {
+                    exclusive,
+                    min: lo,
+                    max: hi,
+                },
+                value,
+                path,
+                issues,
+            );
+        },
+        (Some(EntryState::Float(lo)), Some(EntryState::Float(hi))) => {
+            validate_state(
+                &EntryState::RangeFloat {
+                    exclusive,
+                    min: lo,
+                    max: hi,
+                },
+                value,
+                path,
+                issues,
+            );
+        },
+        _ => {
+            issues.push(ValidationIssue::new(
+                path.clone(),
+                "a numeric range",
+                format!("{value}"),
+                Some(format!("unsupported range bounds `{rangeop}`")),
+            ));
+        },
+    }
+}
+
+/// Parse a bare integer range text (`0..32` / `0...32`) into bounds.
+fn parse_integer_range_text(text: &str) -> Option<(i128, i128, bool)> {
+    let (exclusive, op) = if text.contains("...") {
+        (true, "...")
+    } else if text.contains("..") {
+        (false, "..")
+    } else {
+        return None;
+    };
+    let (lo, hi) = text.split_once(op)?;
+    let lo = lo.trim().parse::<i128>().ok()?;
+    let hi = hi.trim().parse::<i128>().ok()?;
+    Some((lo, hi, exclusive))
+}
+
 /// Validate a `type1` node, including control-operator forms.
 fn validate_type1(
     compiled: &CompiledCDDL,
@@ -1161,16 +1226,27 @@ fn validate_type1(
     let mut lhs: Option<&WrappedNode> = None;
     let mut op: Option<&str> = None;
     let mut rhs: Option<&WrappedNode> = None;
+    let mut rangeop: Option<&str> = None;
 
     for child in children {
         if let WrappedNode::Syntax { rule, .. } = child {
             match rule.as_str() {
                 "type2" if lhs.is_none() => lhs = Some(child),
                 "ctlop" => op = Some(child_text(child).trim()),
+                "rangeop" => rangeop = Some(child_text(child).trim()),
                 "type2" => rhs = Some(child),
                 _ => {},
             }
         }
+    }
+
+    if let (Some(lhs), Some(rangeop), Some(rhs)) = (lhs, rangeop, rhs) {
+        // A bare numeric range (`0..32` / `0...32`) is a `type1` whose
+        // children are `type2 ~ rangeop ~ type2`. The validator must
+        // check the value against the range rather than treating the
+        // lower bound as a literal.
+        validate_range_value(compiled, lhs, rangeop, rhs, value, path, issues);
+        return;
     }
 
     if let (Some(lhs), Some(op), Some(rhs)) = (lhs, op, rhs) {
@@ -1266,6 +1342,23 @@ fn validate_type2(
         }
     }) {
         validate_named_rule(compiled, definitions, &name, value, path, issues);
+        return;
+    }
+
+    if let Some((lo, hi, exclusive)) = parse_integer_range_text(trimmed) {
+        // A bare numeric range written in one node (`0..32`). Validate
+        // the value against the range instead of treating the lower
+        // bound as a literal.
+        validate_state(
+            &EntryState::RangeInt {
+                exclusive,
+                min: lo,
+                max: hi,
+            },
+            value,
+            path,
+            issues,
+        );
         return;
     }
 
@@ -8524,6 +8617,62 @@ headers = ( protected: bstr .size 0, unprotected: {} )
             ),
             "svcrec generic-service-data vector must validate"
         );
+    }
+
+    #[test]
+    fn validate_svcrec_ip_address_locations_type() {
+        // Exact dntls-libs svcrec cross-verify command:
+        //   cbork validate --type=ip-address-locations \
+        //     doc/service-data/location/ip-address.cddl vectors/ip-address-locations.cbor
+        // The full service-data file (group + socket + rfc9164 import)
+        // must validate the 4-element RFC 9164 array, including the
+        // with-prefix and prefix forms whose prefix lengths are bare
+        // numeric ranges (`ipv4-prefix-length = 0..32`,
+        // `ipv6-prefix-length = 0..128`).
+        let dir = write_temp_dir_tree(&["svcrec_ip_addr_type"]);
+        let schema = write_cddl(
+            &dir,
+            "schema.cddl",
+            b"ip-location = ( h'ddb83814 5a37 4d0c 960e 8593d48c30fc' => ip-address-locations )\nip-address-locations = [ +ip-address-or-prefix ]\n$$service-data //= ip-location\n;# import rfc9164\n",
+        );
+        // Serialized bytes copied from `libs/svcrec/vectors/ip-address-locations.cbor`.
+        let cbor = [
+            0x84, 0xD8, 0x34, 0x44, 0xC0, 0x00, 0x02, 0x01, 0xD8, 0x36, 0x50, 0x20, 0x01, 0x0D,
+            0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xD8,
+            0x34, 0x82, 0x44, 0xC0, 0x00, 0x02, 0x01, 0x18, 0x18, 0xD8, 0x36, 0x82, 0x18, 0x40,
+            0x42, 0x20, 0x01,
+        ];
+        let cbor_path = write_cbor(&dir, "value.cbor", &cbor);
+
+        assert!(
+            exec(
+                &schema,
+                Some(&cbor_path),
+                false,
+                false,
+                false,
+                Some("ip-address-locations"),
+                true,
+            ),
+            "ip-address-locations vector must validate all four RFC 9164 forms"
+        );
+    }
+
+    #[test]
+    fn validate_bare_integer_range_members() {
+        // A bare numeric range (`0..32`) as a type/member must check the
+        // value against the range, not treat the lower bound as a
+        // literal. This is the rfc9164 prefix-length shape.
+        let in_ok = validate_schema_bytes("range_in.cddl", b"root = 0..32\n", &[0x18, 24]);
+        assert!(in_ok.is_empty(), "{in_ok:#?}");
+
+        let in_map = validate_schema_bytes("range_in_map.cddl", b"root = { prefix: 0..128 }\n", &[
+            0xA1, 0x66, b'p', b'r', b'e', b'f', b'i', b'x', 0x18, 64,
+        ]);
+        assert!(in_map.is_empty(), "{in_map:#?}");
+
+        let out = validate_schema_bytes("range_out.cddl", b"root = 0..32\n", &[0x18, 33]);
+        assert!(!out.is_empty(), "33 must be rejected by 0..32");
     }
 
     #[test]
