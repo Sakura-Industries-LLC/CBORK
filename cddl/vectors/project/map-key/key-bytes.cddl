@@ -1,0 +1,2 @@
+thismap = { keytype => any }
+keytype = h'00'

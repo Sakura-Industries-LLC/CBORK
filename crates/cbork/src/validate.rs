@@ -142,9 +142,10 @@ struct EmbeddedCborHint {
 }
 
 /// Validate a CDDL schema against a CBOR payload.
+#[must_use]
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::fn_params_excessive_bools)]
-pub(crate) fn exec(
+pub fn exec(
     schema_path: &Path,
     cbor_path: Option<&Path>,
     show_warnings: bool,

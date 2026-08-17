@@ -18,6 +18,8 @@ tasks:
       - "root:spell-check"
       - "root:cbork-rfc-std-lint"
       - "root:cbork-rfc-vectors-lint"
+      - "root:cbork-map-key-vectors-lint"
+      - "root:cbork-map-key-vectors-validate"
       - "root:render-roundtrip-all"
       - "crates/cbork:help-smoke"
     options:
@@ -57,6 +59,48 @@ tasks:
       outputStyle: "stream"
     inputs:
       - "cddl/vectors/rfc/**/*.cddl"
+      - "crates/cbork/**/*.rs"
+      - "crates/cbork-cddl-compiler/**/*.rs"
+      - "crates/cbork-cddl-parser/**/*.rs"
+      - "crates/cbork-abnf-parser/**/*.rs"
+      - "crates/cbork-edn/**/*.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+  cbork-map-key-vectors-lint:
+    deps:
+      - "crates/cbork:build"
+    command: "bash"
+    args:
+      - "-lc"
+      - "target/release/cbork lint --strict cddl/vectors/project/map-key"
+    options:
+      runFromWorkspaceRoot: true
+      runInCI: true
+      outputStyle: "stream"
+    inputs:
+      - "cddl/vectors/project/map-key/**"
+      - "crates/cbork/**/*.rs"
+      - "crates/cbork-cddl-compiler/**/*.rs"
+      - "crates/cbork-cddl-parser/**/*.rs"
+      - "crates/cbork-abnf-parser/**/*.rs"
+      - "crates/cbork-edn/**/*.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+  cbork-map-key-vectors-validate:
+    deps:
+      - "crates/cbork:build"
+    command: "bash"
+    args:
+      - "scripts/test-vectors.sh"
+    options:
+      runFromWorkspaceRoot: true
+      runInCI: true
+      outputStyle: "stream"
+    inputs:
+      - "/scripts/test-vectors.sh"
+      - "/cddl/vectors/project/map-key/**"
       - "crates/cbork/**/*.rs"
       - "crates/cbork-cddl-compiler/**/*.rs"
       - "crates/cbork-cddl-parser/**/*.rs"
