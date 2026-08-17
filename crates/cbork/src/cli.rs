@@ -22,7 +22,7 @@ use crate::{
 #[derive(Debug, Clone, Bpaf)]
 #[bpaf(options, version)]
 #[allow(clippy::struct_excessive_bools)]
-pub(crate) struct Cli {
+pub struct Cli {
     /// Color policy for terminal output.
     #[bpaf(long, argument("auto|always|never"), fallback(ColorMode::Auto))]
     color: ColorMode,
@@ -62,7 +62,7 @@ pub(crate) struct Cli {
 
 impl Cli {
     /// Execute the selected command.
-    pub(crate) fn exec(self) {
+    pub fn exec(self) {
         let _ = (self.color, self.verbose, self.config.as_ref());
         let show_banner =
             !self.quiet && !self.no_banner && matches!(self.format, OutputFormat::Rich);
