@@ -7609,12 +7609,14 @@ headers = ( protected: bstr .size 0, unprotected: {} )
     // or `.dtrmseq` control operator.
     //
     // Fixture provenance:
-    // * The `<<...>>` output syntax is taken from `rfc/draft-ietf-cbor-edn-literals-25.txt`
-    //   Section 2.5.6 (embedded CBOR) and Section 5.1 (grammar). The comma-separated sequence
-    //   inside the wrapper is the draft's prescribed formatting.
+    // * The `<<...>>` output syntax is taken from
+    //   `rfc/draft-ietf-cbor-edn-literals-25.txt` Section 2.5.6 (embedded CBOR) and
+    //   Section 5.1 (grammar). The comma-separated sequence inside the wrapper is the
+    //   draft's prescribed formatting.
     // * The deterministic re-encoding used by `.dtrm`/`.dtrmseq` is
-    //   `rfc/draft-ietf-cbor-serialization-06.txt` Section 5 (deterministic serialization),
-    //   which is a strict superset of Section 4 (preferred-plus serialization).
+    //   `rfc/draft-ietf-cbor-serialization-06.txt` Section 5 (deterministic
+    //   serialization), which is a strict superset of Section 4 (preferred-plus
+    //   serialization).
     // * The preferred-plus re-encoding used by `.prefp`/`.prefpseq` is
     //   `rfc/draft-ietf-cbor-serialization-06.txt` Section 4.
     // * The COSE-style `{protected: h'a10126', unprotected: {}}` example is taken from
@@ -7708,10 +7710,12 @@ headers = ( protected: bstr .size 0, unprotected: {} )
     // Fixture provenance:
     // * The composed `.det` resolution rule comes from RFC 8610 §3.5 (the `.det`
     //   text-processing operator).
-    // * The preferred-plus / deterministic / `.abnf` / `.abnfb` control operators are defined
-    //   in `rfc/draft-ietf-cbor-serialization-06.txt` and the embedded-CBOR extension; plan
-    //   017 integrates the `cbork-abnf-parser` trace API to expose match trees.
-    // * The CDN comment syntax follows `rfc/draft-ietf-cbor-edn-literals-25.txt` section 2.2.
+    // * The preferred-plus / deterministic / `.abnf` / `.abnfb` control operators are
+    //   defined in `rfc/draft-ietf-cbor-serialization-06.txt` and the embedded-CBOR
+    //   extension; plan 017 integrates the `cbork-abnf-parser` trace API to expose match
+    //   trees.
+    // * The CDN comment syntax follows `rfc/draft-ietf-cbor-edn-literals-25.txt` section
+    //   2.2.
 
     #[test]
     fn abnfb_accepts_direct_text_rhs_with_valid_bytes() {
@@ -8581,8 +8585,8 @@ headers = ( protected: bstr .size 0, unprotected: {} )
         //   generic-service-data-vector = { generic-service-data }
         //   generic-service-data = ( buuidv4 => any )      (via ./generic.cddl)
         //   buuidv4 = bstr .abnfb uuidv4-abnf             (via rfc8610 import)
-        // vector: { h'0123456789ab4cde8f0123456789abcd' : "example generic service data payload"
-        // }
+        // vector: { h'0123456789ab4cde8f0123456789abcd' : "example generic service data
+        // payload" }
         let dir = write_temp_dir_tree(&["svcrec_import_repro"]);
         write_cddl(
             &dir,

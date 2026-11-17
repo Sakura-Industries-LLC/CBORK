@@ -2800,7 +2800,7 @@ rule = 1
 
         // Step 5: transform to synthetic Markdown.
         let synthetic = cbork_cddl_compiler::transform_to_markdown(&source);
-        assert!(!synthetic.text.is_empty());
+        assert_ne!(synthetic.text, "");
 
         // Step 7: run `rumdl` on the synthetic Markdown in memory.
         // The call must not error and must produce a Vec<LintWarning>

@@ -72,3 +72,22 @@ private = { ignore = true }
 # Permit an allow-list entry to go unused, so that removing the last
 # dependency that needs a license does not require editing this file.
 unused-allowed-license = "allow"
+
+# `ar_archive_writer` is a build-time-only dependency (build script of `psm`,
+# via `stacker` -> `pest_stack_guard` -> `pest`). Its license is Apache-2.0
+# with the LLVM exception, which only relaxes Apache-2.0's attribution terms.
+[[licenses.exceptions]]
+crate = "ar_archive_writer"
+allow = ["Apache-2.0 WITH LLVM-exception"]
+
+# `dragonbox_ecma` (float formatting) arrives via `rumdl` -> `oxc_parser`
+# -> `oxc_syntax`. Both offered licenses are permissive.
+[[licenses.exceptions]]
+crate = "dragonbox_ecma"
+allow = ["Apache-2.0 WITH LLVM-exception", "BSL-1.0"]
+
+# `zstd-sys` bundles zstd, which is BSD-3-Clause AND BSD-2-Clause. It is only
+# used at build time by `build-info-build` / the `build-info-proc` macro.
+[[licenses.exceptions]]
+crate = "zstd-sys"
+allow = ["BSD-2-Clause"]

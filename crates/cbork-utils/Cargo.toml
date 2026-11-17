@@ -19,4 +19,4 @@ half = "2"
 minicbor = { version = "2", features = ["std", "half"] }
 
 [dev-dependencies]
-proptest = { version = "1.6.0", features = ["attr-macro"] }
+proptest = { version = "1.12.0", features = ["attr-macro"] }

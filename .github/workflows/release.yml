@@ -1,0 +1,142 @@
+# Build and publish `cbork` CLI binaries when a `v*` tag is pushed.
+#
+# The tag must match the `cbork` crate version (`crates/cbork/Cargo.toml`),
+# e.g. `v0.0.20`. Library crate versions are independent and not checked.
+#
+# Each target is built natively on a matching runner; `rumdl` pulls in
+# jemalloc (unix) / mimalloc (msvc) C code, so cross-compiling is avoided.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUST_TOOLCHAIN: "1.99.1"
+  CARGO_TERM_COLOR: always
+  # The workspace denies all warnings; lint enforcement belongs to `just fix-ci`,
+  # not the release build, so a new compiler lint cannot block a tagged release.
+  RUSTFLAGS: --cap-lints=warn
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check-version:
+    name: Check tag matches cbork version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Compare tag with crate version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "cbork") | .version')
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match cbork version ${version}"
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: check-version
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      # Keep LF endings on Windows: build.rs embeds the agent-skill files verbatim.
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          target_env=$(echo "${{ matrix.target }}" | tr '-' '_')
+          echo "CC_${target_env}=musl-gcc" >> "$GITHUB_ENV"
+      # Build jemalloc for up to 64 KiB pages so the arm64 binary also runs on
+      # 16K/64K page kernels (Asahi, some RHEL/Ampere setups).
+      - name: Configure jemalloc page size
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: echo "JEMALLOC_SYS_WITH_LG_PAGE=16" >> "$GITHUB_ENV"
+      - name: Build
+        run: cargo build --release --locked -p cbork --target "${{ matrix.target }}"
+      - name: Package
+        run: |
+          name="cbork-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          ext=""
+          if [ "${{ runner.os }}" = "Windows" ]; then ext=".exe"; fi
+          mkdir "${name}"
+          cp "target/${{ matrix.target }}/release/cbork${ext}" "${name}/"
+          cp README.md crates/cbork/LICENSE LICENSE-AGPL-3.0 "${name}/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a -tzip "${name}.zip" "${name}"
+          else
+            tar -czf "${name}.tar.gz" "${name}"
+          fi
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: cbork-${{ github.ref_name }}-${{ matrix.target }}.*
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.target }}
+          path: cbork-${{ github.ref_name }}-${{ matrix.target }}.*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum cbork-* > SHA256SUMS
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --title "cbork ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/cbork-* dist/SHA256SUMS

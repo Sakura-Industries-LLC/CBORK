@@ -419,7 +419,8 @@ mod tests {
 
         assert!(Map::decode(&mut decoder, &mut DecodeCtx::Deterministic).is_ok());
 
-        // Test case 2: Invalid non-minimal encoding (using additional info 24 for length 1)
+        // Test case 2: Invalid non-minimal encoding (using additional info 24 for length
+        // 1)
         let invalid_small = vec![
             0xB8, // Map with additional info = 24 (0xa0 | 0x18)
             0x01, // Length encoded as uint8 = 1

@@ -1084,7 +1084,7 @@ fn metadata_empty_by_default() {
         origin: SourceOrigin::new(PathBuf::from("test.cddl"), 1, 1),
         metadata: Vec::new(),
     };
-    assert!(node.metadata().is_empty());
+    assert_eq!(node.metadata(), []);
 }
 
 #[test]
@@ -3496,8 +3496,8 @@ fn bug_003_alias_generic_helper_closure_lints_cleanly() {
     //     names (`tagged<t>` -> `tagged`);
     //   * not re-prefix an already-qualified reference (`a.Wrapper` must stay `a.Wrapper`
     //     when the consumer's alias is `middle`, not become `middle.a.Wrapper`);
-    //   * not recurse into Directive node children, which already carry the importer's final
-    //     shape.
+    //   * not recurse into Directive node children, which already carry the importer's
+    //     final shape.
     let path = fixture_path("cddl/vectors/project/bugs/bug_003_alias_generic_helper_closure.cddl");
     let compiled = CompiledCDDL::compile(&path, None::<&Path>).unwrap();
 

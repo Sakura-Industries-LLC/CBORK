@@ -161,9 +161,9 @@ pub(crate) fn finalize_compiled(compiled: &mut CompiledCDDL) {
     // information only available in the unpruned tree:
     //
     // * The pre-populated cache used by the postlude merge below.
-    // * The set of top-level rule names visible to the file, used by the reference-resolution
-    //   pass to decide whether a referenced name is "user-defined" (and therefore not in need
-    //   of postlude injection) or genuinely undefined.
+    // * The set of top-level rule names visible to the file, used by the
+    //   reference-resolution pass to decide whether a referenced name is "user-defined"
+    //   (and therefore not in need of postlude injection) or genuinely undefined.
     let original_user_nodes = compiled.user_nodes.clone();
     let original_definition_names = collect_definition_names(&original_user_nodes);
     let original_generic_definition_names =
@@ -579,7 +579,8 @@ fn collect_definition_strength_actions(
             //
             // The consumer's "direct surface" includes:
             //   * its own definitions (origin matches consumer);
-            //   * names it explicitly cherry-picked via `from ... import <name>,...` directives;
+            //   * names it explicitly cherry-picked via `from ... import <name>,...`
+            //     directives;
             //   * names referenced by the consumer's own definitions.
             let previous_in_consumer = previous.origin.source_path == consumer_source_path;
             let site_in_consumer = site.origin.source_path == consumer_source_path;
