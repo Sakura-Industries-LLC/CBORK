@@ -89,11 +89,18 @@ jobs:
           sudo apt-get install -y --no-install-recommends musl-tools
           target_env=$(echo "${{ matrix.target }}" | tr '-' '_')
           echo "CC_${target_env}=musl-gcc" >> "$GITHUB_ENV"
-      # Build jemalloc for up to 64 KiB pages so the arm64 binary also runs on
-      # 16K/64K page kernels (Asahi, some RHEL/Ampere setups).
-      - name: Configure jemalloc page size
+      # aarch64 musl:
+      # * Build jemalloc for up to 64 KiB pages so the binary also runs on
+      #   16K/64K page kernels (Asahi, some RHEL/Ampere setups).
+      # * GCC defaults to -moutline-atomics on aarch64, which calls libgcc
+      #   helpers that need glibc's __getauxval. Under musl-gcc they fail to
+      #   link, so jemalloc's configure finds no atomics and the C build fails.
+      #   Inline the atomics instead.
+      - name: Configure aarch64 musl C builds
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: echo "JEMALLOC_SYS_WITH_LG_PAGE=16" >> "$GITHUB_ENV"
+        run: |
+          echo "JEMALLOC_SYS_WITH_LG_PAGE=16" >> "$GITHUB_ENV"
+          echo "CFLAGS_aarch64_unknown_linux_musl=-mno-outline-atomics" >> "$GITHUB_ENV"
       - name: Build
         run: cargo build --release --locked -p cbork --target "${{ matrix.target }}"
       - name: Package
