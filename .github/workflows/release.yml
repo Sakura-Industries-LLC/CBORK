@@ -58,7 +58,9 @@ jobs:
       id-token: write
       attestations: write
     strategy:
-      fail-fast: true
+      # Run every target to completion so one run reports all platform failures.
+      # The release job still requires every build to succeed.
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-24.04
