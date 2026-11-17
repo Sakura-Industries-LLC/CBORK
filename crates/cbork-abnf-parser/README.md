@@ -30,6 +30,6 @@ direct users typically only need it for testing CDDL control-operator rules that
 Licensed under `MIT OR Apache-2.0`.
 See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE) in this directory for the full texts.
 
-This crate is part of the [cbork workspace](https://github.com/SakuraIndustries/cbork).
+This crate is part of the [cbork workspace](https://github.com/Sakura-Industries-LLC/CBORK).
 
 [rfc5234]: https://www.rfc-editor.org/rfc/rfc5234

@@ -914,8 +914,8 @@ fn bug_003_alias_generic_helper_closure_vector() {
     // a generic helper (consumer -> `middle` -> `a.Wrapper<inner-type>`)
     // must reach `inner-type` without E016 (unresolved typename).
     // The wrap function must:
-    //   * strip `<...>` before comparing typenames to local rule names, so that `tagged<t>`
-    //     matches `tagged`;
+    //   * strip `<...>` before comparing typenames to local rule names, so that
+    //     `tagged<t>` matches `tagged`;
     //   * not re-prefix already-qualified references (`a.Wrapper` must stay `a.Wrapper`);
     //   * not recurse into Directive children, which are already fully resolved by the
     //     importer.
@@ -1007,8 +1007,8 @@ fn bug_010_x_enc_abnfb_carrier_narrowing_vector() {
     // `ControlOp::Other` and the structured subtype collector
     // rejects it against plain `bstr` (the dntls `svcrec`
     // failure shape).  The fixture also covers:
-    //   * positive: `(bstr .size 48) .x-enc.abnfb ( ... ) .within bstr` and `.within (bstr /
-    //     nil)` must lint cleanly.
+    //   * positive: `(bstr .size 48) .x-enc.abnfb ( ... ) .within bstr` and `.within
+    //     (bstr / nil)` must lint cleanly.
     //   * negative carrier: a narrower size constraint must still fail.
     //   * negative transform-family: `.x-enc.abnfb` must not subtype `.x-hash.abnfb` or
     //     `.x-brotli.abnfb`.
@@ -1287,11 +1287,13 @@ fn bug_018_imported_generic_within_namespace_resolution_vector() {
     // The fixture's LHS and RHS shapes differ on purpose: the test
     // asserts two things that together pin the resolution contract:
     //
-    // 1. The compiled dump preserves `cose.COSE_Encrypt0` as the `.within` RHS text on the
-    //    expanded root rule.  A silent drop or alias rewrite of the RHS would surface here.
-    // 2. The subtype check fires with E030 and a structural reason ("Uint not subtype of { 2
-    //    entries }"), NOT the `unresolved name` reason.  If the namespace were missing the
-    //    diagnostic would carry `unresolved name: cose.COSE_Encrypt0` instead.
+    // 1. The compiled dump preserves `cose.COSE_Encrypt0` as the `.within` RHS text on
+    //    the expanded root rule.  A silent drop or alias rewrite of the RHS would surface
+    //    here.
+    // 2. The subtype check fires with E030 and a structural reason ("Uint not subtype of
+    //    { 2 entries }"), NOT the `unresolved name` reason.  If the namespace were
+    //    missing the diagnostic would carry `unresolved name: cose.COSE_Encrypt0`
+    //    instead.
     let path = repo_root()
         .join("cddl/vectors/project/bugs/bug_018_imported_generic_within_namespace.cddl");
     let compiled = CompiledCDDL::compile(&path, None).expect("bug-018 fixture must compile");

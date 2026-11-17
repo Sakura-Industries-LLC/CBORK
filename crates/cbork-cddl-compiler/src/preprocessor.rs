@@ -431,7 +431,7 @@ mod tests {
     #[test]
     fn parse_postlude_is_available() {
         let postlude = parse_postlude().unwrap();
-        assert!(!postlude.is_empty());
+        assert_ne!(postlude, []);
     }
 
     fn collect_kind_counts(

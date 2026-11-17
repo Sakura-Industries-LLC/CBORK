@@ -254,7 +254,8 @@ mod tests {
         ]);
         assert!(Array::decode(&mut decoder, &mut DecodeCtx::Deterministic).is_ok());
 
-        // Test case 2: Invalid non-minimal encoding (using additional info 24 for length 1)
+        // Test case 2: Invalid non-minimal encoding (using additional info 24 for length
+        // 1)
         let mut decoder = Decoder::new(&[
             0x98, // Array with additional info = 24 (0x80 | 0x18)
             0x01, // Length encoded as uint8 = 1
@@ -357,7 +358,8 @@ mod tests {
             0xFF, // Break code
         ]);
         assert!(Array::decode(&mut decoder.clone(), &mut DecodeCtx::Deterministic).is_err());
-        // Even it's non-deterministic, this should fail, as we enforce for the defined length.
+        // Even it's non-deterministic, this should fail, as we enforce for the defined
+        // length.
         assert!(Array::decode(&mut decoder.clone(), &mut DecodeCtx::non_deterministic()).is_err());
     }
 

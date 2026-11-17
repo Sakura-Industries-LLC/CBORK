@@ -543,7 +543,7 @@ mod tests {
     #[test]
     fn ignores_lines_without_whitespace_after_hash() {
         let dirs = parse_directives(";#import rfc9052").unwrap();
-        assert!(dirs.is_empty());
+        assert_eq!(dirs, []);
     }
 
     #[test]

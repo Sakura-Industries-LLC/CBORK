@@ -270,11 +270,9 @@ both supporting the `from …` and `as …` clause options.
 
 The target filename is classified by how it is written:
 
-* **Unquoted base names** (e.g. `rfc9052`) are *default standard CDDL
-  documents* and resolve through the compile-time catalog
-  ([`cddl/rfc-std/`][cddl-rfc-std]).
-  Two imports of the same base name produce rules with the same source
-  origin (`catalog:<name>`), so re-imports compose cleanly.
+* **Unquoted base names** (e.g. `rfc9052`) are *default standard CDDL documents*
+  and resolve through the compile-time catalog ([`cddl/rfc-std/`][cddl-rfc-std]).
+  Two imports of the same base name produce rules with the same source origin (`catalog:<name>`), so re-imports compose cleanly.
 * **Quoted relative paths** (e.g. `"./somedir/file.cddl"` or
   `"../common.cddl"`) are resolved **relative to the CDDL file in
   which the directive appears**, and the file content is read from the

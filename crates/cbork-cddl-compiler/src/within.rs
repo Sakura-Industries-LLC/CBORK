@@ -2957,8 +2957,9 @@ fn is_control_subtype(
     }
 
     // 1. Carrier compatibility: the carrier of the LHS must fit inside the carrier of the
-    //    RHS. For serialization operators the carriers are usually the same primitive (`bstr`
-    //    for `.cbor`/`.dtrm`); the recursive call also handles user-defined carrier types.
+    //    RHS. For serialization operators the carriers are usually the same primitive
+    //    (`bstr` for `.cbor`/`.dtrm`); the recursive call also handles user-defined
+    //    carrier types.
     is_subtype_impl(lcarrier, rcarrier, defs, visited).map_err(|e| format!("carrier: {e}"))?;
 
     // 2. Operator compatibility matrix.
@@ -4215,7 +4216,7 @@ mod tests {
     fn collect_socket_choices_empty_for_no_augmentations() {
         let nodes = parse_snippet("root = int\n");
         let choices = collect_socket_choices("$msg", &nodes);
-        assert!(choices.is_empty());
+        assert_eq!(choices, []);
     }
 
     #[test]
@@ -5935,7 +5936,8 @@ mod tests {
     // Fixes the bug where `bstr / #6.24(bstr) ⊆ bstr / #6.24(bstr)`
     // was rejected even though every LHS choice arm is accepted by at
     // least one RHS choice arm. The fix ensures:
-    //  * L ⊆ (A / B / C): conflicts from rejected arms are discarded when any arm accepts L.
+    //  * L ⊆ (A / B / C): conflicts from rejected arms are discarded when any arm accepts
+    //    L.
     //  * (A / B / C) ⊆ R: each LHS alternative is checked against R.
     //  * (A / B / C) ⊆ (X / Y / Z): each LHS alternative passes if at least one RHS
     //    alternative accepts it.
@@ -6044,8 +6046,8 @@ mod tests {
 
     #[test]
     fn rfc9171_payload_block_shape_passes() {
-        // Matches the element types of payload-block-structure / canonical-block-structure
-        // from rfc9171 §3.6.
+        // Matches the element types of payload-block-structure /
+        // canonical-block-structure from rfc9171 §3.6.
         let source = r"
             block-type-specific-data = bstr / #6.24(bstr)
             crc-value = bstr .size 2 / bstr .size 4

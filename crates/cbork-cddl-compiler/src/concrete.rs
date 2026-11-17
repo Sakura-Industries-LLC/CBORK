@@ -4291,10 +4291,10 @@ impl<'a> RenderCx<'a> {
         //
         // The grpent can carry the operator in two different shapes:
         //
-        // * a `ctlop` child (e.g. inside a `{ ... }` body the ctlop is its own sibling) -- the
-        //   operator text is on the ctlop node;
-        // * a `memberkey` child whose text already contains the `=>` or `:` -- the operator is
-        //   part of the memberkey text and the next sibling is the value.
+        // * a `ctlop` child (e.g. inside a `{ ... }` body the ctlop is its own sibling)
+        //   -- the operator text is on the ctlop node;
+        // * a `memberkey` child whose text already contains the `=>` or `:` -- the
+        //   operator is part of the memberkey text and the next sibling is the value.
         //
         // We handle both.
         let mut type_children: Vec<&WrappedNode> = Vec::new();

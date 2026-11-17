@@ -23,11 +23,11 @@ cbork-cddl-compiler = { path = "../cbork-cddl-compiler", version = "0.0.10" }
 cbork-edn = { path = "../cbork-edn", version = "0.0.2" }
 cbork-utils = { path = "../cbork-utils", version = "0.0.5" }
 anyhow = "1.0"
-build-info = "0.0.45"
-console = "0.16.4"
-bpaf = { version = "0.9.26", features = ["derive"] }
-diffy = "0.5"
-ignore = "0.4.27"
+build-info = "0.0.47"
+console = "0.16.6"
+bpaf = { version = "0.9.29", features = ["derive"] }
+diffy = "0.5.2"
+ignore = "0.4.34"
 
 [build-dependencies]
-build-info-build = "0.0.45"
+build-info-build = "0.0.47"

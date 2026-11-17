@@ -35,7 +35,7 @@ The crate's AST types are re-exported from `cbork-cddl-compiler` for users who n
 Licensed under `MIT OR Apache-2.0`.
 See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE) in this directory for the full texts.
 
-This crate is part of the [cbork workspace](https://github.com/SakuraIndustries/cbork).
+This crate is part of the [cbork workspace](https://github.com/Sakura-Industries-LLC/CBORK).
 
 [rfc8610]: https://www.rfc-editor.org/rfc/rfc8610
 [rfc9165]: https://www.rfc-editor.org/rfc/rfc9165

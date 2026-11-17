@@ -79,7 +79,6 @@ mod tests {
     #[test]
     fn name_listing() {
         let names: Vec<_> = known_names().collect();
-        assert!(!names.is_empty());
         assert!(names.contains(&"rfc8727"));
         assert!(names.contains(&"rfc9052"));
     }

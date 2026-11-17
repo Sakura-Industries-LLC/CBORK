@@ -1083,9 +1083,9 @@ mod tests {
 
     #[test]
     fn production_path_dtrm_bstr_rejects_non_shortest_in_payload() {
-        // bstr .dtrm { 24: "x" } — but 24 uses non-shortest encoding (should be 0x18 0x18, not
-        // 0x18 0x18) Actually: key 24 encoded properly as 0x1818 is OK. Let's test with
-        // key 24 encoded as 0x19 00 18 (non-shortest)
+        // bstr .dtrm { 24: "x" } — but 24 uses non-shortest encoding (should be 0x18
+        // 0x18, not 0x18 0x18) Actually: key 24 encoded properly as 0x1818 is OK.
+        // Let's test with key 24 encoded as 0x19 00 18 (non-shortest)
         let err = check_serialization(
             &[0xA1, 0x19, 0x00, 0x18, 0x61, b'x'],
             SerializationMode::Prefp,

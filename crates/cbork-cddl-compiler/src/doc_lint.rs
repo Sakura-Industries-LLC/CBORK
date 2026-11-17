@@ -700,7 +700,7 @@ rule = 1
         };
 
         let mapped = map_rumdl_diagnostics(vec![warning], &synthetic, source, Path::new("x.cddl"));
-        assert!(mapped.diagnostics.is_empty());
+        assert_eq!(mapped.diagnostics, []);
         assert_eq!(mapped.suppressed.len(), 1);
         assert_eq!(mapped.suppressed[0].reason, SuppressionReason::SpliceMarker);
     }
@@ -721,7 +721,7 @@ rule = 1
         };
 
         let mapped = map_rumdl_diagnostics(vec![warning], &synthetic, source, Path::new("x.cddl"));
-        assert!(mapped.diagnostics.is_empty());
+        assert_eq!(mapped.diagnostics, []);
         assert_eq!(mapped.suppressed.len(), 1);
         assert_eq!(
             mapped.suppressed[0].reason,

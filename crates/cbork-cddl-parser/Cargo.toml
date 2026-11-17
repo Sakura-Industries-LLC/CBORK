@@ -19,7 +19,7 @@ exclude = ["moon.yml"]
 workspace = true
 
 [dependencies]
-pest = { version = "2.8.6", features = ["std", "pretty-print", "memchr", "const_prec_climber"] }
-pest_derive = { version = "2.8.6", features = ["grammar-extras"] }
+pest = { version = "2.9.6", features = ["std", "pretty-print", "memchr", "const_prec_climber"] }
+pest_derive = { version = "2.9.6", features = ["grammar-extras"] }
 anyhow = "1.0"
 cbork-catalog = { path = "../cbork-catalog", version = "0.0.1" }

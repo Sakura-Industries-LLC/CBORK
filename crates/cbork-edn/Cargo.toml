@@ -19,4 +19,4 @@ workspace = true
 [dependencies]
 half = "2.7.1"
 minicbor = { version = "2", features = ["std", "half"] }
-thiserror = "2.0.18"
+thiserror = "2.0.21"

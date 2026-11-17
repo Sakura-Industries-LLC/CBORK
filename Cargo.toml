@@ -59,7 +59,12 @@ unescaped_backticks = "deny"
 [workspace.package]
 authors = ["Sakura Industries LLC"]
 edition = "2024"
-homepage = "https://github.com/SakuraIndustries/cbork"
+homepage = "https://github.com/Sakura-Industries-LLC/CBORK"
 license = "MPL-2.0"
-repository = "https://github.com/SakuraIndustries/cbork"
+repository = "https://github.com/Sakura-Industries-LLC/CBORK"
 rust-version = "1.96.0"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true

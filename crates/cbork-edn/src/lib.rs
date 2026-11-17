@@ -1024,7 +1024,7 @@ mod tests {
     #[test]
     fn parse_sequence_accepts_empty_input() {
         let document = Document::parse_sequence(&[]).expect("parse_sequence");
-        assert!(document.items().is_empty());
+        assert_eq!(document.items(), []);
         assert!(!document.is_sequence());
     }
 

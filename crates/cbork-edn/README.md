@@ -28,4 +28,4 @@ assert_eq!(doc.to_string(), "{ \"a\": 1, \"b\": 2 }");
 Licensed under `MPL-2.0`.
 See [LICENSE](LICENSE) in this directory and the repository-root `LICENSE-MPL-2.0` for the full text.
 
-This crate is part of the [cbork workspace](https://github.com/SakuraIndustries/cbork).
+This crate is part of the [cbork workspace](https://github.com/Sakura-Industries-LLC/CBORK).
